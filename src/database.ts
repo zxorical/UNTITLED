@@ -688,6 +688,17 @@ export async function getAllPremiumUsers(guildId: string): Promise<PremiumUser[]
   }).toArray();
 }
 
+/**
+ * Get ALL premium users across ALL guilds (no guild filter)
+ * Used by AutoJoiner to monitor all servers
+ */
+export async function getAllPremiumUsersAllGuilds(): Promise<PremiumUser[]> {
+  await ensureConnected();
+  return premiumUsersCol.find({
+    isPremium: true,
+  }).toArray();
+}
+
 export async function getPremiumUsersBySource(
   guildId: string,
   source: 'key' | 'booster' | 'manual'
