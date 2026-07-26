@@ -63,6 +63,27 @@ interface BoosterPremium {
   lastChecked: number;
 }
 
+// AutoJoin Entry - stored in MongoDB to save memory
+interface AutoJoinEntry {
+  _id: string; // entryId (channelId:messageId)
+  userId: string;
+  messageId: string;
+  channelId: string;
+  guildId: string;
+  authorId: string;
+  guildName: string;
+  channelName: string;
+  prize: string;
+  buttonCustomId?: string;
+  detectedAt: number;
+  endsAt?: number;
+  status: 'pending' | 'attempting' | 'success' | 'failed' | 'skipped';
+  attempts: number;
+  lastAttemptAt?: number;
+  lastError?: string;
+  expiresAt: number; // For TTL index
+}
+
 const MONGO_URI = process.env.MONGO_URI;
 if (!MONGO_URI) {
   throw new Error('MONGO_URI environment variable is required');
@@ -78,6 +99,7 @@ let watchlistCol: Collection<UserWatchlist>;
 let licenseKeysCol: Collection<LicenseKey>;
 let premiumUsersCol: Collection<PremiumUser>;
 let boosterPremiumCol: Collection<BoosterPremium>;
+let autoJoinEntriesCol: Collection<AutoJoinEntry>;
 
 let connected = false;
 let connectingPromise: Promise<void> | null = null;
@@ -109,6 +131,7 @@ async function connect(): Promise<void> {
       licenseKeysCol = db.collection<LicenseKey>('license_keys');
       premiumUsersCol = db.collection<PremiumUser>('premium_users');
       boosterPremiumCol = db.collection<BoosterPremium>('booster_premium');
+      autoJoinEntriesCol = db.collection<AutoJoinEntry>('autojoin_entries');
 
       await giveawaysCol.createIndex({ messageId: 1, channelId: 1 }, { unique: true });
       await giveawaysCol.createIndex({ status: 1 });
@@ -124,6 +147,22 @@ async function connect(): Promise<void> {
       await boosterPremiumCol.createIndex({ userId: 1, guildId: 1 }, { unique: true });
       await boosterPremiumCol.createIndex({ isBooster: 1 });
       await boosterPremiumCol.createIndex({ premiumAssigned: 1 });
+
+      // AutoJoin entries indexes
+      // TTL index to auto-delete expired entries
+      await autoJoinEntriesCol.createIndex(
+        { expiresAt: 1 },
+        { expireAfterSeconds: 0 }
+      );
+      // Compound index for lookups
+      await autoJoinEntriesCol.createIndex(
+        { userId: 1, messageId: 1, channelId: 1 },
+        { unique: true }
+      );
+      // Index for cleaning up old entries
+      await autoJoinEntriesCol.createIndex({ detectedAt: -1 });
+      // Index for status lookups
+      await autoJoinEntriesCol.createIndex({ userId: 1, status: 1 });
 
       const docs = await giveawaysCol.find({}).toArray();
       cache.clear();
@@ -846,6 +885,78 @@ export async function setTokenActive(
     { userId, guildId },
     { $set: { tokenActive: active } }
   );
+}
+
+// ---------------------------------------------------------------------------
+// AutoJoin Entries - MongoDB storage for giveaway entries
+// ---------------------------------------------------------------------------
+
+export async function getAutoJoinEntriesCollection(): Promise<Collection<AutoJoinEntry>> {
+  await ensureConnected();
+  return autoJoinEntriesCol;
+}
+
+export async function saveAutoJoinEntry(entry: Omit<AutoJoinEntry, '_id'>): Promise<void> {
+  await ensureConnected();
+  const entryWithId: AutoJoinEntry = {
+    ...entry,
+    _id: entry._id || `${entry.channelId}:${entry.messageId}`,
+  };
+  await autoJoinEntriesCol.insertOne(entryWithId);
+}
+
+export async function getAutoJoinEntry(
+  userId: string,
+  messageId: string,
+  channelId: string
+): Promise<AutoJoinEntry | null> {
+  await ensureConnected();
+  const entryId = `${channelId}:${messageId}`;
+  return autoJoinEntriesCol.findOne({ _id: entryId, userId });
+}
+
+export async function updateAutoJoinEntryStatus(
+  userId: string,
+  messageId: string,
+  channelId: string,
+  status: 'pending' | 'attempting' | 'success' | 'failed' | 'skipped',
+  updates?: Partial<Omit<AutoJoinEntry, '_id' | 'userId' | 'messageId' | 'channelId'>>
+): Promise<void> {
+  await ensureConnected();
+  const entryId = `${channelId}:${messageId}`;
+  await autoJoinEntriesCol.updateOne(
+    { _id: entryId, userId },
+    { $set: { status, ...updates } }
+  );
+}
+
+export async function deleteAutoJoinEntry(
+  userId: string,
+  messageId: string,
+  channelId: string
+): Promise<void> {
+  await ensureConnected();
+  const entryId = `${channelId}:${messageId}`;
+  await autoJoinEntriesCol.deleteOne({ _id: entryId, userId });
+}
+
+export async function cleanupAutoJoinEntries(userId: string): Promise<number> {
+  await ensureConnected();
+  const cutoff = Date.now() - 2 * 60 * 60 * 1000; // 2 hours
+  const result = await autoJoinEntriesCol.deleteMany({
+    userId,
+    status: { $in: ['success', 'failed', 'skipped'] },
+    detectedAt: { $lt: cutoff }
+  });
+  return result.deletedCount || 0;
+}
+
+export async function getPendingAutoJoinEntries(userId: string): Promise<AutoJoinEntry[]> {
+  await ensureConnected();
+  return autoJoinEntriesCol.find({
+    userId,
+    status: { $in: ['pending', 'attempting'] }
+  }).toArray();
 }
 
 // ---------------------------------------------------------------------------
