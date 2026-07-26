@@ -2,6 +2,7 @@
  * @module autoJoin/manager
  * 
  * Premium AutoJoiner - automatically enters giveaways using user-provided tokens.
+ * BUTTON ONLY - no reaction support.
  * 
  * Flow:
  * 1. Users add their Discord token via Premium Panel → encrypted + stored in DB
@@ -27,8 +28,8 @@ import {
 } from '../utils.js';
 import {
   getAllPremiumUsers,
-  updateTokenEntries,
-  updateTokenWins,
+  incrementTokenEntries,
+  incrementTokenWins,
   updateTokenLastUsed,
   getPremiumUser,
   setTokenActive,
@@ -49,9 +50,7 @@ interface GiveawayEntry {
   guildName: string;
   channelName: string;
   prize: string;
-  entryMethod: EntryMethod;
   buttonCustomId?: string;
-  reactionEmoji?: string;
   detectedAt: number;
   endsAt?: number;
   status: EntryStatus;
@@ -59,11 +58,6 @@ interface GiveawayEntry {
   userId: string;
   lastAttemptAt?: number;
   lastError?: string;
-}
-
-enum EntryMethod {
-  BUTTON = 'button',
-  REACTION = 'reaction',
 }
 
 enum EntryStatus {
@@ -248,7 +242,7 @@ export class AutoJoinManager extends EventEmitter {
       
       for (const user of premiumUsers) {
         if (!user.token) continue;
-        if (!user.tokenActive !== false) continue;
+        if (user.tokenActive === false) continue;
         
         await this.startSession(user.userId, user.guildId);
       }
@@ -513,7 +507,7 @@ export class AutoJoinManager extends EventEmitter {
         // Check for wins first
         await this.handleWin(message, userId);
 
-        // Then check for entry opportunities
+        // Then check for entry opportunities (BUTTON ONLY)
         await this.handleMessage(message, session);
       } catch (error) {
         logger.error('Message handler error', {
@@ -556,7 +550,7 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   // -------------------------------------------------------------------------
-  // Message Handling (Entry Detection)
+  // Message Handling (Entry Detection - BUTTON ONLY)
   // -------------------------------------------------------------------------
 
   private async handleMessage(message: Message, session: UserSession): Promise<void> {
@@ -592,7 +586,6 @@ export class AutoJoinManager extends EventEmitter {
         guildName: message.guild!.name,
         channelName: (message.channel as { name?: string }).name ?? 'unknown',
         prize: detected.prize,
-        entryMethod: detected.method,
         buttonCustomId: detected.button?.customId,
         detectedAt: Date.now(),
         endsAt: this.extractEndTimestamp(message),
@@ -612,7 +605,7 @@ export class AutoJoinManager extends EventEmitter {
         channel: `#${entry.channelName}`,
       });
 
-      // Enter the giveaway
+      // Enter the giveaway (BUTTON ONLY)
       await this.enterGiveaway(entry, session);
 
     } catch (error) {
@@ -628,12 +621,12 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   // -------------------------------------------------------------------------
-  // Giveaway Detection
+  // Giveaway Detection (BUTTON ONLY)
   // -------------------------------------------------------------------------
 
   private async detectGiveaway(
     message: Message,
-  ): Promise<{ prize: string; method: EntryMethod; button?: GiveawayButton } | null> {
+  ): Promise<{ prize: string; button: GiveawayButton } | null> {
     const rawContent = message.content ?? '';
     if (BLOCKED_MESSAGE_CONTENT.some(re => re.test(rawContent))) {
       return null;
@@ -667,10 +660,10 @@ export class AutoJoinManager extends EventEmitter {
   private tryExtractEntry(
     message: Message,
     isKnownBot: boolean,
-  ): { prize: string; method: EntryMethod; button: GiveawayButton } | null {
+  ): { prize: string; button: GiveawayButton } | null {
     const button = this.extractEntryButton(message, isKnownBot);
     if (!button) return null;
-    return { prize: this.extractPrize(message), method: EntryMethod.BUTTON, button };
+    return { prize: this.extractPrize(message), button };
   }
 
   private extractEntryButton(message: Message, _isKnownBot: boolean): GiveawayButton | null {
@@ -688,7 +681,7 @@ export class AutoJoinManager extends EventEmitter {
 
         const type = c['type'];
         if (type !== 2 && type !== 'BUTTON') continue;
-        if (c['style'] === 5) continue;
+        if (c['style'] === 5) continue; // link button - skip
         if (c['disabled'] === true) continue;
 
         const customId = (c['customId'] ?? c['custom_id']) as string | undefined;
@@ -696,14 +689,17 @@ export class AutoJoinManager extends EventEmitter {
 
         const label = ((c['label'] as string | undefined) ?? '').trim();
 
+        // Block leave/exit buttons
         if (BLOCKED_BUTTON_LABELS.some(re => re.test(label))) {
           continue;
         }
 
+        // Check trusted custom IDs
         if (TRUSTED_ENTRY_CUSTOM_IDS.has(customId)) {
           return { customId, label: label || customId, disabled: false };
         }
 
+        // Check label patterns
         if (ENTRY_BUTTON_PATTERNS.some(re => re.test(label))) {
           return { customId, label: label || 'Enter', disabled: false };
         }
@@ -714,7 +710,7 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   // -------------------------------------------------------------------------
-  // Entry Execution
+  // Entry Execution (BUTTON ONLY)
   // -------------------------------------------------------------------------
 
   private async enterGiveaway(entry: GiveawayEntry, session: UserSession): Promise<void> {
@@ -733,7 +729,7 @@ export class AutoJoinManager extends EventEmitter {
       }
 
       try {
-        const skipped = await this.executeEntry(entry, session);
+        const skipped = await this.enterViaButton(entry, session);
         if (skipped) {
           entry.status = EntryStatus.SKIPPED;
           return;
@@ -744,7 +740,7 @@ export class AutoJoinManager extends EventEmitter {
         session.stats.lastEntryAt = Date.now();
 
         // Update database
-        await updateTokenEntries(userId, session.guildId);
+        await incrementTokenEntries(userId, session.guildId);
         await updateTokenLastUsed(userId, session.guildId);
 
         logger.info('✅ AutoJoin: Entered giveaway', {
@@ -783,16 +779,6 @@ export class AutoJoinManager extends EventEmitter {
     this.emit('giveawayFailed', { entry, userId });
   }
 
-  private async executeEntry(entry: GiveawayEntry, session: UserSession): Promise<boolean> {
-    if (entry.entryMethod === EntryMethod.BUTTON) {
-      return this.enterViaButton(entry, session);
-    }
-    if (entry.entryMethod === EntryMethod.REACTION) {
-      return this.enterViaReaction(entry, session);
-    }
-    throw new Error(`Unsupported entry method: ${String(entry.entryMethod)}`);
-  }
-
   private async enterViaButton(entry: GiveawayEntry, session: UserSession): Promise<boolean> {
     if (!entry.buttonCustomId) throw new Error('No buttonCustomId set');
 
@@ -813,24 +799,6 @@ export class AutoJoinManager extends EventEmitter {
     }
 
     await this.clickButton(message, button);
-    return false;
-  }
-
-  private async enterViaReaction(entry: GiveawayEntry, session: UserSession): Promise<boolean> {
-    const emoji = entry.reactionEmoji ?? '🎉';
-
-    if (CONFIG.reactionDelayMs > 0) await delay(CONFIG.reactionDelayMs);
-
-    const message = await this.fetchMessage(session.client, entry.channelId, entry.messageId);
-    if (!message) throw new Error(`Message ${entry.messageId} not found`);
-
-    const existing = message.reactions?.cache?.get(emoji) as { me?: boolean } | undefined;
-    if (existing?.me) {
-      entry.status = EntryStatus.SKIPPED;
-      return true;
-    }
-
-    await message.react(emoji);
     return false;
   }
 
@@ -951,7 +919,7 @@ export class AutoJoinManager extends EventEmitter {
       session.stats.wins++;
     }
 
-    await updateTokenWins(userId, this.guildId);
+    await incrementTokenWins(userId, this.guildId);
 
     const prize = this.extractPrize(message);
     const sourceName = `#${(message.channel as { name?: string }).name ?? message.channel.id} in ${message.guild.name}`;
@@ -980,7 +948,7 @@ export class AutoJoinManager extends EventEmitter {
       session.stats.wins++;
     }
 
-    await updateTokenWins(userId, this.guildId);
+    await incrementTokenWins(userId, this.guildId);
 
     const prize = this.extractPrize(message);
 
