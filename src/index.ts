@@ -1,7 +1,7 @@
 /**
  * @module index
  * Application entry point – with BotManager timeout and fallback.
- * Now includes AutoJoiner for premium users.
+ * Now includes AutoJoiner for premium users (monitors ALL servers).
  */
 
 import http from 'http';
@@ -117,24 +117,19 @@ async function main(): Promise<void> {
   }
 
   // --------------------------------------------------------------------------
-  // START AUTOJOINER
+  // START AUTOJOINER - Monitors ALL servers (no GUILD_ID required)
   // --------------------------------------------------------------------------
-  const guildId = process.env.GUILD_ID;
-  if (!guildId) {
-    logger.warn('GUILD_ID not set - AutoJoiner will not start', { component: 'Bootstrap' });
-  } else {
-    try {
-      logger.info('Starting AutoJoiner...', { component: 'Bootstrap' });
-      autoJoiner = new AutoJoinManager(guildId);
-      await autoJoiner.startAllSessions();
-      logger.info('AutoJoiner started successfully.', { component: 'Bootstrap' });
-    } catch (err) {
-      logger.warn('AutoJoiner failed to start:', {
-        component: 'Bootstrap',
-        error: formatError(err),
-      });
-      autoJoiner = null;
-    }
+  try {
+    logger.info('Starting AutoJoiner (monitors all servers)...', { component: 'Bootstrap' });
+    autoJoiner = new AutoJoinManager();
+    await autoJoiner.startAllSessions();
+    logger.info('AutoJoiner started successfully.', { component: 'Bootstrap' });
+  } catch (err) {
+    logger.warn('AutoJoiner failed to start:', {
+      component: 'Bootstrap',
+      error: formatError(err),
+    });
+    autoJoiner = null;
   }
 
   // --------------------------------------------------------------------------
