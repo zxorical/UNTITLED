@@ -123,6 +123,10 @@ async function main(): Promise<void> {
     logger.info('Starting AutoJoiner (monitors all servers)...', { component: 'Bootstrap' });
     autoJoiner = new AutoJoinManager();
     await autoJoiner.startAllSessions();
+    
+    // Restore sessions from database (for VPS restarts)
+    await autoJoiner.restoreSessionsFromDatabase();
+    
     logger.info('AutoJoiner started successfully.', { component: 'Bootstrap' });
   } catch (err) {
     logger.warn('AutoJoiner failed to start:', {
