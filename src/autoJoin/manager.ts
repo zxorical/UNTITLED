@@ -8,8 +8,9 @@
  * 1. Users add their Discord token via Premium Panel → encrypted + stored in DB
  * 2. AutoJoiner reads all premium users with valid tokens
  * 3. Starts a self-bot session for each user
- * 4. Monitors giveaway messages and auto-clicks entry buttons
- * 5. Detects wins and sends webhook notifications (user's personal webhook or global fallback)
+ * 4. Monitors giveaway messages in ALL servers the token has access to
+ * 5. Auto-clicks entry buttons on detected giveaways
+ * 6. Detects wins and sends webhook notifications
  */
 
 import { Client, Message, TextChannel } from 'discord.js-selfbot-v13';
@@ -223,7 +224,8 @@ export class AutoJoinManager extends EventEmitter {
     timeout: 10_000,
   });
 
-  constructor(private guildId: string) {
+  // REMOVED guildId parameter - now monitors ALL servers
+  constructor() {
     super();
     this.startSessionRefresher();
   }
@@ -236,12 +238,15 @@ export class AutoJoinManager extends EventEmitter {
    * Start auto-join sessions for all premium users with tokens
    */
   async startAllSessions(): Promise<void> {
-    logger.info('Starting AutoJoin sessions...', { component: 'AutoJoin' });
+    logger.info('Starting AutoJoin sessions for all premium users...', { component: 'AutoJoin' });
 
     try {
-      const premiumUsers = await getAllPremiumUsers(this.guildId);
+      // Get ALL premium users from ALL guilds
+      // We need to get all users across all guilds
+      // Using a different approach - get all premium users
+      const allPremiumUsers = await this.getAllPremiumUsersAcrossAllGuilds();
       
-      for (const user of premiumUsers) {
+      for (const user of allPremiumUsers) {
         if (!user.token) continue;
         if (user.tokenActive === false) continue;
         
@@ -258,6 +263,25 @@ export class AutoJoinManager extends EventEmitter {
         error: formatError(error),
       });
     }
+  }
+
+  /**
+   * Get all premium users across all guilds
+   * Since we don't have a guild filter, we need to query all
+   */
+  private async getAllPremiumUsersAcrossAllGuilds(): Promise<any[]> {
+    // This requires a database query without guild filter
+    // We'll use the existing getAllPremiumUsers but need to handle multiple guilds
+    // For now, we'll use a workaround - get users from all guilds
+    // You may want to add a new database function for this
+    
+    // Option 1: Use the existing function with a wildcard or empty guildId
+    // Option 2: Add a new function to database.ts
+    
+    // Let's use a simpler approach - get all premium users from all guilds
+    // by querying without guildId filter
+    const { getAllPremiumUsersAllGuilds } = await import('../database.js');
+    return getAllPremiumUsersAllGuilds();
   }
 
   /**
@@ -294,10 +318,10 @@ export class AutoJoinManager extends EventEmitter {
         return false;
       }
 
-      // Validate token by trying to login
+      // Create client and login
       const client = new Client();
       
-      // Set up event handlers before login
+      // Set up session
       const session: UserSession = {
         client,
         userId,
@@ -347,6 +371,7 @@ export class AutoJoinManager extends EventEmitter {
         userId,
         label: session.label,
         username: client.user?.username,
+        guilds: client.guilds.cache.size, // Show how many servers they're in
       });
 
       this.emit('sessionStarted', { userId, guildId });
@@ -406,18 +431,22 @@ export class AutoJoinManager extends EventEmitter {
     logger.debug('Refreshing AutoJoin sessions...', { component: 'AutoJoin' });
 
     try {
-      const premiumUsers = await getAllPremiumUsers(this.guildId);
-      const activeUserIds = new Set(premiumUsers.filter(u => u.token && u.tokenActive !== false).map(u => u.userId));
+      const allPremiumUsers = await this.getAllPremiumUsersAcrossAllGuilds();
+      const activeUserIds = new Set(
+        allPremiumUsers
+          .filter(u => u.token && u.tokenActive !== false)
+          .map(u => `${u.userId}:${u.guildId}`)
+      );
 
       // Stop sessions for users no longer premium or without token
       for (const [key, session] of this.sessions) {
-        if (!activeUserIds.has(session.userId)) {
+        if (!activeUserIds.has(key)) {
           await this.stopSession(session.userId, session.guildId);
         }
       }
 
       // Start sessions for new premium users
-      for (const user of premiumUsers) {
+      for (const user of allPremiumUsers) {
         if (!user.token) continue;
         if (user.tokenActive === false) continue;
         
@@ -501,8 +530,8 @@ export class AutoJoinManager extends EventEmitter {
           return;
         }
 
-        // Only process messages in the target guild
-        if (message.guild.id !== guildId) return;
+        // REMOVED guild filter - monitor ALL servers!
+        // Just check if it's the user's own message
         if (message.author?.id === client.user?.id) return;
 
         // Check for wins first
@@ -555,7 +584,7 @@ export class AutoJoinManager extends EventEmitter {
   // -------------------------------------------------------------------------
 
   private async handleMessage(message: Message, session: UserSession): Promise<void> {
-    // Skip if not in monitored channels
+    // Skip if not in monitored channels (optional - from config)
     if (
       CONFIG.monitoredChannels.length > 0 &&
       !CONFIG.monitoredChannels.includes(message.channel.id)
@@ -920,7 +949,7 @@ export class AutoJoinManager extends EventEmitter {
       session.stats.wins++;
     }
 
-    await incrementTokenWins(userId, this.guildId);
+    await incrementTokenWins(userId, session?.guildId || '');
 
     const prize = this.extractPrize(message);
     const sourceName = `#${(message.channel as { name?: string }).name ?? message.channel.id} in ${message.guild.name}`;
@@ -930,9 +959,10 @@ export class AutoJoinManager extends EventEmitter {
       userId,
       prize,
       source: sourceName,
+      guild: message.guild.name,
     });
 
-    // Send webhook notification (uses user's personal webhook or global fallback)
+    // Send webhook notification
     await this.sendWinWebhook(message, prize, sourceName, userId);
 
     this.emit('giveawayWon', { message, prize, userId });
@@ -949,7 +979,7 @@ export class AutoJoinManager extends EventEmitter {
       session.stats.wins++;
     }
 
-    await incrementTokenWins(userId, this.guildId);
+    await incrementTokenWins(userId, session?.guildId || '');
 
     const prize = this.extractPrize(message);
 
@@ -973,10 +1003,14 @@ export class AutoJoinManager extends EventEmitter {
     sourceName: string,
     userId: string,
   ): Promise<void> {
+    // Get user's guildId from session
+    const session = this.findSessionByUserId(userId);
+    const guildId = session?.guildId || '';
+
     // PRIORITY 1: Get the user's personal webhook
     let url: string | null = null;
     try {
-      url = await getUserWebhook(userId, this.guildId);
+      url = await getUserWebhook(userId, guildId);
       if (url) {
         logger.debug('Using user\'s personal webhook', {
           component: 'AutoJoin',
@@ -1053,6 +1087,7 @@ export class AutoJoinManager extends EventEmitter {
         component: 'AutoJoin',
         userId,
         prize: truncate(prize, 50),
+        guild: guildName,
         webhookType: url === CONFIG.winWebhookUrl || url === CONFIG.webhookUrl ? 'global' : 'personal',
       });
     } catch (error) {
