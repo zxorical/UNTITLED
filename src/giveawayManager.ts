@@ -92,12 +92,16 @@ const BLOCKED_MESSAGE_CONTENT: ReadonlyArray<RegExp> = [
   /results\s+are\s+in/i,
   /this\s+giveaway\s+is\s+now\s+closed/i,
   /thank\s+you\s+for\s+participating/i,
+  /GIVEAWAY\s+ENDED/i,
+  /ended\s+at\s+<t:/i,
+  /winners?\s*:?\s*@/i,
 ];
 
 // DRAFT GIVEAWAY INDICATORS - messages that look like giveaways but aren't started yet
 const DRAFT_GIVEAWAY_INDICATORS: ReadonlyArray<RegExp> = [
   /Review your giveaway/i,
   /click\s+"Start"\s+to/i,
+  /click\s+'Start'\s+to/i,
   /this message expires in/i,
   /preview/i,
   /draft/i,
@@ -107,6 +111,7 @@ const DRAFT_GIVEAWAY_INDICATORS: ReadonlyArray<RegExp> = [
   /you can change/i,
   /setup your giveaway/i,
   /create(?: a)? giveaway/i,
+  /Click\s+[^\s]+\s+button\s+to\s+enter!/i,
 ];
 
 // ---------------------------------------------------------------------------
@@ -230,29 +235,35 @@ export class GiveawayManager extends EventEmitter {
     this.processingMessages.add(key);
 
     try {
-      // CHECK 1: Is this from an allowed giveaway bot?
-      if (!ALLOWED_GIVEAWAY_BOT_IDS.has(message.author.id)) {
-        return;
-      }
-
-      // CHECK 2: Is this a draft giveaway? (check BEFORE content filters)
-      if (this.isDraftGiveaway(message)) {
+      // ================================================================
+      // CHECK 1: IMMEDIATE GIVEAWAY CREATION DETECTION
+      // This MUST come before ANY other checks
+      // ================================================================
+      const allText = this.getGiveawayText(message);
+      
+      // These exact phrases ONLY appear in giveaway creation messages
+      if (/Review your giveaway/i.test(allText) ||
+          /click "Start" to start this giveaway/i.test(allText) ||
+          /click 'Start' to start this giveaway/i.test(allText) ||
+          /This message expires in \d+ minutes?/i.test(allText)) {
         this.stats.draftsSkipped++;
-        // Add to draft cache so we don't process it again
-        if (this.draftMessageCache.size >= this.DRAFT_CACHE_MAX_SIZE) {
-          // Remove oldest entry if cache is full
-          const firstKey = this.draftMessageCache.values().next().value;
-          if (firstKey) this.draftMessageCache.delete(firstKey);
-        }
-        this.draftMessageCache.add(key);
-        this.log.debug('Skipping draft giveaway creation message', {
+        this.log.debug('Skipping giveaway creation message (exact phrase match)', {
           messageId: message.id,
           channelId: message.channel.id,
         });
         return;
       }
 
+      // ================================================================
+      // CHECK 2: Is this from an allowed giveaway bot?
+      // ================================================================
+      if (!ALLOWED_GIVEAWAY_BOT_IDS.has(message.author.id)) {
+        return;
+      }
+
+      // ================================================================
       // CHECK 3: Filter out blocked content
+      // ================================================================
       const content = message.content || '';
       if (BLOCKED_MESSAGE_CONTENT.some(re => re.test(content))) {
         return;
@@ -265,7 +276,42 @@ export class GiveawayManager extends EventEmitter {
         }
       }
 
-      // CHECK 4: Existing giveaway?
+      // ================================================================
+      // CHECK 4: Is this a draft giveaway?
+      // ================================================================
+      if (this.isDraftGiveaway(message)) {
+        this.stats.draftsSkipped++;
+        // Add to draft cache so we don't process it again
+        if (this.draftMessageCache.size >= this.DRAFT_CACHE_MAX_SIZE) {
+          const firstKey = this.draftMessageCache.values().next().value;
+          if (firstKey) this.draftMessageCache.delete(firstKey);
+        }
+        this.draftMessageCache.add(key);
+        this.log.debug('Skipping draft giveaway', {
+          messageId: message.id,
+          channelId: message.channel.id,
+        });
+        return;
+      }
+
+      // ================================================================
+      // CHECK 5: Is this an ended giveaway?
+      // ================================================================
+      if (this.isEndedGiveaway(message)) {
+        const existing = await getGiveaway(message.id, message.channel.id);
+        if (existing && existing.status === 'active') {
+          await markEnded(message.id, message.channel.id);
+        }
+        this.log.debug('Skipping ended giveaway', {
+          messageId: message.id,
+          channelId: message.channel.id,
+        });
+        return;
+      }
+
+      // ================================================================
+      // CHECK 6: Existing giveaway?
+      // ================================================================
       const existing = await getGiveaway(message.id, message.channel.id);
       if (existing) {
         await updateLastSeen(message.id, message.channel.id);
@@ -275,7 +321,9 @@ export class GiveawayManager extends EventEmitter {
         return;
       }
 
-      // CHECK 5: Actually detect the giveaway
+      // ================================================================
+      // CHECK 7: Actually detect the giveaway
+      // ================================================================
       const detected = await this.detectGiveaway(message);
       if (!detected) {
         this.stats.falsePositivesBlocked++;
@@ -531,12 +579,11 @@ export class GiveawayManager extends EventEmitter {
   }
 
   // -------------------------------------------------------------------------
-  // Draft Giveaway Detection - IMPROVED
+  // Draft Giveaway Detection
   // -------------------------------------------------------------------------
   
   /**
    * Check if this is a draft/pending giveaway creation message
-   * More aggressive detection to prevent false positives
    */
   private isDraftGiveaway(message: Message): boolean {
     const content = message.content || '';
@@ -562,16 +609,13 @@ export class GiveawayManager extends EventEmitter {
       }
 
       // STEP 3: Check if the embed has giveaway-like elements but NO timestamp
-      // This helps catch drafts that don't have specific draft text
       const hasGiveawayKeywords = GIVEAWAY_KEYWORDS.some(re => re.test(embedText));
       const hasTimestamp = /<t:\d+:[a-zA-Z]>/.test(embedText);
       
       if (hasGiveawayKeywords && !hasTimestamp && components) {
-        // If it has giveaway keywords but no timestamp, check for management buttons
         const hasManagementButton = this.hasDraftManagementButton(message);
         const hasEntryButton = this.hasEntryButton(message);
         
-        // If there's a management button and no entry button, it's likely a draft
         if (hasManagementButton && !hasEntryButton) {
           return true;
         }
@@ -592,31 +636,26 @@ export class GiveawayManager extends EventEmitter {
           
           const label = (comp.label || '').toLowerCase().trim();
           
-          // Count management buttons
           if (['start', 'edit', 'cancel', 'preview', 'setup'].includes(label)) {
             managementButtons++;
           }
           
-          // Count entry buttons
           if (this.isEntryButton(comp)) {
             entryButtons++;
           }
         }
       }
       
-      // If there are management buttons but no entry buttons, it's a draft
       if (managementButtons > 0 && entryButtons === 0) {
         return true;
       }
       
-      // If all buttons are management buttons, it's a draft
       if (managementButtons > 0 && managementButtons >= this.countTotalButtons(message)) {
         return true;
       }
     }
 
-    // STEP 5: Check if the message looks like a setup/creation message
-    // Messages with certain patterns are likely draft setup messages
+    // STEP 5: Check for setup patterns
     const setupPatterns = [
       /select\s+a?\s*channel/i,
       /set\s+(?:the\s+)?(?:prize|duration|winners?)/i,
@@ -640,6 +679,41 @@ export class GiveawayManager extends EventEmitter {
       }
     }
 
+    return false;
+  }
+
+  /**
+   * Check if this is an ended giveaway message
+   */
+  private isEndedGiveaway(message: Message): boolean {
+    const allText = this.getGiveawayText(message);
+    
+    // Check for explicit ended indicators
+    const endedPatterns = [
+      /GIVEAWAY\s+ENDED/i,
+      /giveaway\s+ended/i,
+      /giveaway\s+is\s+over/i,
+      /giveaway\s+has\s+ended/i,
+      /ended\s+at\s+<t:/i,
+      /this\s+giveaway\s+is\s+now\s+closed/i,
+      /winner\s+announced/i,
+    ];
+    
+    if (endedPatterns.some(re => re.test(allText))) {
+      return true;
+    }
+    
+    // Check if there's a winner mention
+    if (/winner\s*:?\s*<@|winners\s*:?\s*<@/i.test(allText)) {
+      return true;
+    }
+    
+    // Check if the timestamp is in the past
+    const endsAt = this.extractEndTimestamp(message);
+    if (endsAt && endsAt < Date.now()) {
+      return true;
+    }
+    
     return false;
   }
 
@@ -689,7 +763,6 @@ export class GiveawayManager extends EventEmitter {
     const customId = comp.customId || comp.custom_id || '';
     const label = (comp.label || '').trim();
 
-    // Skip management buttons
     const lowerLabel = label.toLowerCase();
     if (['start', 'edit', 'cancel', 'preview', 'setup'].includes(lowerLabel)) {
       return false;
@@ -698,7 +771,6 @@ export class GiveawayManager extends EventEmitter {
     if (TRUSTED_ENTRY_CUSTOM_IDS.has(customId)) return true;
     if (ENTRY_BUTTON_LABEL_PATTERNS.some(re => re.test(label))) return true;
     
-    // Check for giveaway entry emojis
     for (const emoji of ENTRY_EMOJI_PATTERNS) {
       if (label.includes(emoji)) return true;
     }
@@ -849,7 +921,6 @@ export class GiveawayManager extends EventEmitter {
         const label = (comp.label || '').trim();
         const lowerLabel = label.toLowerCase();
         
-        // Skip management buttons
         if (['edit', 'start', 'cancel', 'preview', 'setup'].includes(lowerLabel)) {
           continue;
         }
@@ -919,6 +990,10 @@ export class GiveawayManager extends EventEmitter {
   }
 
   private isEnded(message: Message): boolean {
+    if (this.isEndedGiveaway(message)) {
+      return true;
+    }
+    
     const endsAt = this.extractEndTimestamp(message);
     if (endsAt === null) return false;
     return endsAt < Date.now();
