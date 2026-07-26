@@ -35,6 +35,7 @@ import {
   getPremiumUser,
   setTokenActive,
   getUserWebhook,
+  getAllPremiumUsersAllGuilds,
 } from '../database.js';
 import { decryptToken } from '../premium/tokenManager.js';
 import { CONFIG } from '../config.js';
@@ -79,7 +80,7 @@ interface GiveawayButton {
 interface UserSession {
   client: Client;
   userId: string;
-  guildId: string;
+  guildId: string; // Primary guild where they have premium
   token: string;
   label: string;
   startedAt: number;
@@ -224,7 +225,6 @@ export class AutoJoinManager extends EventEmitter {
     timeout: 10_000,
   });
 
-  // REMOVED guildId parameter - now monitors ALL servers
   constructor() {
     super();
     this.startSessionRefresher();
@@ -241,9 +241,6 @@ export class AutoJoinManager extends EventEmitter {
     logger.info('Starting AutoJoin sessions for all premium users...', { component: 'AutoJoin' });
 
     try {
-      // Get ALL premium users from ALL guilds
-      // We need to get all users across all guilds
-      // Using a different approach - get all premium users
       const allPremiumUsers = await this.getAllPremiumUsersAcrossAllGuilds();
       
       for (const user of allPremiumUsers) {
@@ -267,20 +264,9 @@ export class AutoJoinManager extends EventEmitter {
 
   /**
    * Get all premium users across all guilds
-   * Since we don't have a guild filter, we need to query all
+   * Uses the database function directly
    */
   private async getAllPremiumUsersAcrossAllGuilds(): Promise<any[]> {
-    // This requires a database query without guild filter
-    // We'll use the existing getAllPremiumUsers but need to handle multiple guilds
-    // For now, we'll use a workaround - get users from all guilds
-    // You may want to add a new database function for this
-    
-    // Option 1: Use the existing function with a wildcard or empty guildId
-    // Option 2: Add a new function to database.ts
-    
-    // Let's use a simpler approach - get all premium users from all guilds
-    // by querying without guildId filter
-    const { getAllPremiumUsersAllGuilds } = await import('../database.js');
     return getAllPremiumUsersAllGuilds();
   }
 
@@ -288,11 +274,11 @@ export class AutoJoinManager extends EventEmitter {
    * Start a single user session
    */
   async startSession(userId: string, guildId: string): Promise<boolean> {
-    const sessionKey = this.makeSessionKey(userId, guildId);
+    const sessionKey = this.makeSessionKey(userId);
     
     // Check if already running
     if (this.sessions.has(sessionKey)) {
-      logger.debug('Session already running', { component: 'AutoJoin', userId, guildId });
+      logger.debug('Session already running', { component: 'AutoJoin', userId });
       return true;
     }
 
@@ -371,7 +357,7 @@ export class AutoJoinManager extends EventEmitter {
         userId,
         label: session.label,
         username: client.user?.username,
-        guilds: client.guilds.cache.size, // Show how many servers they're in
+        guilds: client.guilds.cache.size,
       });
 
       this.emit('sessionStarted', { userId, guildId });
@@ -391,10 +377,48 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   /**
+   * Restore sessions from database (for VPS restarts)
+   */
+  async restoreSessionsFromDatabase(): Promise<void> {
+    logger.info('Restoring AutoJoin sessions from database...', { component: 'AutoJoin' });
+    
+    try {
+      const allPremiumUsers = await this.getAllPremiumUsersAcrossAllGuilds();
+      let restored = 0;
+      
+      for (const user of allPremiumUsers) {
+        if (!user.token) continue;
+        if (user.tokenActive === false) continue;
+        
+        const sessionKey = this.makeSessionKey(user.userId);
+        if (this.sessions.has(sessionKey)) {
+          continue;
+        }
+        
+        const success = await this.startSession(user.userId, user.guildId);
+        if (success) restored++;
+        
+        // Small delay to avoid rate limits
+        await delay(1000);
+      }
+      
+      logger.info(`Restored ${restored} AutoJoin sessions from database`, {
+        component: 'AutoJoin',
+        total: this.sessions.size,
+      });
+    } catch (error) {
+      logger.error('Failed to restore AutoJoin sessions', {
+        component: 'AutoJoin',
+        error: formatError(error),
+      });
+    }
+  }
+
+  /**
    * Stop a single user session
    */
   async stopSession(userId: string, guildId: string): Promise<void> {
-    const sessionKey = this.makeSessionKey(userId, guildId);
+    const sessionKey = this.makeSessionKey(userId);
     const session = this.sessions.get(sessionKey);
     
     if (!session) return;
@@ -435,12 +459,12 @@ export class AutoJoinManager extends EventEmitter {
       const activeUserIds = new Set(
         allPremiumUsers
           .filter(u => u.token && u.tokenActive !== false)
-          .map(u => `${u.userId}:${u.guildId}`)
+          .map(u => u.userId)
       );
 
       // Stop sessions for users no longer premium or without token
       for (const [key, session] of this.sessions) {
-        if (!activeUserIds.has(key)) {
+        if (!activeUserIds.has(session.userId)) {
           await this.stopSession(session.userId, session.guildId);
         }
       }
@@ -450,7 +474,7 @@ export class AutoJoinManager extends EventEmitter {
         if (!user.token) continue;
         if (user.tokenActive === false) continue;
         
-        const sessionKey = this.makeSessionKey(user.userId, user.guildId);
+        const sessionKey = this.makeSessionKey(user.userId);
         if (!this.sessions.has(sessionKey)) {
           await this.startSession(user.userId, user.guildId);
         }
@@ -530,8 +554,7 @@ export class AutoJoinManager extends EventEmitter {
           return;
         }
 
-        // REMOVED guild filter - monitor ALL servers!
-        // Just check if it's the user's own message
+        // Skip own messages
         if (message.author?.id === client.user?.id) return;
 
         // Check for wins first
@@ -1168,8 +1191,8 @@ export class AutoJoinManager extends EventEmitter {
     return `${message.channel.id}:${message.id}`;
   }
 
-  private makeSessionKey(userId: string, guildId: string): string {
-    return `${userId}:${guildId}`;
+  private makeSessionKey(userId: string): string {
+    return userId; // No guildId needed since we monitor all servers
   }
 
   private findSessionByUserId(userId: string): UserSession | null {
@@ -1215,7 +1238,7 @@ export class AutoJoinManager extends EventEmitter {
       totalSessions: stats.totalSessions,
       activeSessions: stats.activeSessions,
       sessions: Array.from(stats.sessionStats.entries()).map(([key, s]) => ({
-        userId: key.split(':')[0],
+        userId: key,
         detected: s.detected,
         entered: s.entered,
         wins: s.wins,
