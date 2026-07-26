@@ -234,10 +234,24 @@ export class GiveawayManager extends EventEmitter {
     this.processingMessages.add(key);
 
     try {
-      // Check if this is a draft giveaway first
+      // ================================================================
+      // CRITICAL: Check for creation message FIRST
+      // Edit + Start buttons together = DEFINITIVE creation message
+      // This must be checked BEFORE any other detection
+      // ================================================================
+      if (this.hasEditAndStartButtons(message)) {
+        this.stats.draftsSkipped++;
+        this.log.debug('Skipping giveaway creation (Edit + Start buttons)', {
+          messageId: message.id,
+          channelId: message.channel.id,
+        });
+        return;
+      }
+
+      // Check for other draft indicators (fallback)
       if (this.isDraftGiveaway(message)) {
         this.stats.draftsSkipped++;
-        this.log.debug('Skipping draft giveaway creation message', {
+        this.log.debug('Skipping draft giveaway', {
           messageId: message.id,
           channelId: message.channel.id,
         });
@@ -278,7 +292,6 @@ export class GiveawayManager extends EventEmitter {
         detectedAt: receivedAt,
         endsAt: detected.endsAt,
         detectionTimeMs: detectionTime,
-        // Pass banner and icon data
         guildIcon: guildIcon,
         guildBanner: guildBanner,
         memberCount: memberCount,
@@ -299,9 +312,6 @@ export class GiveawayManager extends EventEmitter {
         return;
       }
 
-      // sendNotification returns the invite URL it generated/resolved for the
-      // main tracker message — reuse it for watchlist DMs so both surfaces
-      // show the identical invite link, instead of resolving it twice.
       const inviteUrl = await notifyPromise;
 
       // Check watchlist matches using cached data
@@ -329,12 +339,10 @@ export class GiveawayManager extends EventEmitter {
       const text = this.getCachedGiveawayText(message);
       const lowerText = text.toLowerCase();
 
-      // Early exit - check if ANY item matches
       const allItems = Array.from(watchlistData.values()).flat();
       const hasAnyMatch = allItems.some(item => lowerText.includes(item.toLowerCase()));
       if (!hasAnyMatch) return;
 
-      // Find matching users
       const matchedUsers: string[] = [];
 
       for (const [userId, items] of watchlistData) {
@@ -355,7 +363,6 @@ export class GiveawayManager extends EventEmitter {
       const messageUrl = `https://discord.com/channels/${message.guild!.id}/${message.channel.id}/${message.id}`;
       const endsAt = this.extractEndTimestamp(message);
 
-      // SEND DMS WITH OPTIMAL BATCHING
       await this.sendWatchlistDMs(uniqueUsers, prize, message, endsAt, messageUrl, inviteUrl);
 
     } catch (err) {
@@ -376,8 +383,6 @@ export class GiveawayManager extends EventEmitter {
   ): Promise<void> {
     if (users.length === 0) return;
 
-    // Dynamic batch size based on user count
-    // More users = larger batches (but still safe)
     let batchSize: number;
     let delayBetweenBatches: number;
 
@@ -429,13 +434,11 @@ export class GiveawayManager extends EventEmitter {
           )
         );
 
-        // Count successes and failures
         for (const result of results) {
           if (result.status === 'fulfilled') sent++;
           else failed++;
         }
 
-        // Log progress for large batches
         if (users.length > 50 && (i + batchSize) % 50 === 0) {
           this.log.debug(`Watchlist DMs: ${Math.min(i + batchSize, users.length)}/${users.length} sent`);
         }
@@ -445,9 +448,7 @@ export class GiveawayManager extends EventEmitter {
         failed += batch.length;
       }
 
-      // Delay between batches (except for the last one)
       if (i + batchSize < users.length) {
-        // Add jitter to avoid rate limit patterns
         const jitter = Math.random() * 200;
         await delay(delayBetweenBatches + jitter);
       }
@@ -517,16 +518,39 @@ export class GiveawayManager extends EventEmitter {
     return parts.join(' ');
   }
 
-  private escapeRegex(str: string): string {
-    return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  }
-
   // -------------------------------------------------------------------------
-  // Draft Giveaway Detection - NEW
+  // Draft Giveaway Detection
   // -------------------------------------------------------------------------
   
   /**
-   * Check if this is a draft/pending giveaway creation message
+   * Check if the message has both Edit AND Start buttons
+   * This combination ONLY appears in giveaway creation/draft messages
+   * Real giveaways NEVER have both Edit and Start buttons
+   */
+  private hasEditAndStartButtons(message: Message): boolean {
+    const components = (message as any).components as any[] | undefined;
+    if (!components) return false;
+
+    let hasEdit = false;
+    let hasStart = false;
+
+    for (const row of components) {
+      const comps = row.components as any[] | undefined;
+      if (!comps) continue;
+      for (const comp of comps) {
+        if (comp.type === 2) { // Button
+          const label = (comp.label || '').toLowerCase().trim();
+          if (label === 'edit') hasEdit = true;
+          if (label === 'start') hasStart = true;
+        }
+      }
+    }
+
+    return hasEdit && hasStart;
+  }
+
+  /**
+   * Check if this is a draft/pending giveaway creation message (fallback)
    */
   private isDraftGiveaway(message: Message): boolean {
     const content = message.content || '';
@@ -599,7 +623,6 @@ export class GiveawayManager extends EventEmitter {
           if (TRUSTED_ENTRY_CUSTOM_IDS.has(customId)) return true;
           if (ENTRY_BUTTON_LABEL_PATTERNS.some(re => re.test(label))) return true;
           
-          // Check for giveaway entry emojis
           for (const emoji of ENTRY_EMOJI_PATTERNS) {
             if (label.includes(emoji)) return true;
           }
@@ -607,39 +630,6 @@ export class GiveawayManager extends EventEmitter {
       }
     }
     return false;
-  }
-
-  /**
-   * Check if the only actionable button is "Start" (meaning it's a draft)
-   */
-  private isStartButtonOnly(button: ButtonInfo, message: Message): boolean {
-    const components = (message as any).components as any[] | undefined;
-    if (!components) return false;
-
-    let hasEntryButton = false;
-    let hasStartButton = false;
-
-    for (const row of components) {
-      const comps = row.components as any[] | undefined;
-      if (!comps) continue;
-
-      for (const comp of comps) {
-        if (comp.type !== 2 || comp.disabled === true) continue;
-        const label = (comp.label || '').toLowerCase();
-
-        if (label === 'start' || label === 'edit' || label === 'cancel') {
-          hasStartButton = true;
-        }
-
-        // Check if this is an actual entry button
-        if (this.isEntryButton(comp)) {
-          hasEntryButton = true;
-        }
-      }
-    }
-
-    // If there's a Start button and NO entry button, it's a draft
-    return hasStartButton && !hasEntryButton;
   }
 
   /**
@@ -652,7 +642,6 @@ export class GiveawayManager extends EventEmitter {
     if (TRUSTED_ENTRY_CUSTOM_IDS.has(customId)) return true;
     if (ENTRY_BUTTON_LABEL_PATTERNS.some(re => re.test(label))) return true;
     
-    // Check for giveaway entry emojis
     for (const emoji of ENTRY_EMOJI_PATTERNS) {
       if (label.includes(emoji)) return true;
     }
@@ -686,7 +675,12 @@ export class GiveawayManager extends EventEmitter {
   // Detection
   // -------------------------------------------------------------------------
   private async detectGiveaway(message: Message): Promise<DetectedGiveaway | null> {
-    // Check for draft management buttons - if present and no entry button, skip
+    // If it has Edit+Start, it's a creation message - skip
+    if (this.hasEditAndStartButtons(message)) {
+      return null;
+    }
+
+    // If it has draft management buttons and no entry button, skip
     if (this.hasDraftManagementButton(message) && !this.hasEntryButton(message)) {
       this.log.debug('Skipping giveaway with draft management buttons (no entry button)', {
         messageId: message.id
@@ -729,7 +723,12 @@ export class GiveawayManager extends EventEmitter {
   private collectSignalsSync(message: Message): Record<string, number> {
     const signals: Record<string, number> = {};
 
-    // If this has draft management buttons and no entry button, skip entirely
+    // If it has Edit+Start, skip entirely
+    if (this.hasEditAndStartButtons(message)) {
+      return {};
+    }
+
+    // If it has draft management buttons and no entry button, skip
     if (this.hasDraftManagementButton(message) && !this.hasEntryButton(message)) {
       return {};
     }
@@ -786,7 +785,12 @@ export class GiveawayManager extends EventEmitter {
     const components = (message as any).components as any[] | undefined;
     if (!components?.length) return null;
 
-    // First check if this has draft buttons - if so, skip
+    // If it has Edit+Start, skip
+    if (this.hasEditAndStartButtons(message)) {
+      return null;
+    }
+
+    // Check if this has draft buttons - if so, skip
     let hasDraftButton = false;
     for (const row of components) {
       const comps = row.components as any[] | undefined;
@@ -804,7 +808,6 @@ export class GiveawayManager extends EventEmitter {
     }
 
     if (hasDraftButton) {
-      // Check if there's also an entry button
       let hasEntry = false;
       for (const row of components) {
         const comps = row.components as any[] | undefined;
@@ -821,7 +824,6 @@ export class GiveawayManager extends EventEmitter {
         if (hasEntry) break;
       }
       
-      // If no entry button, this is a draft
       if (!hasEntry) return null;
     }
 
@@ -863,11 +865,11 @@ export class GiveawayManager extends EventEmitter {
   // Allowed bot check
   // -------------------------------------------------------------------------
   private isAllowedBot(message: Message): boolean {
-    // Check if the message is from an allowed giveaway bot
     if (!message.author?.bot) return false;
     if (!message.author.id) return false;
     
     // Skip drafts before allowing
+    if (this.hasEditAndStartButtons(message)) return false;
     if (this.isDraftGiveaway(message)) return false;
     
     return ALLOWED_GIVEAWAY_BOT_IDS.has(message.author.id);
@@ -944,20 +946,16 @@ export class GiveawayManager extends EventEmitter {
   }
 
   private setCachedInvite(guildId: string, url: string): void {
-    // Cache for 30 minutes
     this.inviteCache.set(guildId, { url, expiresAt: Date.now() + 30 * 60 * 1000 });
   }
 
   private async fetchInviteForGuild(guildId: string): Promise<string> {
-    // Check cache first
     const cached = this.getCachedInvite(guildId);
     if (cached) return cached;
 
-    // Check pending requests to avoid duplicates
     const pending = this.pendingInvites.get(guildId);
     if (pending) return pending;
 
-    // Start new fetch
     const promise = this.doFetchInvite(guildId);
     this.pendingInvites.set(guildId, promise);
 
@@ -982,18 +980,15 @@ export class GiveawayManager extends EventEmitter {
 
       this.log.debug(`Generating invite for guild: ${guild.name} (${guildId})`);
 
-      // Try 1: Fetch existing invites
       try {
         const invites = await guild.invites.fetch();
         if (invites && invites.size > 0) {
-          // Prefer permanent invites (no expiration, no usage limit)
           const permanent = invites.find(inv => inv.maxAge === 0 && inv.maxUses === 0);
           if (permanent) {
             this.log.debug(`Using permanent invite for ${guild.name}: ${permanent.url}`);
             return permanent.url;
           }
           
-          // If no permanent invite, use the first one
           const firstInvite = invites.first();
           if (firstInvite) {
             this.log.debug(`Using existing invite for ${guild.name}: ${firstInvite.url}`);
@@ -1004,7 +999,6 @@ export class GiveawayManager extends EventEmitter {
         this.log.debug(`Could not fetch existing invites for ${guild.name}: ${formatError(error)}`);
       }
 
-      // Try 2: Vanity URL
       try {
         const vanityCode = (guild as any).vanityURLCode;
         if (vanityCode) {
@@ -1016,7 +1010,6 @@ export class GiveawayManager extends EventEmitter {
         this.log.debug(`No vanity URL for ${guild.name}: ${formatError(error)}`);
       }
 
-      // Try 3: Create new invite
       const textChannels = guild.channels.cache.filter(
         (ch): ch is TextChannel => ch.type === 'GUILD_TEXT'
       );
@@ -1026,17 +1019,14 @@ export class GiveawayManager extends EventEmitter {
         return `https://discord.com/channels/${guildId}`;
       }
 
-      // Get the bot's member to check permissions
       const botMember = guild.members.cache.get(this.client.user?.id || '');
       if (!botMember) {
         this.log.warn(`Bot not found in ${guild.name}`);
         return `https://discord.com/channels/${guildId}`;
       }
 
-      // Try channels in order of permissions
       for (const [, channel] of textChannels) {
         try {
-          // Check if bot has permission to create invites
           const permissions = channel.permissionsFor(botMember);
           if (!permissions || !permissions.has('CREATE_INSTANT_INVITE')) {
             this.log.debug(`No CREATE_INSTANT_INVITE permission in #${channel.name}`);
@@ -1044,8 +1034,8 @@ export class GiveawayManager extends EventEmitter {
           }
 
           const invite = await channel.createInvite({
-            maxAge: 0, // Never expire
-            maxUses: 0, // Unlimited uses
+            maxAge: 0,
+            maxUses: 0,
             reason: 'Giveaway tracker - auto-generated invite',
             temporary: false,
           });
@@ -1058,10 +1048,8 @@ export class GiveawayManager extends EventEmitter {
         }
       }
 
-      // Try 4: Use any channel with permission
       for (const [, channel] of textChannels) {
         try {
-          // Try without permission check as fallback
           const invite = await channel.createInvite({
             maxAge: 0,
             maxUses: 0,
@@ -1076,7 +1064,6 @@ export class GiveawayManager extends EventEmitter {
         }
       }
 
-      // Final fallback: channel link
       this.log.warn(`Could not create invite for ${guild.name}, using channel link fallback`);
       return `https://discord.com/channels/${guildId}`;
 
@@ -1091,19 +1078,16 @@ export class GiveawayManager extends EventEmitter {
   // -------------------------------------------------------------------------
   
   private startInviteRefresher(): void {
-    // Clear any existing interval
     if (this.inviteRefresherInterval) {
       clearInterval(this.inviteRefresherInterval);
     }
 
-    // Refresh invites every 5 minutes
     this.inviteRefresherInterval = setInterval(() => {
       this.refreshInvites().catch((err) => {
         this.log.debug(`Invite refresh error: ${formatError(err)}`);
       });
     }, 5 * 60 * 1000);
 
-    // Don't let the interval keep the process alive
     if (this.inviteRefresherInterval.unref) {
       this.inviteRefresherInterval.unref();
     }
@@ -1120,7 +1104,6 @@ export class GiveawayManager extends EventEmitter {
     
     for (const [guildId] of expired) {
       this.inviteCache.delete(guildId);
-      // Async refresh in background
       this.fetchInviteForGuild(guildId).catch((err) => {
         this.log.debug(`Failed to refresh invite for ${guildId}: ${formatError(err)}`);
       });
@@ -1146,13 +1129,11 @@ export class GiveawayManager extends EventEmitter {
       return `https://discord.com/channels/${guildId}`;
     }
 
-    // Generate the invite
     let inviteUrl: string;
     try {
       this.log.debug(`Generating invite for guild ${guildId} (${data.guildName})`);
       inviteUrl = await this.fetchInviteForGuild(guildId);
       
-      // Validate the invite URL
       if (!inviteUrl || 
           inviteUrl.includes('unavailable') || 
           inviteUrl.includes('not reachable') ||
@@ -1167,12 +1148,10 @@ export class GiveawayManager extends EventEmitter {
 
     this.log.debug(`Using invite URL for notification: ${inviteUrl}`);
 
-    // Get guild data for banner and icon (if not already in data)
     let guildIcon = (data as any).guildIcon || null;
     let guildBanner = (data as any).guildBanner || null;
     let memberCount = (data as any).memberCount || null;
 
-    // If not passed, try to get from cache
     if (!guildIcon || !guildBanner) {
       const guild = this.client.guilds.cache.get(guildId);
       if (guild) {
@@ -1189,7 +1168,6 @@ export class GiveawayManager extends EventEmitter {
       notifiedAt: null,
       lastSeenAt: Date.now(),
       inviteUrl: inviteUrl,
-      // Pass the banner and icon data
       guildIcon: guildIcon,
       guildBanner: guildBanner,
       memberCount: memberCount,
@@ -1250,7 +1228,6 @@ export class GiveawayManager extends EventEmitter {
   }
 
   public async shutdown(): Promise<void> {
-    // Clear the invite refresher
     if (this.inviteRefresherInterval) {
       clearInterval(this.inviteRefresherInterval);
       this.inviteRefresherInterval = null;
