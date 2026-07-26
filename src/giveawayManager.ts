@@ -94,6 +94,17 @@ const BLOCKED_MESSAGE_CONTENT: ReadonlyArray<RegExp> = [
   /thank\s+you\s+for\s+participating/i,
 ];
 
+// DRAFT GIVEAWAY INDICATORS - messages that look like giveaways but aren't started yet
+const DRAFT_GIVEAWAY_INDICATORS: ReadonlyArray<RegExp> = [
+  /Review your giveaway/i,
+  /click\s+"Start"\s+to/i,
+  /this message expires in/i,
+  /preview/i,
+  /draft/i,
+  /giveaway\s+preview/i,
+  /configure\s+your\s+giveaway/i,
+];
+
 // ---------------------------------------------------------------------------
 // Scoring System
 // ---------------------------------------------------------------------------
@@ -161,6 +172,7 @@ export class GiveawayManager extends EventEmitter {
     errors: 0,
     falsePositivesBlocked: 0,
     watchlistMatches: 0,
+    draftsSkipped: 0,
     startedAt: Date.now(),
   };
 
@@ -222,6 +234,16 @@ export class GiveawayManager extends EventEmitter {
     this.processingMessages.add(key);
 
     try {
+      // Check if this is a draft giveaway first
+      if (this.isDraftGiveaway(message)) {
+        this.stats.draftsSkipped++;
+        this.log.debug('Skipping draft giveaway creation message', {
+          messageId: message.id,
+          channelId: message.channel.id,
+        });
+        return;
+      }
+
       const existing = await getGiveaway(message.id, message.channel.id);
       if (existing) {
         await updateLastSeen(message.id, message.channel.id);
@@ -397,10 +419,10 @@ export class GiveawayManager extends EventEmitter {
               (message.channel as any).name || 'unknown',
               endsAt,
               messageUrl,
-              guild.id,       // guildId — previously missing, caused "No invite available" in DMs
+              guild.id,
               guildIcon,
               detectedAt,
-              inviteUrl,      // reuse invite already generated for the tracker channel message
+              inviteUrl,
               guildBanner,
               memberCount
             )
@@ -500,9 +522,178 @@ export class GiveawayManager extends EventEmitter {
   }
 
   // -------------------------------------------------------------------------
+  // Draft Giveaway Detection - NEW
+  // -------------------------------------------------------------------------
+  
+  /**
+   * Check if this is a draft/pending giveaway creation message
+   */
+  private isDraftGiveaway(message: Message): boolean {
+    const content = message.content || '';
+    const embed = message.embeds?.[0];
+    
+    // Check content for draft indicators
+    if (DRAFT_GIVEAWAY_INDICATORS.some(re => re.test(content))) {
+      return true;
+    }
+
+    if (embed) {
+      const embedText = [
+        embed.title || '',
+        embed.description || '',
+        embed.footer?.text || '',
+        ...(embed.fields || []).flatMap(f => [f.name, f.value]),
+      ].join(' ');
+
+      if (DRAFT_GIVEAWAY_INDICATORS.some(re => re.test(embedText))) {
+        return true;
+      }
+    }
+
+    // Check for "Start" or "Edit" or "Cancel" buttons (draft management buttons)
+    const components = (message as any).components as any[] | undefined;
+    if (components) {
+      let hasDraftButton = false;
+      for (const row of components) {
+        const comps = row.components as any[] | undefined;
+        if (!comps) continue;
+        for (const comp of comps) {
+          if (comp.type === 2) { // Button
+            const label = (comp.label || '').toLowerCase();
+            if (['start', 'edit', 'cancel', 'preview'].includes(label)) {
+              hasDraftButton = true;
+              break;
+            }
+          }
+        }
+        if (hasDraftButton) break;
+      }
+      
+      if (hasDraftButton) {
+        // Check if there's also an entry button - if not, it's definitely a draft
+        const hasEntryButton = this.hasEntryButton(message);
+        if (!hasEntryButton) {
+          return true;
+        }
+      }
+    }
+
+    return false;
+  }
+
+  /**
+   * Check if the message has an entry button
+   */
+  private hasEntryButton(message: Message): boolean {
+    const components = (message as any).components as any[] | undefined;
+    if (!components) return false;
+
+    for (const row of components) {
+      const comps = row.components as any[] | undefined;
+      if (!comps) continue;
+      for (const comp of comps) {
+        if (comp.type === 2 && comp.style !== 5 && !comp.disabled) {
+          const customId = comp.customId || comp.custom_id || '';
+          const label = (comp.label || '').trim();
+          
+          if (TRUSTED_ENTRY_CUSTOM_IDS.has(customId)) return true;
+          if (ENTRY_BUTTON_LABEL_PATTERNS.some(re => re.test(label))) return true;
+          
+          // Check for giveaway entry emojis
+          for (const emoji of ENTRY_EMOJI_PATTERNS) {
+            if (label.includes(emoji)) return true;
+          }
+        }
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Check if the only actionable button is "Start" (meaning it's a draft)
+   */
+  private isStartButtonOnly(button: ButtonInfo, message: Message): boolean {
+    const components = (message as any).components as any[] | undefined;
+    if (!components) return false;
+
+    let hasEntryButton = false;
+    let hasStartButton = false;
+
+    for (const row of components) {
+      const comps = row.components as any[] | undefined;
+      if (!comps) continue;
+
+      for (const comp of comps) {
+        if (comp.type !== 2 || comp.disabled === true) continue;
+        const label = (comp.label || '').toLowerCase();
+
+        if (label === 'start' || label === 'edit' || label === 'cancel') {
+          hasStartButton = true;
+        }
+
+        // Check if this is an actual entry button
+        if (this.isEntryButton(comp)) {
+          hasEntryButton = true;
+        }
+      }
+    }
+
+    // If there's a Start button and NO entry button, it's a draft
+    return hasStartButton && !hasEntryButton;
+  }
+
+  /**
+   * Check if a component is an entry button
+   */
+  private isEntryButton(comp: any): boolean {
+    const customId = comp.customId || comp.custom_id || '';
+    const label = (comp.label || '').trim();
+
+    if (TRUSTED_ENTRY_CUSTOM_IDS.has(customId)) return true;
+    if (ENTRY_BUTTON_LABEL_PATTERNS.some(re => re.test(label))) return true;
+    
+    // Check for giveaway entry emojis
+    for (const emoji of ENTRY_EMOJI_PATTERNS) {
+      if (label.includes(emoji)) return true;
+    }
+
+    return false;
+  }
+
+  /**
+   * Check if message has a Start/Edit/Cancel button
+   */
+  private hasDraftManagementButton(message: Message): boolean {
+    const components = (message as any).components as any[] | undefined;
+    if (!components) return false;
+
+    for (const row of components) {
+      const comps = row.components as any[] | undefined;
+      if (!comps) continue;
+      for (const comp of comps) {
+        if (comp.type === 2) {
+          const label = (comp.label || '').toLowerCase();
+          if (['start', 'edit', 'cancel', 'preview'].includes(label)) {
+            return true;
+          }
+        }
+      }
+    }
+    return false;
+  }
+
+  // -------------------------------------------------------------------------
   // Detection
   // -------------------------------------------------------------------------
   private async detectGiveaway(message: Message): Promise<DetectedGiveaway | null> {
+    // Check for draft management buttons - if present and no entry button, skip
+    if (this.hasDraftManagementButton(message) && !this.hasEntryButton(message)) {
+      this.log.debug('Skipping giveaway with draft management buttons (no entry button)', {
+        messageId: message.id
+      });
+      return null;
+    }
+
     let signals = this.collectSignalsSync(message);
     let score = Object.values(signals).reduce((sum, v) => sum + v, 0);
     let button = this.extractEntryButton(message);
@@ -537,6 +728,11 @@ export class GiveawayManager extends EventEmitter {
   // -------------------------------------------------------------------------
   private collectSignalsSync(message: Message): Record<string, number> {
     const signals: Record<string, number> = {};
+
+    // If this has draft management buttons and no entry button, skip entirely
+    if (this.hasDraftManagementButton(message) && !this.hasEntryButton(message)) {
+      return {};
+    }
 
     const button = this.extractEntryButton(message);
     if (button) signals['ENTRY_BUTTON'] = GiveawaySignal.ENTRY_BUTTON;
@@ -590,6 +786,45 @@ export class GiveawayManager extends EventEmitter {
     const components = (message as any).components as any[] | undefined;
     if (!components?.length) return null;
 
+    // First check if this has draft buttons - if so, skip
+    let hasDraftButton = false;
+    for (const row of components) {
+      const comps = row.components as any[] | undefined;
+      if (!comps) continue;
+      for (const comp of comps) {
+        if (comp.type === 2 && comp.style !== 5) {
+          const label = (comp.label || '').toLowerCase();
+          if (['start', 'edit', 'cancel', 'preview'].includes(label)) {
+            hasDraftButton = true;
+            break;
+          }
+        }
+      }
+      if (hasDraftButton) break;
+    }
+
+    if (hasDraftButton) {
+      // Check if there's also an entry button
+      let hasEntry = false;
+      for (const row of components) {
+        const comps = row.components as any[] | undefined;
+        if (!comps) continue;
+        for (const comp of comps) {
+          if (comp.type === 2 && comp.style !== 5 && !comp.disabled) {
+            const customId = comp.customId || comp.custom_id || '';
+            const label = (comp.label || '').trim();
+            if (TRUSTED_ENTRY_CUSTOM_IDS.has(customId)) hasEntry = true;
+            if (ENTRY_BUTTON_LABEL_PATTERNS.some(re => re.test(label))) hasEntry = true;
+            if (hasEntry) break;
+          }
+        }
+        if (hasEntry) break;
+      }
+      
+      // If no entry button, this is a draft
+      if (!hasEntry) return null;
+    }
+
     for (const row of components) {
       const comps = row.components as any[] | undefined;
       if (!comps?.length) continue;
@@ -600,6 +835,10 @@ export class GiveawayManager extends EventEmitter {
         if (!customId) continue;
 
         const label = (comp.label || '').trim();
+        // Don't detect "Edit" or "Start" or "Cancel" buttons as entry buttons
+        if (label.toLowerCase() === 'edit' || label.toLowerCase() === 'start' || label.toLowerCase() === 'cancel' || label.toLowerCase() === 'preview') {
+          continue;
+        }
         if (TRUSTED_ENTRY_CUSTOM_IDS.has(customId)) return { customId, label: label || customId };
         if (ENTRY_BUTTON_LABEL_PATTERNS.some(re => re.test(label))) return { customId, label: label || 'Enter' };
       }
@@ -624,7 +863,14 @@ export class GiveawayManager extends EventEmitter {
   // Allowed bot check
   // -------------------------------------------------------------------------
   private isAllowedBot(message: Message): boolean {
-    return !!(message.author?.bot && message.author.id && ALLOWED_GIVEAWAY_BOT_IDS.has(message.author.id));
+    // Check if the message is from an allowed giveaway bot
+    if (!message.author?.bot) return false;
+    if (!message.author.id) return false;
+    
+    // Skip drafts before allowing
+    if (this.isDraftGiveaway(message)) return false;
+    
+    return ALLOWED_GIVEAWAY_BOT_IDS.has(message.author.id);
   }
 
   // -------------------------------------------------------------------------
@@ -685,7 +931,7 @@ export class GiveawayManager extends EventEmitter {
   }
 
   // -------------------------------------------------------------------------
-  // INVITE GENERATION - FIXED
+  // INVITE GENERATION
   // -------------------------------------------------------------------------
   
   private getCachedInvite(guildId: string): string | null {
@@ -882,9 +1128,7 @@ export class GiveawayManager extends EventEmitter {
   }
 
   // -------------------------------------------------------------------------
-  // Notification - FIXED TO PASS BANNER AND THUMBNAIL
-  // Returns the resolved invite URL so callers (e.g. watchlist DMs) can reuse
-  // the exact same invite shown in the tracker channel.
+  // Notification - Returns the resolved invite URL
   // -------------------------------------------------------------------------
   
   private async sendNotification(
@@ -902,7 +1146,7 @@ export class GiveawayManager extends EventEmitter {
       return `https://discord.com/channels/${guildId}`;
     }
 
-    // ACTUALLY generate the invite instead of using fallback
+    // Generate the invite
     let inviteUrl: string;
     try {
       this.log.debug(`Generating invite for guild ${guildId} (${data.guildName})`);
@@ -986,6 +1230,7 @@ export class GiveawayManager extends EventEmitter {
     this.log.info(`  Errors              : ${s.errors}`);
     this.log.info(`  False positives blocked: ${s.falsePositivesBlocked}`);
     this.log.info(`  Watchlist matches   : ${s.watchlistMatches}`);
+    this.log.info(`  Drafts skipped      : ${s.draftsSkipped}`);
     this.log.info(`  Uptime              : ${Math.floor(uptime / 60)}m ${Math.floor(uptime % 60)}s`);
     this.log.info(`  Invites cached      : ${this.inviteCache.size}`);
     this.log.info(`────────────────────────────────────────────────────────`);
@@ -999,6 +1244,7 @@ export class GiveawayManager extends EventEmitter {
       errors: 0, 
       falsePositivesBlocked: 0,
       watchlistMatches: 0,
+      draftsSkipped: 0,
       startedAt: Date.now() 
     };
   }
