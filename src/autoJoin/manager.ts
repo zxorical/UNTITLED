@@ -13,7 +13,7 @@
  * 6. Detects wins and sends webhook notifications
  */
 
-import { Client, Message, TextChannel, Options } from 'discord.js-selfbot-v13';
+import { Client, Message, TextChannel } from 'discord.js-selfbot-v13';
 import { EventEmitter } from 'events';
 import axios from 'axios';
 import { logger } from '../logger.js';
@@ -38,7 +38,6 @@ import {
   saveAutoJoinEntry,
   updateAutoJoinEntryStatus,
   cleanupAutoJoinEntries,
-  getPendingAutoJoinEntries,
 } from '../database.js';
 import { decryptToken } from '../premium/tokenManager.js';
 import { CONFIG } from '../config.js';
@@ -332,22 +331,9 @@ export class AutoJoinManager extends EventEmitter {
 
       // Create client with minimal caching to save memory
       const client = new Client({
-        restGlobalTimeout: 30000,
-        retryLimit: 3,
         // Disable message caching to save memory
         messageCacheLifetime: 60,
         messageSweepInterval: 120,
-        // Disable guild caching for large guilds
-        makeCache: Options.cacheWithLimits({
-          MessageManager: { maxSize: 0 },
-          GuildMemberManager: { maxSize: 0 },
-          ChannelManager: { maxSize: 0 },
-          GuildChannelManager: { maxSize: 0 },
-          PresenceManager: { maxSize: 0 },
-          UserManager: { maxSize: 0 },
-          ReactionManager: { maxSize: 0 },
-          ReactionUserManager: { maxSize: 0 },
-        }),
       });
       
       const session: UserSession = {
@@ -416,8 +402,15 @@ export class AutoJoinManager extends EventEmitter {
         resolve();
         return;
       }
-      client.once('ready', () => { clearTimeout(timeout); resolve(); });
-      client.once('error', (err) => { clearTimeout(timeout); reject(err); });
+      // Use 'ready' event directly on client
+      client.once('ready', () => { 
+        clearTimeout(timeout); 
+        resolve(); 
+      });
+      client.once('error', (err) => { 
+        clearTimeout(timeout); 
+        reject(err); 
+      });
     });
   }
 
@@ -704,7 +697,7 @@ export class AutoJoinManager extends EventEmitter {
         return;
       }
 
-      const entry: Omit<GiveawayEntry, '_id'> = {
+      const entryData: Omit<GiveawayEntry, '_id'> = {
         userId: session.userId,
         messageId: message.id,
         channelId: message.channel.id,
@@ -721,20 +714,17 @@ export class AutoJoinManager extends EventEmitter {
         expiresAt: Date.now() + ENTRY_TTL_MS,
       };
 
-      // Store in MongoDB
-      await saveAutoJoinEntry({
-        ...entry,
-        _id: entryId,
-      });
+      // Store in MongoDB - the database function will add the _id
+      await saveAutoJoinEntry(entryData);
 
       session.stats.detected++;
 
       logger.debug('AutoJoin: Giveaway detected', {
         component: 'AutoJoin',
         userId: session.userId,
-        prize: truncate(entry.prize, 60),
-        guild: entry.guildName,
-        channel: `#${entry.channelName}`,
+        prize: truncate(entryData.prize, 60),
+        guild: entryData.guildName,
+        channel: `#${entryData.channelName}`,
       });
 
       // Enter the giveaway
@@ -843,10 +833,11 @@ export class AutoJoinManager extends EventEmitter {
   // -------------------------------------------------------------------------
 
   private async enterGiveaway(entryId: string, session: UserSession): Promise<void> {
-    const entry = await getAutoJoinEntry(session.userId, 
-      entryId.split(':')[1], // messageId
-      entryId.split(':')[0]  // channelId
-    );
+    const parts = entryId.split(':');
+    const channelId = parts[0];
+    const messageId = parts.slice(1).join(':');
+    
+    const entry = await getAutoJoinEntry(session.userId, messageId, channelId);
     
     if (!entry) return;
 
