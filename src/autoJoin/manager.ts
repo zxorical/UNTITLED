@@ -331,7 +331,6 @@ export class AutoJoinManager extends EventEmitter {
 
       // Create client with minimal caching to save memory
       const client = new Client({
-        // Disable message caching to save memory
         messageCacheLifetime: 60,
         messageSweepInterval: 120,
       });
@@ -397,17 +396,23 @@ export class AutoJoinManager extends EventEmitter {
   private async waitForReady(client: Client): Promise<void> {
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => reject(new Error('Ready timeout')), 10000);
+      
+      // Check if already ready
       if (client.isReady()) {
         clearTimeout(timeout);
         resolve();
         return;
       }
-      // Use 'ready' event directly on client
-      client.once('ready', () => { 
+      
+      // Use type assertion for the client to access once
+      const selfbotClient = client as any;
+      
+      selfbotClient.once('ready', () => { 
         clearTimeout(timeout); 
         resolve(); 
       });
-      client.once('error', (err) => { 
+      
+      selfbotClient.once('error', (err: Error) => { 
         clearTimeout(timeout); 
         reject(err); 
       });
@@ -427,7 +432,9 @@ export class AutoJoinManager extends EventEmitter {
           component: 'AutoJoin',
           userId: session.userId,
         });
-        session.client.destroy();
+        
+        // Use type assertion for destroy
+        (session.client as any).destroy();
         this._startSessionInternal(session.userId, session.guildId)
           .catch(err => logger.error('Reconnect failed', { error: formatError(err) }));
       }
@@ -486,8 +493,9 @@ export class AutoJoinManager extends EventEmitter {
         session.heartbeatInterval = undefined;
       }
       
+      // Use type assertion for destroy
       await Promise.race([
-        session.client.destroy(),
+        (session.client as any).destroy(),
         delay(5000),
       ]);
       
@@ -1105,8 +1113,7 @@ export class AutoJoinManager extends EventEmitter {
     this.emit('giveawayWon', { message, prize, userId, source: 'dm' });
   }
 
-  // -------------------------------------------------------------------------
-  // Webhooks - Priority: User Personal > WIN_WEBHOOK_URL > WEBHOOK_URL
+  // -------------------------------------------------------------------------  // Webhooks - Priority: User Personal > WIN_WEBHOOK_URL > WEBHOOK_URL
   // -------------------------------------------------------------------------
 
   private async sendWinWebhook(
