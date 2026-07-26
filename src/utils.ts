@@ -80,3 +80,15 @@ export function sanitizeForLog(text: string): string {
     .replace(/\s{2,}/g, ' ')
     .trim();
 }
+
+/**
+ * Exponential backoff delay calculator
+ * @param attempt - Current attempt number (0-indexed)
+ * @param baseDelayMs - Base delay in milliseconds
+ * @param maxDelayMs - Maximum delay cap in milliseconds
+ * @returns Calculated delay in milliseconds
+ */
+export function exponentialBackoff(attempt: number, baseDelayMs: number, maxDelayMs: number): number {
+  const delay = baseDelayMs * Math.pow(2, attempt);
+  return Math.min(delay, maxDelayMs);
+}
