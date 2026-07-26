@@ -130,6 +130,9 @@ const GIVEAWAY_KEYWORDS: ReadonlyArray<RegExp> = [
 
 const MINIMUM_SCORE_THRESHOLD = 6;
 
+// Creation detection threshold (lowered from 8 to 7)
+const CREATION_SCORE_THRESHOLD = 7;
+
 // ---------------------------------------------------------------------------
 // Helper types
 // ---------------------------------------------------------------------------
@@ -140,6 +143,11 @@ interface ButtonInfo {
 
 interface ReactionInfo {
   emoji: string;
+}
+
+interface CreationResult {
+  isCreation: boolean;
+  score: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -164,6 +172,11 @@ export class GiveawayManager extends EventEmitter {
 
   // OPTIMIZATION: Cache giveaway text to avoid rebuilding
   private giveawayTextCache = new Map<string, string>();
+
+  // Cache creation detection results per message (keyed by message ID only - globally unique)
+  private creationCache = new Map<string, { result: CreationResult; timestamp: number }>();
+  private readonly CREATION_CACHE_TTL = 5000; // 5 seconds
+  private creationCacheCleanupInterval: NodeJS.Timeout | null = null;
 
   private stats = {
     detected: 0,
@@ -195,6 +208,36 @@ export class GiveawayManager extends EventEmitter {
 
     // Start the invite refresher
     this.startInviteRefresher();
+    
+    // Start creation cache cleanup (runs every 60 seconds)
+    this.startCreationCacheCleanup();
+  }
+
+  // -------------------------------------------------------------------------
+  // Cache Cleanup
+  // -------------------------------------------------------------------------
+  private startCreationCacheCleanup(): void {
+    if (this.creationCacheCleanupInterval) {
+      clearInterval(this.creationCacheCleanupInterval);
+    }
+
+    this.creationCacheCleanupInterval = setInterval(() => {
+      const now = Date.now();
+      let cleaned = 0;
+      for (const [key, value] of this.creationCache) {
+        if (now - value.timestamp > this.CREATION_CACHE_TTL) {
+          this.creationCache.delete(key);
+          cleaned++;
+        }
+      }
+      if (cleaned > 0) {
+        this.log.debug(`Cleaned ${cleaned} expired creation cache entries`);
+      }
+    }, 60000); // Clean every 60 seconds
+
+    if (this.creationCacheCleanupInterval.unref) {
+      this.creationCacheCleanupInterval.unref();
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -213,7 +256,9 @@ export class GiveawayManager extends EventEmitter {
       return;
     }
 
-    if (!this.isAllowedBot(message)) return;
+    // Check if it's a bot and if it's allowed (removed creation check from here)
+    if (!message.author?.bot) return;
+    if (!ALLOWED_GIVEAWAY_BOT_IDS.has(message.author.id)) return;
 
     const content = message.content || '';
     if (BLOCKED_MESSAGE_CONTENT.some(re => re.test(content))) {
@@ -235,51 +280,65 @@ export class GiveawayManager extends EventEmitter {
 
     try {
       // ================================================================
-      // TRIPLE-LAYER CREATION DETECTION - MUST CHECK BEFORE ANYTHING ELSE
+      // SCORE-BASED CREATION DETECTION with caching and smart refresh
       // ================================================================
+      
+      // Check cache first (keyed by message ID only - globally unique)
+      const cacheKey = message.id;
+      let cached = this.creationCache.get(cacheKey);
+      let result: CreationResult;
 
-      // --- LAYER 1: Check for Edit + Start buttons ---
-      if (this.hasEditAndStartButtons(message)) {
-        this.stats.draftsSkipped++;
-        this.log.debug('Skipping creation (Edit+Start buttons)', {
-          messageId: message.id,
-          channelId: message.channel.id,
+      if (cached && (Date.now() - cached.timestamp) < this.CREATION_CACHE_TTL) {
+        result = cached.result;
+      } else {
+        // Initial check
+        result = this.isCreationMessage(message);
+        
+        // Smart refresh: only fetch if important data is missing
+        if (!result.isCreation && this.shouldRefreshMessage(message)) {
+          try {
+            const refreshed = await message.fetch();
+            const refreshedResult = this.isCreationMessage(refreshed);
+            // Only use refreshed result if it changed
+            if (refreshedResult.isCreation || refreshedResult.score > result.score) {
+              result = refreshedResult;
+            }
+          } catch {
+            // If fetch fails, keep original result
+          }
+        }
+        
+        // Cache the result
+        this.creationCache.set(cacheKey, {
+          result,
+          timestamp: Date.now(),
         });
-        return;
       }
-
-      // --- LAYER 2: Check for creation text patterns ---
-      const allText = this.getGiveawayText(message);
-      const creationPatterns = [
-        /Review your giveaway/i,
-        /click "Start" to start this giveaway/i,
-        /click 'Start' to start this giveaway/i,
-        /This message expires in \d+ minutes?/i,
-        /Configure your giveaway/i,
-        /Giveaway preview/i,
-        /You can edit this/i,
-        /You can change/i,
-      ];
-      if (creationPatterns.some(re => re.test(allText))) {
-        this.stats.draftsSkipped++;
-        this.log.debug('Skipping creation (text pattern match)', {
+      
+      // Log the score for debugging (only if score >= 4 to reduce noise)
+      if (result.score >= 4) {
+        const allText = this.getCachedGiveawayText(message);
+        const components = (message as any).components as any[] | undefined;
+        const buttonLabels = this.getButtonLabels(components);
+        
+        this.log.debug('Creation score', {
           messageId: message.id,
-          channelId: message.channel.id,
+          score: result.score,
+          threshold: CREATION_SCORE_THRESHOLD,
+          isCreation: result.isCreation,
+          textPreview: allText.slice(0, 150),
+          buttons: buttonLabels,
+          embeds: message.embeds?.length ?? 0,
+          components: components?.length ?? 0,
         });
-        return;
       }
-
-      // --- LAYER 3: Check for management buttons count ---
-      // If there are 2+ management buttons AND 1+ entry button, it's a creation
-      const managementCount = this.countManagementButtons(message);
-      const entryCount = this.countEntryButtons(message);
-      if (managementCount >= 2 && entryCount >= 1) {
+      
+      if (result.isCreation) {
         this.stats.draftsSkipped++;
-        this.log.debug('Skipping creation (management buttons count)', {
+        this.log.debug('Skipping giveaway creation (score-based detection)', {
           messageId: message.id,
           channelId: message.channel.id,
-          managementCount,
-          entryCount,
+          score: result.score,
         });
         return;
       }
@@ -364,6 +423,120 @@ export class GiveawayManager extends EventEmitter {
       this.processingMessages.delete(key);
       this.giveawayTextCache.delete(message.id);
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // Helper: Check if message should be refreshed
+  // -------------------------------------------------------------------------
+  private shouldRefreshMessage(message: Message): boolean {
+    // If there are no embeds but the message likely should have them
+    if (message.embeds.length === 0) {
+      return true;
+    }
+    
+    // If there are no components but the message likely should have them
+    const components = (message as any).components;
+    if (!components || components.length === 0) {
+      return true;
+    }
+    
+    // If the content is very short but has giveaway-like text
+    const content = message.content || '';
+    if (content.length < 50 && /\bgiveaway\b/i.test(content)) {
+      return true;
+    }
+    
+    return false;
+  }
+
+  // -------------------------------------------------------------------------
+  // Helper: Get button labels
+  // -------------------------------------------------------------------------
+  private getButtonLabels(components: any[] | undefined): string[] {
+    if (!components) return [];
+    
+    const labels: string[] = [];
+    for (const row of components) {
+      const comps = row.components as any[] | undefined;
+      if (!comps) continue;
+      for (const comp of comps) {
+        if (comp.type === 2) {
+          const label = (comp.label || '').toLowerCase().trim();
+          labels.push(label);
+        }
+      }
+    }
+    return labels;
+  }
+
+  // -------------------------------------------------------------------------
+  // SCORE-BASED CREATION DETECTION
+  // -------------------------------------------------------------------------
+
+  /**
+   * Score-based detection for giveaway creation messages
+   * Returns { isCreation: boolean, score: number }
+   */
+  private isCreationMessage(message: Message): CreationResult {
+    // Use cached text to avoid rebuilding
+    const allText = this.getCachedGiveawayText(message);
+    const components = (message as any).components as any[] | undefined;
+    
+    let score = 0;
+    const buttonLabels = this.getButtonLabels(components);
+
+    // --- TEXT-BASED SIGNALS ---
+    
+    // High weight signals (5 points) - more specific patterns
+    if (/Review your giveaway/i.test(allText)) score += 5;
+    if (/this message expires in \d+ minutes?/i.test(allText)) score += 5;
+    if (/click "Start" to start this giveaway/i.test(allText)) score += 5;
+    if (/click 'Start' to start this giveaway/i.test(allText)) score += 5;
+    if (/configure your giveaway/i.test(allText)) score += 5;
+
+    // Medium weight signals (3 points)
+    if (/giveaway preview/i.test(allText)) score += 3;
+    if (/setup your giveaway/i.test(allText)) score += 3;
+    if (/you can edit this/i.test(allText)) score += 3;
+    if (/you can change/i.test(allText)) score += 3;
+    // More specific: "Review" + "Start" combined in text
+    if (/review.*start/i.test(allText)) score += 3;
+
+    // Low weight signals (2 points)
+    if (/create(?: a)? giveaway/i.test(allText)) score += 2;
+    if (/select a channel/i.test(allText)) score += 2;
+    if (/set (?:the )?(?:prize|duration|winners)/i.test(allText)) score += 2;
+
+    // --- BUTTON-BASED SIGNALS ---
+    // Check if any button label contains "start", "edit", "cancel", "preview", "setup"
+    // This handles cases like "🎉 Start" or "✏️ Edit"
+    const hasStart = buttonLabels.some(label => label.includes('start'));
+    const hasEdit = buttonLabels.some(label => label.includes('edit'));
+    const hasCancel = buttonLabels.some(label => label.includes('cancel'));
+    const hasPreview = buttonLabels.some(label => label.includes('preview'));
+    const hasSetup = buttonLabels.some(label => label.includes('setup'));
+
+    if (hasStart) score += 3;
+    if (hasEdit) score += 2;
+    if (hasCancel) score += 2;
+    if (hasPreview) score += 2;
+    if (hasSetup) score += 2;
+
+    // --- DURATION CHECK ---
+    // Fixed regex with capturing group
+    const durationMatch = allText.match(/(\d+)\s*(minute|min|m|hour|h)/i);
+    if (durationMatch) {
+      const value = parseInt(durationMatch[1], 10);
+      const unit = (durationMatch[2] || '').toLowerCase();
+      let minutes = value;
+      if (unit.startsWith('h')) minutes = value * 60;
+      // Creation messages often have short durations (1-15 minutes)
+      if (minutes <= 15) score += 2;
+    }
+
+    const isCreation = score >= CREATION_SCORE_THRESHOLD;
+    
+    return { isCreation, score };
   }
 
   // -------------------------------------------------------------------------
@@ -547,6 +720,8 @@ export class GiveawayManager extends EventEmitter {
       if (embed.title) parts.push(embed.title);
       if (embed.description) parts.push(embed.description);
       if (embed.footer?.text) parts.push(embed.footer.text);
+      // Include embed author
+      if (embed.author?.name) parts.push(embed.author.name);
       if (embed.fields) {
         for (const field of embed.fields) {
           parts.push(field.name);
@@ -559,7 +734,7 @@ export class GiveawayManager extends EventEmitter {
   }
 
   // -------------------------------------------------------------------------
-  // CREATION DETECTION METHODS
+  // CREATION DETECTION METHODS (legacy - kept for backward compatibility)
   // -------------------------------------------------------------------------
   
   /**
@@ -728,6 +903,16 @@ export class GiveawayManager extends EventEmitter {
   private isEntryButton(comp: any): boolean {
     const customId = comp.customId || comp.custom_id || '';
     const label = (comp.label || '').trim();
+    const lowerLabel = label.toLowerCase();
+
+    // Skip management buttons (using includes to handle emoji prefixes like "🎉 Start")
+    if (lowerLabel.includes('edit') || 
+        lowerLabel.includes('start') || 
+        lowerLabel.includes('cancel') || 
+        lowerLabel.includes('preview') || 
+        lowerLabel.includes('setup')) {
+      return false;
+    }
 
     if (TRUSTED_ENTRY_CUSTOM_IDS.has(customId)) return true;
     if (ENTRY_BUTTON_LABEL_PATTERNS.some(re => re.test(label))) return true;
@@ -765,6 +950,20 @@ export class GiveawayManager extends EventEmitter {
   // Detection
   // -------------------------------------------------------------------------
   private async detectGiveaway(message: Message): Promise<DetectedGiveaway | null> {
+    // Check if it's a creation message (uses cache)
+    const cacheKey = message.id;
+    const cached = this.creationCache.get(cacheKey);
+    if (cached && cached.result.isCreation) {
+      return null;
+    }
+    // If not in cache, check fresh
+    if (!cached) {
+      const result = this.isCreationMessage(message);
+      if (result.isCreation) {
+        return null;
+      }
+    }
+
     // If it has Edit+Start, it's a creation message - skip
     if (this.hasEditAndStartButtons(message)) {
       return null;
@@ -812,6 +1011,20 @@ export class GiveawayManager extends EventEmitter {
   // -------------------------------------------------------------------------
   private collectSignalsSync(message: Message): Record<string, number> {
     const signals: Record<string, number> = {};
+
+    // Check if it's a creation message (uses cache)
+    const cacheKey = message.id;
+    const cached = this.creationCache.get(cacheKey);
+    if (cached && cached.result.isCreation) {
+      return {};
+    }
+    // If not in cache, check fresh
+    if (!cached) {
+      const result = this.isCreationMessage(message);
+      if (result.isCreation) {
+        return {};
+      }
+    }
 
     // If it has Edit+Start, skip entirely
     if (this.hasEditAndStartButtons(message)) {
@@ -875,6 +1088,20 @@ export class GiveawayManager extends EventEmitter {
     const components = (message as any).components as any[] | undefined;
     if (!components?.length) return null;
 
+    // Check if it's a creation message (uses cache)
+    const cacheKey = message.id;
+    const cached = this.creationCache.get(cacheKey);
+    if (cached && cached.result.isCreation) {
+      return null;
+    }
+    // If not in cache, check fresh
+    if (!cached) {
+      const result = this.isCreationMessage(message);
+      if (result.isCreation) {
+        return null;
+      }
+    }
+
     // If it has Edit+Start, skip
     if (this.hasEditAndStartButtons(message)) {
       return null;
@@ -927,8 +1154,13 @@ export class GiveawayManager extends EventEmitter {
         if (!customId) continue;
 
         const label = (comp.label || '').trim();
-        // Don't detect "Edit" or "Start" or "Cancel" buttons as entry buttons
-        if (label.toLowerCase() === 'edit' || label.toLowerCase() === 'start' || label.toLowerCase() === 'cancel' || label.toLowerCase() === 'preview') {
+        const lowerLabel = label.toLowerCase();
+        // Skip management buttons (using includes to handle emoji prefixes like "🎉 Start")
+        if (lowerLabel.includes('edit') || 
+            lowerLabel.includes('start') || 
+            lowerLabel.includes('cancel') || 
+            lowerLabel.includes('preview') || 
+            lowerLabel.includes('setup')) {
           continue;
         }
         if (TRUSTED_ENTRY_CUSTOM_IDS.has(customId)) return { customId, label: label || customId };
@@ -952,16 +1184,11 @@ export class GiveawayManager extends EventEmitter {
   }
 
   // -------------------------------------------------------------------------
-  // Allowed bot check
+  // Allowed bot check (SIMPLIFIED - no creation check)
   // -------------------------------------------------------------------------
   private isAllowedBot(message: Message): boolean {
     if (!message.author?.bot) return false;
     if (!message.author.id) return false;
-    
-    // Skip drafts before allowing
-    if (this.hasEditAndStartButtons(message)) return false;
-    if (this.isDraftGiveaway(message)) return false;
-    
     return ALLOWED_GIVEAWAY_BOT_IDS.has(message.author.id);
   }
 
@@ -1321,6 +1548,10 @@ export class GiveawayManager extends EventEmitter {
     if (this.inviteRefresherInterval) {
       clearInterval(this.inviteRefresherInterval);
       this.inviteRefresherInterval = null;
+    }
+    if (this.creationCacheCleanupInterval) {
+      clearInterval(this.creationCacheCleanupInterval);
+      this.creationCacheCleanupInterval = null;
     }
 
     this.log.info(`Shutting down ${this.accountLabel}...`);
