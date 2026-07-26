@@ -103,7 +103,17 @@ const DRAFT_GIVEAWAY_INDICATORS: ReadonlyArray<RegExp> = [
   /draft/i,
   /giveaway\s+preview/i,
   /configure\s+your\s+giveaway/i,
+  /Click\s+[^\s]+\s+button\s+to\s+enter!/i, // "Click 🏅 button to enter!" in drafts
 ];
+
+// DRAFT BUTTON LABELS - buttons that appear on draft messages
+const DRAFT_BUTTON_LABELS: ReadonlySet<string> = new Set([
+  'edit',
+  'start',
+  'cancel',
+  'preview',
+  'back',
+]);
 
 // ---------------------------------------------------------------------------
 // Scoring System
@@ -234,12 +244,13 @@ export class GiveawayManager extends EventEmitter {
     this.processingMessages.add(key);
 
     try {
-      // Check if this is a draft giveaway first
+      // Check if this is a draft giveaway FIRST - before any other processing
       if (this.isDraftGiveaway(message)) {
         this.stats.draftsSkipped++;
         this.log.debug('Skipping draft giveaway creation message', {
           messageId: message.id,
           channelId: message.channel.id,
+          content: message.content?.slice(0, 50) || '',
         });
         return;
       }
@@ -522,21 +533,22 @@ export class GiveawayManager extends EventEmitter {
   }
 
   // -------------------------------------------------------------------------
-  // Draft Giveaway Detection - NEW
+  // Draft Giveaway Detection - ENHANCED
   // -------------------------------------------------------------------------
   
   /**
    * Check if this is a draft/pending giveaway creation message
+   * Uses multiple detection strategies for maximum accuracy
    */
   private isDraftGiveaway(message: Message): boolean {
+    // Strategy 1: Check content for draft indicators
     const content = message.content || '';
-    const embed = message.embeds?.[0];
-    
-    // Check content for draft indicators
     if (DRAFT_GIVEAWAY_INDICATORS.some(re => re.test(content))) {
       return true;
     }
 
+    // Strategy 2: Check embed content for draft indicators
+    const embed = message.embeds?.[0];
     if (embed) {
       const embedText = [
         embed.title || '',
@@ -550,30 +562,76 @@ export class GiveawayManager extends EventEmitter {
       }
     }
 
-    // Check for "Start" or "Edit" or "Cancel" buttons (draft management buttons)
+    // Strategy 3: Check for draft management buttons (Edit + Start together)
     const components = (message as any).components as any[] | undefined;
     if (components) {
-      let hasDraftButton = false;
+      const buttonLabels = new Set<string>();
+      
       for (const row of components) {
         const comps = row.components as any[] | undefined;
         if (!comps) continue;
         for (const comp of comps) {
           if (comp.type === 2) { // Button
             const label = (comp.label || '').toLowerCase();
-            if (['start', 'edit', 'cancel', 'preview'].includes(label)) {
-              hasDraftButton = true;
-              break;
-            }
+            buttonLabels.add(label);
           }
         }
-        if (hasDraftButton) break;
       }
-      
-      if (hasDraftButton) {
-        // Check if there's also an entry button - if not, it's definitely a draft
+
+      // CRITICAL: If there's BOTH an "edit" AND a "start" button, this is DEFINITELY a draft
+      if (buttonLabels.has('edit') && buttonLabels.has('start')) {
+        return true;
+      }
+
+      // If there's a "start" button AND any of the draft indicators in content/embed
+      if (buttonLabels.has('start')) {
+        // Check if there's no "enter" or "join" button (entry button)
         const hasEntryButton = this.hasEntryButton(message);
         if (!hasEntryButton) {
           return true;
+        }
+        
+        // Additional check: if there's a "start" button and the prize is short/generic
+        // (draft giveaways often have placeholder prizes)
+        const prize = this.extractPrize(message);
+        if (prize && prize.length < 10 && /^(test|testing|prize|giveaway|example)/i.test(prize)) {
+          return true;
+        }
+      }
+
+      // If there's a "cancel" button along with any draft indicator
+      if (buttonLabels.has('cancel')) {
+        const embedText = embed ? [
+          embed.title || '',
+          embed.description || '',
+          embed.footer?.text || '',
+        ].join(' ') : '';
+        
+        if (/\b(?:duration|winners?|ends?)\b/i.test(embedText)) {
+          // Check if duration is very short (drafts often have 1 minute duration)
+          if (/\b1\s*(?:minute|min)\b/i.test(embedText)) {
+            return true;
+          }
+        }
+      }
+    }
+
+    // Strategy 4: Check for "Click 🏅 button to enter!" pattern (common in drafts)
+    const allText = this.getGiveawayText(message);
+    if (/click\s+[^\s]+\s+button\s+to\s+enter!/i.test(allText)) {
+      // If it has "Edit" or "Start" button in components
+      if (components) {
+        for (const row of components) {
+          const comps = row.components as any[] | undefined;
+          if (!comps) continue;
+          for (const comp of comps) {
+            if (comp.type === 2) {
+              const label = (comp.label || '').toLowerCase();
+              if (label === 'edit' || label === 'start' || label === 'cancel') {
+                return true;
+              }
+            }
+          }
         }
       }
     }
@@ -596,6 +654,9 @@ export class GiveawayManager extends EventEmitter {
           const customId = comp.customId || comp.custom_id || '';
           const label = (comp.label || '').trim();
           
+          // Skip draft management buttons
+          if (DRAFT_BUTTON_LABELS.has(label.toLowerCase())) continue;
+          
           if (TRUSTED_ENTRY_CUSTOM_IDS.has(customId)) return true;
           if (ENTRY_BUTTON_LABEL_PATTERNS.some(re => re.test(label))) return true;
           
@@ -610,44 +671,14 @@ export class GiveawayManager extends EventEmitter {
   }
 
   /**
-   * Check if the only actionable button is "Start" (meaning it's a draft)
-   */
-  private isStartButtonOnly(button: ButtonInfo, message: Message): boolean {
-    const components = (message as any).components as any[] | undefined;
-    if (!components) return false;
-
-    let hasEntryButton = false;
-    let hasStartButton = false;
-
-    for (const row of components) {
-      const comps = row.components as any[] | undefined;
-      if (!comps) continue;
-
-      for (const comp of comps) {
-        if (comp.type !== 2 || comp.disabled === true) continue;
-        const label = (comp.label || '').toLowerCase();
-
-        if (label === 'start' || label === 'edit' || label === 'cancel') {
-          hasStartButton = true;
-        }
-
-        // Check if this is an actual entry button
-        if (this.isEntryButton(comp)) {
-          hasEntryButton = true;
-        }
-      }
-    }
-
-    // If there's a Start button and NO entry button, it's a draft
-    return hasStartButton && !hasEntryButton;
-  }
-
-  /**
    * Check if a component is an entry button
    */
   private isEntryButton(comp: any): boolean {
     const customId = comp.customId || comp.custom_id || '';
     const label = (comp.label || '').trim();
+
+    // Skip draft management buttons
+    if (DRAFT_BUTTON_LABELS.has(label.toLowerCase())) return false;
 
     if (TRUSTED_ENTRY_CUSTOM_IDS.has(customId)) return true;
     if (ENTRY_BUTTON_LABEL_PATTERNS.some(re => re.test(label))) return true;
@@ -661,7 +692,7 @@ export class GiveawayManager extends EventEmitter {
   }
 
   /**
-   * Check if message has a Start/Edit/Cancel button
+   * Check if message has draft management buttons
    */
   private hasDraftManagementButton(message: Message): boolean {
     const components = (message as any).components as any[] | undefined;
@@ -673,7 +704,7 @@ export class GiveawayManager extends EventEmitter {
       for (const comp of comps) {
         if (comp.type === 2) {
           const label = (comp.label || '').toLowerCase();
-          if (['start', 'edit', 'cancel', 'preview'].includes(label)) {
+          if (DRAFT_BUTTON_LABELS.has(label)) {
             return true;
           }
         }
@@ -682,11 +713,44 @@ export class GiveawayManager extends EventEmitter {
     return false;
   }
 
+  /**
+   * Check if this message has both Edit AND Start buttons (definitive draft indicator)
+   */
+  private hasEditAndStartButtons(message: Message): boolean {
+    const components = (message as any).components as any[] | undefined;
+    if (!components) return false;
+
+    let hasEdit = false;
+    let hasStart = false;
+
+    for (const row of components) {
+      const comps = row.components as any[] | undefined;
+      if (!comps) continue;
+      for (const comp of comps) {
+        if (comp.type === 2) {
+          const label = (comp.label || '').toLowerCase();
+          if (label === 'edit') hasEdit = true;
+          if (label === 'start') hasStart = true;
+        }
+      }
+    }
+
+    return hasEdit && hasStart;
+  }
+
   // -------------------------------------------------------------------------
   // Detection
   // -------------------------------------------------------------------------
   private async detectGiveaway(message: Message): Promise<DetectedGiveaway | null> {
-    // Check for draft management buttons - if present and no entry button, skip
+    // If there's both Edit AND Start buttons, this is DEFINITELY a draft
+    if (this.hasEditAndStartButtons(message)) {
+      this.log.debug('Skipping giveaway with Edit + Start buttons (definitive draft)', {
+        messageId: message.id
+      });
+      return null;
+    }
+
+    // If there's a Start button and no entry button, skip
     if (this.hasDraftManagementButton(message) && !this.hasEntryButton(message)) {
       this.log.debug('Skipping giveaway with draft management buttons (no entry button)', {
         messageId: message.id
@@ -729,7 +793,12 @@ export class GiveawayManager extends EventEmitter {
   private collectSignalsSync(message: Message): Record<string, number> {
     const signals: Record<string, number> = {};
 
-    // If this has draft management buttons and no entry button, skip entirely
+    // If this has Edit + Start buttons, skip entirely
+    if (this.hasEditAndStartButtons(message)) {
+      return {};
+    }
+
+    // If this has draft management buttons and no entry button, skip
     if (this.hasDraftManagementButton(message) && !this.hasEntryButton(message)) {
       return {};
     }
@@ -786,7 +855,12 @@ export class GiveawayManager extends EventEmitter {
     const components = (message as any).components as any[] | undefined;
     if (!components?.length) return null;
 
-    // First check if this has draft buttons - if so, skip
+    // First check for Edit + Start (definitive draft)
+    if (this.hasEditAndStartButtons(message)) {
+      return null;
+    }
+
+    // Check if this has draft management buttons
     let hasDraftButton = false;
     for (const row of components) {
       const comps = row.components as any[] | undefined;
@@ -794,7 +868,7 @@ export class GiveawayManager extends EventEmitter {
       for (const comp of comps) {
         if (comp.type === 2 && comp.style !== 5) {
           const label = (comp.label || '').toLowerCase();
-          if (['start', 'edit', 'cancel', 'preview'].includes(label)) {
+          if (DRAFT_BUTTON_LABELS.has(label)) {
             hasDraftButton = true;
             break;
           }
@@ -813,6 +887,10 @@ export class GiveawayManager extends EventEmitter {
           if (comp.type === 2 && comp.style !== 5 && !comp.disabled) {
             const customId = comp.customId || comp.custom_id || '';
             const label = (comp.label || '').trim();
+            
+            // Skip draft management buttons
+            if (DRAFT_BUTTON_LABELS.has(label.toLowerCase())) continue;
+            
             if (TRUSTED_ENTRY_CUSTOM_IDS.has(customId)) hasEntry = true;
             if (ENTRY_BUTTON_LABEL_PATTERNS.some(re => re.test(label))) hasEntry = true;
             if (hasEntry) break;
@@ -835,8 +913,8 @@ export class GiveawayManager extends EventEmitter {
         if (!customId) continue;
 
         const label = (comp.label || '').trim();
-        // Don't detect "Edit" or "Start" or "Cancel" buttons as entry buttons
-        if (label.toLowerCase() === 'edit' || label.toLowerCase() === 'start' || label.toLowerCase() === 'cancel' || label.toLowerCase() === 'preview') {
+        // Skip draft management buttons
+        if (DRAFT_BUTTON_LABELS.has(label.toLowerCase())) {
           continue;
         }
         if (TRUSTED_ENTRY_CUSTOM_IDS.has(customId)) return { customId, label: label || customId };
