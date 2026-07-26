@@ -14,6 +14,14 @@ export interface AppConfig {
   notificationCooldown: number;
   statsIntervalMs: number;
   adminUserIds: string[];
+  
+  // AutoJoin settings
+  maxRetries: number;
+  retryDelayMs: number;
+  buttonDelayMs: number;
+  reactionDelayMs: number;
+  webhookUrl: string;
+  winWebhookUrl: string;
 }
 
 export interface GiveawayData {
@@ -93,4 +101,66 @@ export interface LicenseKey {
   usedBy: string | null;
   createdAt: number;
   createdBy: string;
+}
+
+// AutoJoin Types
+export interface GiveawayEntry {
+  entryId: string;
+  messageId: string;
+  channelId: string;
+  guildId: string;
+  authorId: string;
+  guildName: string;
+  channelName: string;
+  prize: string;
+  entryMethod: EntryMethod;
+  buttonCustomId?: string;
+  reactionEmoji?: string;
+  detectionSource: DetectionSource;
+  detectedAt: number;
+  endsAt?: number;
+  status: EntryStatus;
+  attempts: number;
+  userId: string;
+  lastAttemptAt?: number;
+  lastError?: string;
+}
+
+export enum EntryMethod {
+  BUTTON = 'button',
+  REACTION = 'reaction',
+}
+
+export enum EntryStatus {
+  PENDING = 'pending',
+  ATTEMPTING = 'attempting',
+  SUCCESS = 'success',
+  FAILED = 'failed',
+  SKIPPED = 'skipped',
+}
+
+export interface GiveawayButton {
+  customId: string;
+  label: string;
+  disabled: boolean;
+}
+
+export interface GiveawayStats {
+  totalDetected: number;
+  totalSucceeded: number;
+  totalFailed: number;
+  totalSkipped: number;
+  totalDuplicates: number;
+  totalWins: number;
+  serversJoined: number;
+  serversJoinFailed: number;
+  startedAt: number;
+  lastDetectedAt?: number;
+  lastSuccessAt?: number;
+}
+
+export interface ManagerState {
+  entries: Map<string, GiveawayEntry>;
+  processing: Set<string>;
+  stats: GiveawayStats;
 }
