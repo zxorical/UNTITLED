@@ -65,6 +65,7 @@ import {
   assignPremiumRole,
   addPremiumUser,
   removePremiumUser as removePremiumUserService,
+  checkPremium,
 } from './license/licenseMiddleware.js';
 
 declare function updateNotificationStatus(
@@ -373,6 +374,7 @@ export class BotManager {
   private commandsRegistered = false;
   private presenceInterval: NodeJS.Timeout | null = null;
   private cleanupInterval: NodeJS.Timeout | null = null;
+  private verificationInterval: NodeJS.Timeout | null = null;
 
   public metrics = new MetricsCollector();
   public notifications: NotificationService;
@@ -406,8 +408,6 @@ export class BotManager {
     this.commands.set('panel', this.panelCommand.bind(this));
     this.commands.set('purge', this.purgeCommand.bind(this));
     this.commands.set('watch', this.watchlistCommand.bind(this));
-    this.commands.set('activate', this.activateCommand.bind(this));
-    this.commands.set('premium', this.premiumCommand.bind(this));
     this.commands.set('licenseadmin', this.licenseAdminCommand.bind(this));
 
     // --- Booster Listeners ---
@@ -428,6 +428,9 @@ export class BotManager {
 
       // Auto-assign premium to existing boosters on startup
       await this.assignPremiumToExistingBoosters();
+
+      // Start periodic premium role verification
+      this.verificationInterval = setInterval(() => this.verifyAllPremiumRoles(), 300000); // Every 5 minutes
     });
 
     // --- Interaction Handler ---
@@ -561,6 +564,7 @@ export class BotManager {
   public async destroy(): Promise<void> {
     if (this.presenceInterval) clearInterval(this.presenceInterval);
     if (this.cleanupInterval) clearInterval(this.cleanupInterval);
+    if (this.verificationInterval) clearInterval(this.verificationInterval);
     await this.client.destroy();
   }
 
@@ -569,6 +573,64 @@ export class BotManager {
     this.metrics.recordDetection(Date.now() - data.detectedAt);
     await this.updatePresence();
     return true;
+  }
+
+  // -------------------------------------------------------------------------
+  // Premium Role Verification (Security)
+  // -------------------------------------------------------------------------
+
+  private async verifyAllPremiumRoles(): Promise<void> {
+    const guildId = process.env.GUILD_ID;
+    const premiumRoleId = process.env.PREMIUM_ROLE_ID;
+    
+    if (!guildId || !premiumRoleId) {
+      return;
+    }
+    
+    try {
+      const guild = await this.client.guilds.fetch(guildId);
+      const members = await guild.members.fetch();
+      
+      const allPremiumUsers = await getAllPremiumUsers(guildId);
+      const validUserIds = new Set(allPremiumUsers.map(u => u.userId));
+      
+      // Also check boosters
+      const boosterRoleId = process.env.BOOSTER_ROLE_ID;
+      let fixed = 0;
+      
+      for (const [, member] of members) {
+        const hasRole = member.roles.cache.has(premiumRoleId);
+        const isBooster = boosterRoleId ? member.roles.cache.has(boosterRoleId) : false;
+        const shouldHaveRole = validUserIds.has(member.id) || isBooster;
+        
+        if (hasRole && !shouldHaveRole) {
+          // Remove role from people who shouldn't have it
+          await member.roles.remove(premiumRoleId);
+          fixed++;
+          logger.warn('Removed unauthorized premium role', { 
+            userId: member.id, 
+            username: member.user.username 
+          });
+        } else if (!hasRole && shouldHaveRole) {
+          // Add role to people who should have it
+          await member.roles.add(premiumRoleId);
+          fixed++;
+          logger.info('Added missing premium role', { 
+            userId: member.id, 
+            username: member.user.username 
+          });
+        }
+      }
+      
+      if (fixed > 0) {
+        logger.info(`Premium role verification fixed ${fixed} members`, { component: 'BotManager' });
+      }
+    } catch (error) {
+      logger.error('Premium role verification failed', { 
+        component: 'BotManager',
+        error: formatError(error) 
+      });
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -901,64 +963,6 @@ export class BotManager {
     await interaction.editReply({ content: 'License management panel sent to this channel.' });
   }
 
-  private async activateCommand(interaction: ChatInputCommandInteraction<CacheType>) {
-    const key = interaction.options.getString('key', true).trim().toUpperCase();
-
-    await interaction.deferReply({ ephemeral: true });
-
-    const result = await useLicenseKey(key, interaction.user.id);
-
-    if (!result.success) {
-      await interaction.editReply({
-        content: `Activation failed: ${result.error || 'Unknown error'}`,
-      });
-      return;
-    }
-
-    const guildId = interaction.guildId;
-    if (!guildId) {
-      await interaction.editReply({
-        content: 'Activation failed: This command must be used in a server.',
-      });
-      return;
-    }
-
-    const roleResult = await assignPremiumRole(interaction.user.id, guildId);
-
-    if (!roleResult.success) {
-      await interaction.editReply({
-        content: `Activation failed: ${roleResult.error || 'Could not assign premium role.'}`,
-      });
-      return;
-    }
-
-    await interaction.editReply({
-      content: 'Premium activated successfully.',
-    });
-  }
-
-  private async premiumCommand(interaction: ChatInputCommandInteraction<CacheType>) {
-    await interaction.deferReply({ ephemeral: true });
-
-    const premium = await isPremium(interaction.user.id, interaction.guildId || undefined);
-
-    if (!premium) {
-      await interaction.editReply({
-        content: [
-          'You do not have premium access.',
-          '',
-          'To activate premium, click the "Activate Premium" button in the license panel.',
-          'Contact an administrator to obtain a license key.',
-        ].join('\n'),
-      });
-      return;
-    }
-
-    await interaction.editReply({
-      content: 'You have premium access.',
-    });
-  }
-
   private async licenseAdminCommand(interaction: ChatInputCommandInteraction<CacheType>) {
     if (!await requireOwner(interaction)) return;
 
@@ -1101,13 +1105,14 @@ export class BotManager {
         { name: '/setchannel', value: 'Set notify channel (admin)', inline: false },
         { name: '/reset', value: 'Clear database (admin)', inline: false },
         { name: '/panel', value: 'Send license management panel (owner)', inline: false },
-        { name: '/activate <key>', value: 'Activate premium license', inline: false },
-        { name: '/premium', value: 'Check premium status', inline: false },
         { name: '/licenseadmin', value: 'Send admin license management panel (owner)', inline: false },
         { name: '/watch add <item>', value: 'Track giveaway items', inline: false },
         { name: '/watch remove <item>', value: 'Stop tracking item', inline: false },
         { name: '/watch list', value: 'Show tracked items', inline: false },
         { name: '/watch clear', value: 'Clear all items', inline: false },
+        { name: '', value: '────────────────────', inline: false },
+        { name: 'Premium Access', value: 'Click the "Activate Premium" button in the license panel', inline: false },
+        { name: 'AutoJoiner', value: 'Click the "AutoJoiner" button in the premium panel', inline: false },
       )
       .setFooter({ text: 'made by gab' })
       .setTimestamp();
@@ -1497,17 +1502,6 @@ export class BotManager {
         .setName('panel')
         .setDescription('Send license management panel (owner only)')
         .setDefaultMemberPermissions(0),
-      new SlashCommandBuilder()
-        .setName('activate')
-        .setDescription('Activate a premium license key')
-        .addStringOption(opt =>
-          opt.setName('key')
-            .setDescription('Your license key')
-            .setRequired(true)
-        ),
-      new SlashCommandBuilder()
-        .setName('premium')
-        .setDescription('Check your premium status'),
       new SlashCommandBuilder()
         .setName('licenseadmin')
         .setDescription('Send admin license management panel (owner only)')
