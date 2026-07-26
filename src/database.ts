@@ -900,7 +900,7 @@ export async function saveAutoJoinEntry(entry: Omit<AutoJoinEntry, '_id'>): Prom
   await ensureConnected();
   const entryWithId: AutoJoinEntry = {
     ...entry,
-    _id: entry._id || `${entry.channelId}:${entry.messageId}`,
+    _id: `${entry.channelId}:${entry.messageId}`,
   };
   await autoJoinEntriesCol.insertOne(entryWithId);
 }
