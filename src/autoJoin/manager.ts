@@ -27,7 +27,6 @@ import {
   hasGiveawayKeyword,
 } from '../utils.js';
 import {
-  getAllPremiumUsers,
   incrementTokenEntries,
   incrementTokenWins,
   updateTokenLastUsed,
@@ -35,17 +34,21 @@ import {
   setTokenActive,
   getUserWebhook,
   getAllPremiumUsersAllGuilds,
+  getAutoJoinEntry,
+  saveAutoJoinEntry,
+  updateAutoJoinEntryStatus,
+  cleanupAutoJoinEntries,
+  getPendingAutoJoinEntries,
 } from '../database.js';
 import { decryptToken } from '../premium/tokenManager.js';
 import { CONFIG } from '../config.js';
-import { Db, Collection, MongoClient } from 'mongodb';
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
-interface StoredGiveawayEntry {
-  _id: string; // entryId
+interface GiveawayEntry {
+  _id: string;
   userId: string;
   messageId: string;
   channelId: string;
@@ -61,7 +64,7 @@ interface StoredGiveawayEntry {
   attempts: number;
   lastAttemptAt?: number;
   lastError?: string;
-  expiresAt: number; // For TTL index
+  expiresAt: number;
 }
 
 interface GiveawayButton {
@@ -80,8 +83,6 @@ interface UserSession {
   isActive: boolean;
   stats: SessionStats;
   heartbeatInterval?: NodeJS.Timeout;
-  cleanupInterval?: NodeJS.Timeout;
-  lastGuildFetch?: number;
 }
 
 interface SessionStats {
@@ -106,11 +107,9 @@ const HEARTBEAT_INTERVAL_MS = 60_000;
 const MAX_SESSIONS = 5;
 const PROCESSING_CACHE_TTL_MS = 60000; // 1 minute for processing set
 
-// ... (rest of constants remain the same)
-
 const KNOWN_GIVEAWAY_BOT_IDS: ReadonlySet<string> = new Set([
-  '294882584201003009',
-  '739448630517039104',
+  '294882584201003009', // GiveawayBot
+  '739448630517039104', // GiveawayBoat
   '515195524879237130',
   '235148962103951360',
   '282859044593598464',
@@ -174,40 +173,40 @@ const WIN_PATTERNS: ReadonlyArray<RegExp> = [
 ];
 
 // ---------------------------------------------------------------------------
-// MongoDB Collection for AutoJoin entries
+// Token Bucket (Rate Limiter)
 // ---------------------------------------------------------------------------
 
-let entriesCollection: Collection<StoredGiveawayEntry> | null = null;
+class TokenBucket {
+  private tokens: number;
+  private lastRefill: number;
 
-async function getEntriesCollection(): Promise<Collection<StoredGiveawayEntry>> {
-  if (entriesCollection) return entriesCollection;
-  
-  const MONGO_URI = process.env.MONGO_URI;
-  if (!MONGO_URI) {
-    throw new Error('MONGO_URI environment variable is required');
+  constructor(
+    private readonly maxTokens: number,
+    private readonly refillIntervalMs: number,
+  ) {
+    this.tokens = maxTokens;
+    this.lastRefill = Date.now();
   }
-  
-  const client = new MongoClient(MONGO_URI);
-  await client.connect();
-  const db = client.db('giveaway_tracker');
-  entriesCollection = db.collection<StoredGiveawayEntry>('autojoin_entries');
-  
-  // Create TTL index to automatically delete expired entries
-  await entriesCollection.createIndex(
-    { expiresAt: 1 },
-    { expireAfterSeconds: 0 }
-  );
-  
-  // Create compound index for lookups
-  await entriesCollection.createIndex(
-    { userId: 1, messageId: 1, channelId: 1 },
-    { unique: true }
-  );
-  
-  // Create index for cleaning up old entries
-  await entriesCollection.createIndex({ detectedAt: -1 });
-  
-  return entriesCollection;
+
+  async consume(): Promise<void> {
+    this.refill();
+    if (this.tokens <= 0) {
+      const waitMs = this.refillIntervalMs - (Date.now() - this.lastRefill);
+      await delay(Math.max(waitMs, 50));
+      this.refill();
+    }
+    this.tokens = Math.max(0, this.tokens - 1);
+  }
+
+  private refill(): void {
+    const now = Date.now();
+    const elapsed = now - this.lastRefill;
+    const batches = Math.floor(elapsed / this.refillIntervalMs);
+    if (batches > 0) {
+      this.tokens = Math.min(this.maxTokens, this.tokens + batches * this.maxTokens);
+      this.lastRefill = now;
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -331,7 +330,7 @@ export class AutoJoinManager extends EventEmitter {
         return false;
       }
 
-      // Create client with minimal caching
+      // Create client with minimal caching to save memory
       const client = new Client({
         restGlobalTimeout: 30000,
         retryLimit: 3,
@@ -684,28 +683,15 @@ export class AutoJoinManager extends EventEmitter {
     }
 
     // Check MongoDB for existing entry
-    const collection = await getEntriesCollection();
-    const existing = await collection.findOne({ 
-      _id: entryId,
-      userId: session.userId,
-      status: { $in: ['pending', 'attempting'] }
-    });
+    const existing = await getAutoJoinEntry(session.userId, message.id, message.channel.id);
     
     if (existing) {
-      // Still being processed
-      this.processingCache.set(entryId, Date.now());
-      return;
-    }
-
-    // Check if entry was already processed (success, failed, skipped)
-    const completed = await collection.findOne({
-      _id: entryId,
-      userId: session.userId,
-      status: { $in: ['success', 'failed', 'skipped'] }
-    });
-    
-    if (completed) {
-      // Already processed, don't process again
+      if (existing.status === 'pending' || existing.status === 'attempting') {
+        // Still being processed
+        this.processingCache.set(entryId, Date.now());
+        return;
+      }
+      // Already completed (success, failed, skipped) - don't process again
       return;
     }
 
@@ -718,7 +704,7 @@ export class AutoJoinManager extends EventEmitter {
         return;
       }
 
-      const entry: Omit<StoredGiveawayEntry, '_id'> = {
+      const entry: Omit<GiveawayEntry, '_id'> = {
         userId: session.userId,
         messageId: message.id,
         channelId: message.channel.id,
@@ -736,7 +722,7 @@ export class AutoJoinManager extends EventEmitter {
       };
 
       // Store in MongoDB
-      await collection.insertOne({
+      await saveAutoJoinEntry({
         ...entry,
         _id: entryId,
       });
@@ -762,250 +748,17 @@ export class AutoJoinManager extends EventEmitter {
       });
     } finally {
       this.processingCache.delete(entryId);
-      this.cleanupOldEntries(session.userId);
+      await cleanupAutoJoinEntries(session.userId);
     }
   }
 
   // -------------------------------------------------------------------------
-  // Entry Execution (BUTTON ONLY)
+  // Giveaway Detection (BUTTON ONLY)
   // -------------------------------------------------------------------------
 
-  private async enterGiveaway(entryId: string, session: UserSession): Promise<void> {
-    const collection = await getEntriesCollection();
-    const entry = await collection.findOne({ _id: entryId, userId: session.userId });
-    
-    if (!entry) return;
-
-    await collection.updateOne(
-      { _id: entryId },
-      { $set: { status: 'attempting' } }
-    );
-
-    const maxAttempts = CONFIG.maxRetries + 1;
-
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      const attemptNum = attempt + 1;
-      
-      if (attempt > 0) {
-        const backoffMs = exponentialBackoff(attempt - 1, CONFIG.retryDelayMs, 30000);
-        await delay(backoffMs);
-      }
-
-      try {
-        const skipped = await this.enterViaButton(entry, session);
-        if (skipped) {
-          await collection.updateOne(
-            { _id: entryId },
-            { $set: { status: 'skipped' } }
-          );
-          return;
-        }
-
-        session.stats.entered++;
-        session.stats.lastEntryAt = Date.now();
-
-        await collection.updateOne(
-          { _id: entryId },
-          { $set: { status: 'success', attempts: attemptNum } }
-        );
-
-        await incrementTokenEntries(session.userId, session.guildId);
-        await updateTokenLastUsed(session.userId, session.guildId);
-
-        logger.info('✅ AutoJoin: Entered giveaway', {
-          component: 'AutoJoin',
-          userId: session.userId,
-          prize: truncate(entry.prize, 60),
-          attempts: attemptNum,
-          guild: entry.guildName,
-        });
-
-        this.emit('giveawayEntered', { entry, userId: session.userId });
-        return;
-
-      } catch (error) {
-        const lastError = formatError(error);
-        await collection.updateOne(
-          { _id: entryId },
-          { $set: { attempts: attemptNum, lastError } }
-        );
-        
-        logger.warn(`AutoJoin: Attempt ${attemptNum}/${maxAttempts} failed`, {
-          component: 'AutoJoin',
-          userId: session.userId,
-          entryId,
-          error: lastError,
-        });
-      }
-    }
-
-    // All attempts failed
-    await collection.updateOne(
-      { _id: entryId },
-      { $set: { status: 'failed' } }
-    );
-    
-    session.stats.failed++;
-
-    logger.error('❌ AutoJoin: All retries exhausted', {
-      component: 'AutoJoin',
-      userId: session.userId,
-      prize: truncate(entry.prize, 60),
-      attempts: entry.attempts,
-      lastError: entry.lastError,
-    });
-
-    this.emit('giveawayFailed', { entry, userId: session.userId });
-  }
-
-  private async enterViaButton(entry: StoredGiveawayEntry, session: UserSession): Promise<boolean> {
-    if (!entry.buttonCustomId) throw new Error('No buttonCustomId set');
-
-    if (CONFIG.buttonDelayMs > 0) await delay(CONFIG.buttonDelayMs);
-
-    const message = await this.fetchMessage(session.client, entry.channelId, entry.messageId);
-    if (!message) throw new Error(`Message ${entry.messageId} not found`);
-
-    const button = this.findButtonById(message, entry.buttonCustomId);
-    if (!button || button.disabled) {
-      return true; // Skip
-    }
-
-    await this.clickButton(message, button);
-    return false;
-  }
-
-  // -------------------------------------------------------------------------
-  // Rest of the helper methods (keep existing implementations)
-  // -------------------------------------------------------------------------
-
-  private async cleanupOldEntries(userId: string): Promise<void> {
-    try {
-      const collection = await getEntriesCollection();
-      const cutoff = Date.now() - ENTRY_TTL_MS;
-      
-      // Delete old entries that are completed
-      await collection.deleteMany({
-        userId,
-        status: { $in: ['success', 'failed', 'skipped'] },
-        detectedAt: { $lt: cutoff }
-      });
-    } catch (error) {
-      // Ignore cleanup errors
-    }
-  }
-
-  private makeEntryId(message: Message): string {
-    return `${message.channel.id}:${message.id}`;
-  }
-
-  private makeSessionKey(userId: string): string {
-    return userId;
-  }
-
-  private findSessionByUserId(userId: string): UserSession | null {
-    for (const [_, session] of this.sessions) {
-      if (session.userId === userId) return session;
-    }
-    return null;
-  }
-
-  // -------------------------------------------------------------------------
-  // Interval Starters
-  // -------------------------------------------------------------------------
-
-  private startSessionRefresher(): void {
-    this.refreshInterval = setInterval(() => {
-      this.refreshSessions().catch((error) => {
-        logger.error('Session refresh failed', {
-          component: 'AutoJoin',
-          error: formatError(error),
-        });
-      });
-    }, SESSION_REFRESH_INTERVAL_MS);
-
-    if (this.refreshInterval.unref) {
-      this.refreshInterval.unref();
-    }
-  }
-
-  private startCleanupInterval(): void {
-    this.cleanupInterval = setInterval(async () => {
-      try {
-        // Clean up expired MongoDB entries
-        const collection = await getEntriesCollection();
-        await collection.deleteMany({
-          expiresAt: { $lt: Date.now() }
-        });
-      } catch (error) {
-        logger.debug('Cleanup error', { error: formatError(error) });
-      }
-    }, 5 * 60_000); // Every 5 minutes
-
-    if (this.cleanupInterval.unref) {
-      this.cleanupInterval.unref();
-    }
-  }
-
-  private startMemoryCheck(): void {
-    this.memoryCheckInterval = setInterval(() => {
-      const memUsage = process.memoryUsage();
-      const heapUsedMB = Math.round(memUsage.heapUsed / 1024 / 1024);
-      const heapTotalMB = Math.round(memUsage.heapTotal / 1024 / 1024);
-      
-      // Log memory usage
-      logger.debug('AutoJoin Memory Usage', {
-        component: 'AutoJoin',
-        heapUsed: `${heapUsedMB}MB`,
-        heapTotal: `${heapTotalMB}MB`,
-        sessions: this.sessions.size,
-        processingCache: this.processingCache.size,
-        recentWins: this.recentWins.size,
-      });
-
-      // If memory is too high, force cleanup
-      if (heapUsedMB > 300) {
-        logger.warn('High memory usage detected, forcing cleanup', {
-          component: 'AutoJoin',
-          heapUsed: `${heapUsedMB}MB`,
-        });
-        
-        this.processingCache.clear();
-        this.recentWins.clear();
-        
-        // Force garbage collection if available
-        if (global.gc) {
-          global.gc();
-        }
-      }
-    }, 60_000); // Every minute
-
-    if (this.memoryCheckInterval.unref) {
-      this.memoryCheckInterval.unref();
-    }
-  }
-
-  private logStats(): void {
-    const stats = this.getStats();
-    logger.info('AutoJoin Stats', {
-      component: 'AutoJoin',
-      totalSessions: stats.totalSessions,
-      activeSessions: stats.activeSessions,
-      sessions: Array.from(stats.sessionStats.entries()).map(([key, s]) => ({
-        userId: key,
-        detected: s.detected,
-        entered: s.entered,
-        wins: s.wins,
-        failed: s.failed,
-      })),
-    });
-  }
-
-  // -------------------------------------------------------------------------
-  // Existing helper methods (keep these as-is)
-  // -------------------------------------------------------------------------
-
-  private async detectGiveaway(message: Message): Promise<{ prize: string; button: GiveawayButton } | null> {
+  private async detectGiveaway(
+    message: Message,
+  ): Promise<{ prize: string; button: GiveawayButton } | null> {
     const rawContent = message.content ?? '';
     if (BLOCKED_MESSAGE_CONTENT.some(re => re.test(rawContent))) {
       return null;
@@ -1017,9 +770,11 @@ export class AutoJoinManager extends EventEmitter {
 
     if (!hasSignal) return null;
 
+    // Try immediate extraction
     const immediate = this.tryExtractEntry(message, isKnownBot);
     if (immediate) return immediate;
 
+    // Retry with delay (components may load late)
     for (let i = 0; i < COMPONENT_RETRY_ATTEMPTS; i++) {
       await delay(COMPONENT_RETRY_DELAY_MS);
       try {
@@ -1034,7 +789,10 @@ export class AutoJoinManager extends EventEmitter {
     return null;
   }
 
-  private tryExtractEntry(message: Message, isKnownBot: boolean): { prize: string; button: GiveawayButton } | null {
+  private tryExtractEntry(
+    message: Message,
+    isKnownBot: boolean,
+  ): { prize: string; button: GiveawayButton } | null {
     const button = this.extractEntryButton(message, isKnownBot);
     if (!button) return null;
     return { prize: this.extractPrize(message), button };
@@ -1079,6 +837,128 @@ export class AutoJoinManager extends EventEmitter {
 
     return null;
   }
+
+  // -------------------------------------------------------------------------
+  // Entry Execution (BUTTON ONLY)
+  // -------------------------------------------------------------------------
+
+  private async enterGiveaway(entryId: string, session: UserSession): Promise<void> {
+    const entry = await getAutoJoinEntry(session.userId, 
+      entryId.split(':')[1], // messageId
+      entryId.split(':')[0]  // channelId
+    );
+    
+    if (!entry) return;
+
+    await updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'attempting');
+
+    const maxAttempts = CONFIG.maxRetries + 1;
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      const attemptNum = attempt + 1;
+      
+      if (attempt > 0) {
+        const backoffMs = exponentialBackoff(attempt - 1, CONFIG.retryDelayMs, 30000);
+        await delay(backoffMs);
+      }
+
+      try {
+        const skipped = await this.enterViaButton(entry, session);
+        if (skipped) {
+          await updateAutoJoinEntryStatus(
+            session.userId, 
+            entry.messageId, 
+            entry.channelId, 
+            'skipped'
+          );
+          return;
+        }
+
+        session.stats.entered++;
+        session.stats.lastEntryAt = Date.now();
+
+        await updateAutoJoinEntryStatus(
+          session.userId,
+          entry.messageId,
+          entry.channelId,
+          'success',
+          { attempts: attemptNum }
+        );
+
+        await incrementTokenEntries(session.userId, session.guildId);
+        await updateTokenLastUsed(session.userId, session.guildId);
+
+        logger.info('✅ AutoJoin: Entered giveaway', {
+          component: 'AutoJoin',
+          userId: session.userId,
+          prize: truncate(entry.prize, 60),
+          attempts: attemptNum,
+          guild: entry.guildName,
+        });
+
+        this.emit('giveawayEntered', { entry, userId: session.userId });
+        return;
+
+      } catch (error) {
+        const lastError = formatError(error);
+        await updateAutoJoinEntryStatus(
+          session.userId,
+          entry.messageId,
+          entry.channelId,
+          'attempting',
+          { attempts: attemptNum, lastError }
+        );
+        
+        logger.warn(`AutoJoin: Attempt ${attemptNum}/${maxAttempts} failed`, {
+          component: 'AutoJoin',
+          userId: session.userId,
+          entryId,
+          error: lastError,
+        });
+      }
+    }
+
+    // All attempts failed
+    await updateAutoJoinEntryStatus(
+      session.userId,
+      entry.messageId,
+      entry.channelId,
+      'failed'
+    );
+    
+    session.stats.failed++;
+
+    logger.error('❌ AutoJoin: All retries exhausted', {
+      component: 'AutoJoin',
+      userId: session.userId,
+      prize: truncate(entry.prize, 60),
+      attempts: entry.attempts,
+      lastError: entry.lastError,
+    });
+
+    this.emit('giveawayFailed', { entry, userId: session.userId });
+  }
+
+  private async enterViaButton(entry: GiveawayEntry, session: UserSession): Promise<boolean> {
+    if (!entry.buttonCustomId) throw new Error('No buttonCustomId set');
+
+    if (CONFIG.buttonDelayMs > 0) await delay(CONFIG.buttonDelayMs);
+
+    const message = await this.fetchMessage(session.client, entry.channelId, entry.messageId);
+    if (!message) throw new Error(`Message ${entry.messageId} not found`);
+
+    const button = this.findButtonById(message, entry.buttonCustomId);
+    if (!button || button.disabled) {
+      return true; // Skip
+    }
+
+    await this.clickButton(message, button);
+    return false;
+  }
+
+  // -------------------------------------------------------------------------
+  // Interaction Helpers
+  // -------------------------------------------------------------------------
 
   private async clickButton(message: Message, button: GiveawayButton): Promise<void> {
     const selfbotMsg = message as Message & { clickButton?: (id: string) => Promise<unknown> };
@@ -1161,6 +1041,152 @@ export class AutoJoinManager extends EventEmitter {
     return null;
   }
 
+  // -------------------------------------------------------------------------
+  // Win Detection
+  // -------------------------------------------------------------------------
+
+  private async handleWin(message: Message, userId: string): Promise<void> {
+    if (!message.guild) return;
+    if (!message.author?.bot) return;
+
+    const myId = message.client.user?.id;
+    if (!myId) return;
+
+    const mentionedInUsers = message.mentions?.users?.has(myId) ?? false;
+    const mentionedInContent = (message.content ?? '').includes(myId);
+    if (!mentionedInUsers && !mentionedInContent) return;
+
+    const allText = this.extractAllText(message);
+    if (!WIN_PATTERNS.some(re => re.test(allText))) return;
+
+    // Dedup
+    const dedupKey = `${message.channel.id}:${message.author?.id ?? 'unknown'}`;
+    const lastWin = this.recentWins.get(dedupKey);
+    if (lastWin && Date.now() - lastWin < WIN_DEDUP_TTL_MS) {
+      return;
+    }
+    this.recentWins.set(dedupKey, Date.now());
+
+    const session = this.findSessionByUserId(userId);
+    if (session) {
+      session.stats.wins++;
+    }
+
+    await incrementTokenWins(userId, session?.guildId || '');
+
+    const prize = this.extractPrize(message);
+    const sourceName = `#${(message.channel as { name?: string }).name ?? message.channel.id} in ${message.guild.name}`;
+
+    logger.info('🏆 AutoJoin: WIN DETECTED!', {
+      component: 'AutoJoin',
+      userId,
+      prize,
+      source: sourceName,
+      guild: message.guild.name,
+    });
+
+    await this.sendWinWebhook(message, prize, sourceName, userId);
+    this.emit('giveawayWon', { message, prize, userId });
+  }
+
+  private async handleDmWin(message: Message, userId: string): Promise<void> {
+    if (message.guild) return;
+
+    const allText = this.extractAllText(message);
+    if (!WIN_PATTERNS.some(re => re.test(allText))) return;
+
+    const session = this.findSessionByUserId(userId);
+    if (session) {
+      session.stats.wins++;
+    }
+
+    await incrementTokenWins(userId, session?.guildId || '');
+
+    const prize = this.extractPrize(message);
+
+    logger.info('🏆 AutoJoin: WIN DETECTED (DM)!', {
+      component: 'AutoJoin',
+      userId,
+      prize,
+    });
+
+    await this.sendWinWebhook(message, prize, 'Direct Message', userId);
+    this.emit('giveawayWon', { message, prize, userId, source: 'dm' });
+  }
+
+  // -------------------------------------------------------------------------
+  // Webhooks - Priority: User Personal > WIN_WEBHOOK_URL > WEBHOOK_URL
+  // -------------------------------------------------------------------------
+
+  private async sendWinWebhook(
+    message: Message,
+    prize: string,
+    sourceName: string,
+    userId: string,
+  ): Promise<void> {
+    const session = this.findSessionByUserId(userId);
+    const guildId = session?.guildId || '';
+
+    let url: string | null = null;
+    try {
+      url = await getUserWebhook(userId, guildId);
+    } catch (error) {
+      logger.debug('Failed to get user webhook', { userId, error: formatError(error) });
+    }
+
+    if (!url) {
+      url = CONFIG.winWebhookUrl || null;
+    }
+    if (!url) {
+      url = CONFIG.webhookUrl || null;
+    }
+
+    if (!url) {
+      logger.debug('No webhook configured for win notification', { userId });
+      return;
+    }
+
+    const guildName = message.guild?.name ?? 'Direct Message';
+    const jumpUrl = message.guild
+      ? `https://discord.com/channels/${message.guild.id}/${message.channel.id}/${message.id}`
+      : null;
+
+    try {
+      await axios.post(url, {
+        content: '@everyone',
+        username: '🎉 AutoJoin WIN',
+        embeds: [{
+          title: '🏆 GIVEAWAY WIN!',
+          description: jumpUrl ? `[Jump to message](${jumpUrl})` : 'Won via Direct Message',
+          color: 0xFFD700,
+          fields: [
+            { name: '🎁 Prize', value: prize || 'Unknown', inline: false },
+            { name: '🏠 Server', value: guildName, inline: true },
+            { name: '📢 Source', value: sourceName, inline: true },
+            { name: '👤 User', value: `<@${userId}>`, inline: true },
+            { name: '⏰ Won At', value: formatTimestamp(Date.now()), inline: false },
+          ],
+          footer: { 
+            text: `AutoJoin • ${url === CONFIG.winWebhookUrl || url === CONFIG.webhookUrl ? 'Global' : 'Personal'} Webhook`,
+          },
+          timestamp: new Date().toISOString(),
+        }],
+      }, { timeout: 8000 });
+
+      logger.info('Win webhook sent successfully', {
+        userId,
+        prize: truncate(prize, 50),
+        guild: guildName,
+      });
+    } catch (error) {
+      logger.warn('Win webhook failed', { userId, error: formatError(error) });
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Helpers
+  // -------------------------------------------------------------------------
+
   private isKnownGiveawayBot(message: Message): boolean {
     return !!(message.author?.bot && message.author.id && KNOWN_GIVEAWAY_BOT_IDS.has(message.author.id));
   }
@@ -1222,131 +1248,108 @@ export class AutoJoinManager extends EventEmitter {
     }
   }
 
-  private async handleWin(message: Message, userId: string): Promise<void> {
-    if (!message.guild) return;
-    if (!message.author?.bot) return;
-
-    const myId = message.client.user?.id;
-    if (!myId) return;
-
-    const mentionedInUsers = message.mentions?.users?.has(myId) ?? false;
-    const mentionedInContent = (message.content ?? '').includes(myId);
-    if (!mentionedInUsers && !mentionedInContent) return;
-
-    const allText = this.extractAllText(message);
-    if (!WIN_PATTERNS.some(re => re.test(allText))) return;
-
-    const dedupKey = `${message.channel.id}:${message.author?.id ?? 'unknown'}`;
-    const lastWin = this.recentWins.get(dedupKey);
-    if (lastWin && Date.now() - lastWin < WIN_DEDUP_TTL_MS) {
-      return;
-    }
-    this.recentWins.set(dedupKey, Date.now());
-
-    const session = this.findSessionByUserId(userId);
-    if (session) {
-      session.stats.wins++;
-    }
-
-    await incrementTokenWins(userId, session?.guildId || '');
-
-    const prize = this.extractPrize(message);
-    const sourceName = `#${(message.channel as { name?: string }).name ?? message.channel.id} in ${message.guild.name}`;
-
-    logger.info('🏆 AutoJoin: WIN DETECTED!', {
-      component: 'AutoJoin',
-      userId,
-      prize,
-      source: sourceName,
-      guild: message.guild.name,
-    });
-
-    await this.sendWinWebhook(message, prize, sourceName, userId);
-    this.emit('giveawayWon', { message, prize, userId });
+  private makeEntryId(message: Message): string {
+    return `${message.channel.id}:${message.id}`;
   }
 
-  private async handleDmWin(message: Message, userId: string): Promise<void> {
-    if (message.guild) return;
-
-    const allText = this.extractAllText(message);
-    if (!WIN_PATTERNS.some(re => re.test(allText))) return;
-
-    const session = this.findSessionByUserId(userId);
-    if (session) {
-      session.stats.wins++;
-    }
-
-    await incrementTokenWins(userId, session?.guildId || '');
-
-    const prize = this.extractPrize(message);
-
-    logger.info('🏆 AutoJoin: WIN DETECTED (DM)!', {
-      component: 'AutoJoin',
-      userId,
-      prize,
-    });
-
-    await this.sendWinWebhook(message, prize, 'Direct Message', userId);
-    this.emit('giveawayWon', { message, prize, userId, source: 'dm' });
+  private makeSessionKey(userId: string): string {
+    return userId;
   }
 
-  private async sendWinWebhook(message: Message, prize: string, sourceName: string, userId: string): Promise<void> {
-    const session = this.findSessionByUserId(userId);
-    const guildId = session?.guildId || '';
-
-    let url: string | null = null;
-    try {
-      url = await getUserWebhook(userId, guildId);
-    } catch (error) {
-      logger.debug('Failed to get user webhook', { userId, error: formatError(error) });
+  private findSessionByUserId(userId: string): UserSession | null {
+    for (const [_, session] of this.sessions) {
+      if (session.userId === userId) return session;
     }
+    return null;
+  }
 
-    if (!url) {
-      url = CONFIG.winWebhookUrl || null;
-    }
-    if (!url) {
-      url = CONFIG.webhookUrl || null;
-    }
+  // -------------------------------------------------------------------------
+  // Interval Starters
+  // -------------------------------------------------------------------------
 
-    if (!url) {
-      logger.debug('No webhook configured for win notification', { userId });
-      return;
-    }
-
-    const guildName = message.guild?.name ?? 'Direct Message';
-    const jumpUrl = message.guild
-      ? `https://discord.com/channels/${message.guild.id}/${message.channel.id}/${message.id}`
-      : null;
-
-    try {
-      await axios.post(url, {
-        content: '@everyone',
-        username: '🎉 AutoJoin WIN',
-        embeds: [{
-          title: '🏆 GIVEAWAY WIN!',
-          description: jumpUrl ? `[Jump to message](${jumpUrl})` : 'Won via Direct Message',
-          color: 0xFFD700,
-          fields: [
-            { name: '🎁 Prize', value: prize || 'Unknown', inline: false },
-            { name: '🏠 Server', value: guildName, inline: true },
-            { name: '📢 Source', value: sourceName, inline: true },
-            { name: '👤 User', value: `<@${userId}>`, inline: true },
-            { name: '⏰ Won At', value: formatTimestamp(Date.now()), inline: false },
-          ],
-          footer: { 
-            text: `AutoJoin • ${url === CONFIG.winWebhookUrl || url === CONFIG.webhookUrl ? 'Global' : 'Personal'} Webhook`,
-          },
-          timestamp: new Date().toISOString(),
-        }],
-      }, { timeout: 8000 });
-
-      logger.info('Win webhook sent successfully', {
-        userId,
-        prize: truncate(prize, 50),
-        guild: guildName,
+  private startSessionRefresher(): void {
+    this.refreshInterval = setInterval(() => {
+      this.refreshSessions().catch((error) => {
+        logger.error('Session refresh failed', {
+          component: 'AutoJoin',
+          error: formatError(error),
+        });
       });
-    } catch (error) {
-      logger.warn('Win webhook failed', { userId, error: formatError(error) });
+    }, SESSION_REFRESH_INTERVAL_MS);
+
+    if (this.refreshInterval.unref) {
+      this.refreshInterval.unref();
     }
+  }
+
+  private startCleanupInterval(): void {
+    this.cleanupInterval = setInterval(async () => {
+      try {
+        // Clean up old entries for all sessions
+        for (const [_, session] of this.sessions) {
+          await cleanupAutoJoinEntries(session.userId);
+        }
+      } catch (error) {
+        logger.debug('Cleanup error', { error: formatError(error) });
+      }
+    }, 5 * 60_000); // Every 5 minutes
+
+    if (this.cleanupInterval.unref) {
+      this.cleanupInterval.unref();
+    }
+  }
+
+  private startMemoryCheck(): void {
+    this.memoryCheckInterval = setInterval(() => {
+      const memUsage = process.memoryUsage();
+      const heapUsedMB = Math.round(memUsage.heapUsed / 1024 / 1024);
+      const heapTotalMB = Math.round(memUsage.heapTotal / 1024 / 1024);
+      
+      // Log memory usage
+      logger.debug('AutoJoin Memory Usage', {
+        component: 'AutoJoin',
+        heapUsed: `${heapUsedMB}MB`,
+        heapTotal: `${heapTotalMB}MB`,
+        sessions: this.sessions.size,
+        processingCache: this.processingCache.size,
+        recentWins: this.recentWins.size,
+      });
+
+      // If memory is too high, force cleanup
+      if (heapUsedMB > 300) {
+        logger.warn('High memory usage detected, forcing cleanup', {
+          component: 'AutoJoin',
+          heapUsed: `${heapUsedMB}MB`,
+        });
+        
+        this.processingCache.clear();
+        this.recentWins.clear();
+        
+        // Force garbage collection if available
+        if (global.gc) {
+          global.gc();
+        }
+      }
+    }, 60_000); // Every minute
+
+    if (this.memoryCheckInterval.unref) {
+      this.memoryCheckInterval.unref();
+    }
+  }
+
+  private logStats(): void {
+    const stats = this.getStats();
+    logger.info('AutoJoin Stats', {
+      component: 'AutoJoin',
+      totalSessions: stats.totalSessions,
+      activeSessions: stats.activeSessions,
+      sessions: Array.from(stats.sessionStats.entries()).map(([key, s]) => ({
+        userId: key,
+        detected: s.detected,
+        entered: s.entered,
+        wins: s.wins,
+        failed: s.failed,
+      })),
+    });
   }
 }
