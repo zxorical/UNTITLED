@@ -235,18 +235,58 @@ export class GiveawayManager extends EventEmitter {
 
     try {
       // ================================================================
-      // CRITICAL: Check for creation message FIRST
-      // Edit + Start buttons together = DEFINITIVE creation message
-      // This must be checked BEFORE any other detection
+      // TRIPLE-LAYER CREATION DETECTION - MUST CHECK BEFORE ANYTHING ELSE
       // ================================================================
+
+      // --- LAYER 1: Check for Edit + Start buttons ---
       if (this.hasEditAndStartButtons(message)) {
         this.stats.draftsSkipped++;
-        this.log.debug('Skipping giveaway creation (Edit + Start buttons)', {
+        this.log.debug('Skipping creation (Edit+Start buttons)', {
           messageId: message.id,
           channelId: message.channel.id,
         });
         return;
       }
+
+      // --- LAYER 2: Check for creation text patterns ---
+      const allText = this.getGiveawayText(message);
+      const creationPatterns = [
+        /Review your giveaway/i,
+        /click "Start" to start this giveaway/i,
+        /click 'Start' to start this giveaway/i,
+        /This message expires in \d+ minutes?/i,
+        /Configure your giveaway/i,
+        /Giveaway preview/i,
+        /You can edit this/i,
+        /You can change/i,
+      ];
+      if (creationPatterns.some(re => re.test(allText))) {
+        this.stats.draftsSkipped++;
+        this.log.debug('Skipping creation (text pattern match)', {
+          messageId: message.id,
+          channelId: message.channel.id,
+        });
+        return;
+      }
+
+      // --- LAYER 3: Check for management buttons count ---
+      // If there are 2+ management buttons AND 1+ entry button, it's a creation
+      const managementCount = this.countManagementButtons(message);
+      const entryCount = this.countEntryButtons(message);
+      if (managementCount >= 2 && entryCount >= 1) {
+        this.stats.draftsSkipped++;
+        this.log.debug('Skipping creation (management buttons count)', {
+          messageId: message.id,
+          channelId: message.channel.id,
+          managementCount,
+          entryCount,
+        });
+        return;
+      }
+
+      // ================================================================
+      // END CREATION DETECTION
+      // ================================================================
 
       // Check for other draft indicators (fallback)
       if (this.isDraftGiveaway(message)) {
@@ -519,13 +559,12 @@ export class GiveawayManager extends EventEmitter {
   }
 
   // -------------------------------------------------------------------------
-  // Draft Giveaway Detection
+  // CREATION DETECTION METHODS
   // -------------------------------------------------------------------------
   
   /**
    * Check if the message has both Edit AND Start buttons
    * This combination ONLY appears in giveaway creation/draft messages
-   * Real giveaways NEVER have both Edit and Start buttons
    */
   private hasEditAndStartButtons(message: Message): boolean {
     const components = (message as any).components as any[] | undefined;
@@ -549,6 +588,57 @@ export class GiveawayManager extends EventEmitter {
     return hasEdit && hasStart;
   }
 
+  /**
+   * Count management buttons (Edit, Start, Cancel, Preview, Setup)
+   */
+  private countManagementButtons(message: Message): number {
+    const components = (message as any).components as any[] | undefined;
+    if (!components) return 0;
+    
+    let count = 0;
+    const managementLabels = ['edit', 'start', 'cancel', 'preview', 'setup'];
+    
+    for (const row of components) {
+      const comps = row.components as any[] | undefined;
+      if (!comps) continue;
+      for (const comp of comps) {
+        if (comp.type === 2) {
+          const label = (comp.label || '').toLowerCase().trim();
+          if (managementLabels.includes(label)) {
+            count++;
+          }
+        }
+      }
+    }
+    return count;
+  }
+
+  /**
+   * Count entry buttons
+   */
+  private countEntryButtons(message: Message): number {
+    const components = (message as any).components as any[] | undefined;
+    if (!components) return 0;
+    
+    let count = 0;
+    for (const row of components) {
+      const comps = row.components as any[] | undefined;
+      if (!comps) continue;
+      for (const comp of comps) {
+        if (comp.type === 2 && comp.style !== 5 && !comp.disabled) {
+          if (this.isEntryButton(comp)) {
+            count++;
+          }
+        }
+      }
+    }
+    return count;
+  }
+
+  // -------------------------------------------------------------------------
+  // Draft Giveaway Detection (fallback)
+  // -------------------------------------------------------------------------
+  
   /**
    * Check if this is a draft/pending giveaway creation message (fallback)
    */
