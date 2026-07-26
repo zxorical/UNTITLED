@@ -3,6 +3,10 @@
  * All shared TypeScript types
  */
 
+// ============================================================
+// App Configuration
+// ============================================================
+
 export interface AppConfig {
   tokens: string[];
   botToken: string;
@@ -23,6 +27,10 @@ export interface AppConfig {
   webhookUrl: string;
   winWebhookUrl: string;
 }
+
+// ============================================================
+// Giveaway Data
+// ============================================================
 
 export interface GiveawayData {
   id?: string;
@@ -46,12 +54,20 @@ export interface GiveawayData {
   memberCount?: number | null;
 }
 
+// ============================================================
+// Stats
+// ============================================================
+
 export interface GiveawayStats {
   totalDetected: number;
   activeGiveaways: number;
   serversWithGiveaways: number;
   lastDetected: number | null;
 }
+
+// ============================================================
+// Detection
+// ============================================================
 
 export enum DetectionSource {
   CONTENT = 'content',
@@ -87,6 +103,10 @@ export interface GiveawayMessage {
   }[];
 }
 
+// ============================================================
+// Watchlist
+// ============================================================
+
 export interface UserWatchlist {
   userId: string;
   items: string[];
@@ -94,7 +114,10 @@ export interface UserWatchlist {
   updatedAt: number;
 }
 
-// License System Types
+// ============================================================
+// License System
+// ============================================================
+
 export interface LicenseKey {
   key: string;
   used: boolean;
@@ -103,7 +126,23 @@ export interface LicenseKey {
   createdBy: string;
 }
 
+// ============================================================
 // AutoJoin Types
+// ============================================================
+
+export enum EntryMethod {
+  BUTTON = 'button',
+  REACTION = 'reaction',
+}
+
+export enum EntryStatus {
+  PENDING = 'pending',
+  ATTEMPTING = 'attempting',
+  SUCCESS = 'success',
+  FAILED = 'failed',
+  SKIPPED = 'skipped',
+}
+
 export interface GiveawayEntry {
   entryId: string;
   messageId: string;
@@ -126,37 +165,24 @@ export interface GiveawayEntry {
   lastError?: string;
 }
 
-export enum EntryMethod {
-  BUTTON = 'button',
-  REACTION = 'reaction',
-}
-
-export enum EntryStatus {
-  PENDING = 'pending',
-  ATTEMPTING = 'attempting',
-  SUCCESS = 'success',
-  FAILED = 'failed',
-  SKIPPED = 'skipped',
-}
-
 export interface GiveawayButton {
   customId: string;
   label: string;
   disabled: boolean;
 }
 
-export interface GiveawayStats {
-  totalDetected: number;
-  totalSucceeded: number;
-  totalFailed: number;
-  totalSkipped: number;
-  totalDuplicates: number;
-  totalWins: number;
-  serversJoined: number;
-  serversJoinFailed: number;
-  startedAt: number;
-  lastDetectedAt?: number;
-  lastSuccessAt?: number;
+export interface AutoJoinSessionStats {
+  detected: number;
+  entered: number;
+  failed: number;
+  wins: number;
+  lastEntryAt?: number;
+}
+
+export interface AutoJoinManagerStats {
+  totalSessions: number;
+  activeSessions: number;
+  sessionStats: Map<string, AutoJoinSessionStats>;
 }
 
 export interface ManagerState {
