@@ -16,6 +16,7 @@ import { BotManager } from './bot.js';
 import { delay, formatError, formatDuration } from './utils.js';
 import { getDb, closeDb, cleanupOldGiveaways } from './database.js';
 import { AutoJoinManager } from './autoJoin/index.js';
+import { restoreTokenSessionsFromDatabase } from './premium/tokenManager.js';
 
 // ----------------------------------------------------------------------------
 // HEALTH SERVER
@@ -93,6 +94,20 @@ async function main(): Promise<void> {
 
   // Cleanup old giveaways (fire and forget)
   cleanupOldGiveaways(30).catch(err => logger.warn('cleanupOldGiveaways error', { error: err }));
+
+  // --------------------------------------------------------------------------
+  // RESTORE TOKEN SESSIONS FROM DATABASE
+  // This fixes the issue where tokens are forgotten on VPS restart
+  // --------------------------------------------------------------------------
+  try {
+    const restored = await restoreTokenSessionsFromDatabase();
+    logger.info(`Restored ${restored} token sessions from database`, { component: 'Bootstrap' });
+  } catch (err) {
+    logger.warn('Failed to restore token sessions:', {
+      component: 'Bootstrap',
+      error: formatError(err),
+    });
+  }
 
   // --------------------------------------------------------------------------
   // START BOTMANAGER WITH TIMEOUT
