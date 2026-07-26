@@ -9,7 +9,7 @@
  * 2. AutoJoiner reads all premium users with valid tokens
  * 3. Starts a self-bot session for each user
  * 4. Monitors giveaway messages and auto-clicks entry buttons
- * 5. Detects wins and sends webhook notifications
+ * 5. Detects wins and sends webhook notifications (user's personal webhook or global fallback)
  */
 
 import { Client, Message, TextChannel } from 'discord.js-selfbot-v13';
@@ -33,6 +33,7 @@ import {
   updateTokenLastUsed,
   getPremiumUser,
   setTokenActive,
+  getUserWebhook,
 } from '../database.js';
 import { decryptToken } from '../premium/tokenManager.js';
 import { CONFIG } from '../config.js';
@@ -471,7 +472,7 @@ export class AutoJoinManager extends EventEmitter {
 
     logger.info('Shutting down AutoJoin sessions...', { component: 'AutoJoin' });
 
-    const stopPromises = [];
+    const stopPromises: Promise<void>[] = [];
     for (const [key, session] of this.sessions) {
       stopPromises.push(this.stopSession(session.userId, session.guildId));
     }
@@ -931,7 +932,7 @@ export class AutoJoinManager extends EventEmitter {
       source: sourceName,
     });
 
-    // Send webhook notification
+    // Send webhook notification (uses user's personal webhook or global fallback)
     await this.sendWinWebhook(message, prize, sourceName, userId);
 
     this.emit('giveawayWon', { message, prize, userId });
@@ -963,7 +964,7 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   // -------------------------------------------------------------------------
-  // Webhooks
+  // Webhooks - Priority: User Personal > WIN_WEBHOOK_URL > WEBHOOK_URL
   // -------------------------------------------------------------------------
 
   private async sendWinWebhook(
@@ -972,8 +973,54 @@ export class AutoJoinManager extends EventEmitter {
     sourceName: string,
     userId: string,
   ): Promise<void> {
-    const url = CONFIG.winWebhookUrl ?? CONFIG.webhookUrl;
-    if (!url) return;
+    // PRIORITY 1: Get the user's personal webhook
+    let url: string | null = null;
+    try {
+      url = await getUserWebhook(userId, this.guildId);
+      if (url) {
+        logger.debug('Using user\'s personal webhook', {
+          component: 'AutoJoin',
+          userId,
+        });
+      }
+    } catch (error) {
+      logger.debug('Failed to get user webhook', {
+        component: 'AutoJoin',
+        userId,
+        error: formatError(error),
+      });
+    }
+
+    // PRIORITY 2: Fallback to global WIN_WEBHOOK_URL
+    if (!url) {
+      url = CONFIG.winWebhookUrl || null;
+      if (url) {
+        logger.debug('Using global WIN_WEBHOOK_URL', {
+          component: 'AutoJoin',
+          userId,
+        });
+      }
+    }
+
+    // PRIORITY 3: Fallback to global WEBHOOK_URL
+    if (!url) {
+      url = CONFIG.webhookUrl || null;
+      if (url) {
+        logger.debug('Using global WEBHOOK_URL', {
+          component: 'AutoJoin',
+          userId,
+        });
+      }
+    }
+
+    // If no webhook at all, log and return
+    if (!url) {
+      logger.debug('No webhook configured for win notification', {
+        component: 'AutoJoin',
+        userId,
+      });
+      return;
+    }
 
     const guildName = message.guild?.name ?? 'Direct Message';
     const jumpUrl = message.guild
@@ -983,7 +1030,7 @@ export class AutoJoinManager extends EventEmitter {
     try {
       await axios.post(url, {
         content: '@everyone',
-        username: 'AutoJoin WIN',
+        username: '🎉 AutoJoin WIN',
         embeds: [{
           title: '🏆 GIVEAWAY WIN!',
           description: jumpUrl ? `[Jump to message](${jumpUrl})` : 'Won via Direct Message',
@@ -995,15 +1042,18 @@ export class AutoJoinManager extends EventEmitter {
             { name: '👤 User', value: `<@${userId}>`, inline: true },
             { name: '⏰ Won At', value: formatTimestamp(Date.now()), inline: false },
           ],
-          footer: { text: `AutoJoin • User: ${userId}` },
+          footer: { 
+            text: `AutoJoin • ${url === CONFIG.winWebhookUrl || url === CONFIG.webhookUrl ? 'Global' : 'Personal'} Webhook`,
+          },
           timestamp: new Date().toISOString(),
         }],
       }, { timeout: 8000 });
 
-      logger.debug('Win webhook sent', {
+      logger.info('Win webhook sent successfully', {
         component: 'AutoJoin',
         userId,
-        prize,
+        prize: truncate(prize, 50),
+        webhookType: url === CONFIG.winWebhookUrl || url === CONFIG.webhookUrl ? 'global' : 'personal',
       });
     } catch (error) {
       logger.warn('Win webhook failed', {
