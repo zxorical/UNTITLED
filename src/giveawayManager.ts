@@ -189,6 +189,9 @@ export class GiveawayManager extends EventEmitter {
     startedAt: Date.now(),
   };
 
+  // Track message edit versions to handle delayed embed population
+  private messageEditTracker = new Map<string, { version: number; timestamp: number }>();
+
   // Invite refresher interval
   private inviteRefresherInterval: NodeJS.Timeout | null = null;
 
@@ -294,16 +297,54 @@ export class GiveawayManager extends EventEmitter {
         // Initial check
         result = this.isCreationMessage(message);
         
+        // Track if we've seen this message before (for edit detection)
+        const editKey = message.id;
+        const editInfo = this.messageEditTracker.get(editKey);
+        const version = editInfo ? editInfo.version + 1 : 1;
+        this.messageEditTracker.set(editKey, { version, timestamp: Date.now() });
+        
+        // DEBUG: Log original message state
+        console.log(`[DEBUG] Original message ${message.id}:`);
+        console.log("CONTENT:", message.content || "(empty)");
+        console.log("EMBEDS:", message.embeds.length);
+        console.log("EMBEDS DATA:", message.embeds.map(e => ({
+            title: e.title,
+            description: e.description?.slice(0, 100),
+            footer: e.footer?.text,
+            fields: e.fields?.length
+        })));
+        console.log("COMPONENTS:", (message as any).components?.length || 0);
+        console.log("COMPONENTS DATA:", (message as any).components ? 
+            JSON.stringify((message as any).components, null, 2).slice(0, 500) : 
+            "none"
+        );
+        console.log("SCORE:", result.score);
+        console.log("IS_CREATION:", result.isCreation);
+        console.log("---");
+        
         // Smart refresh: only fetch if important data is missing
         if (!result.isCreation && this.shouldRefreshMessage(message)) {
           try {
-            const refreshed = await message.fetch();
+            // Use channel.messages.fetch() for a fresh API request
+            console.log(`[DEBUG] Fetching fresh version of message ${message.id}...`);
+            const refreshed = await message.channel.messages.fetch(message.id);
+            
+            console.log(`[DEBUG] Fresh message ${message.id}:`);
+            console.log("  Original embeds:", message.embeds.length);
+            console.log("  Fetched embeds:", refreshed.embeds.length);
+            console.log("  Original components:", (message as any).components?.length || 0);
+            console.log("  Fetched components:", (refreshed as any).components?.length || 0);
+            
             const refreshedResult = this.isCreationMessage(refreshed);
-            // Only use refreshed result if it changed
+            // Only use refreshed result if it changed (score increased or became a creation)
             if (refreshedResult.isCreation || refreshedResult.score > result.score) {
+              console.log(`[DEBUG] Using refreshed result: score ${result.score} -> ${refreshedResult.score}, isCreation ${result.isCreation} -> ${refreshedResult.isCreation}`);
               result = refreshedResult;
+            } else {
+              console.log(`[DEBUG] Refreshed result unchanged, keeping original`);
             }
-          } catch {
+          } catch (err) {
+            console.log(`[DEBUG] Failed to fetch fresh message: ${formatError(err)}`);
             // If fetch fails, keep original result
           }
         }
@@ -984,7 +1025,7 @@ export class GiveawayManager extends EventEmitter {
     if (!button) {
       await delay(200);
       try {
-        const refreshed = await message.fetch();
+        const refreshed = await message.channel.messages.fetch(message.id);
         signals = this.collectSignalsSync(refreshed);
         score = Object.values(signals).reduce((sum, v) => sum + v, 0);
         button = this.extractEntryButton(refreshed);
