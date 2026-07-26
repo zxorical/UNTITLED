@@ -54,31 +54,92 @@ function tokensEnv(): string[] {
 }
 
 export const CONFIG: AppConfig = {
+  // Account tokens for public detectors
   tokens: tokensEnv(),
+  
+  // Main bot token for notifications
   botToken: requireEnv('DISCORD_BOT_TOKEN'),
+  
+  // Channel where giveaway notifications are sent
   trackerChannelId: requireEnv('TRACKER_CHANNEL_ID'),
+  
+  // Optional: only monitor specific channels
   monitoredChannels: csvEnv('MONITORED_CHANNELS'),
+  
+  // Database path (fallback if MongoDB not used)
   dbPath: optionalEnv('DB_PATH', './data/giveaways.json'),
+  
+  // Logging
   logLevel: optionalEnv('LOG_LEVEL', 'info'),
   logDir: optionalEnv('LOG_DIR', './logs'),
+  
+  // Notification cooldown to prevent spam
   notificationCooldown: assertInt(
     optionalEnv('NOTIFICATION_COOLDOWN', '30'),
     'NOTIFICATION_COOLDOWN', 10, 3600
   ),
+  
+  // Stats logging interval
   statsIntervalMs: assertInt(
     optionalEnv('STATS_INTERVAL_MS', '60000'),
     'STATS_INTERVAL_MS', 10000, 3600000
   ),
+  
+  // Admin user IDs
   adminUserIds: csvEnv('ADMIN_USER_IDS'),
+  
+  // ============================================================
+  // AutoJoin Settings
+  // ============================================================
+  
+  // Maximum retry attempts for entering a giveaway
+  maxRetries: assertInt(
+    optionalEnv('MAX_RETRIES', '3'),
+    'MAX_RETRIES', 1, 10
+  ),
+  
+  // Base delay between retry attempts (exponential backoff)
+  retryDelayMs: assertInt(
+    optionalEnv('RETRY_DELAY_MS', '2000'),
+    'RETRY_DELAY_MS', 500, 30000
+  ),
+  
+  // Delay before clicking a button (to ensure component loads)
+  buttonDelayMs: assertInt(
+    optionalEnv('BUTTON_DELAY_MS', '500'),
+    'BUTTON_DELAY_MS', 0, 5000
+  ),
+  
+  // Delay before adding a reaction (deprecated - kept for backwards compat)
+  reactionDelayMs: assertInt(
+    optionalEnv('REACTION_DELAY_MS', '300'),
+    'REACTION_DELAY_MS', 0, 5000
+  ),
+  
+  // Global webhook URLs (fallback if user doesn't set their own)
+  webhookUrl: optionalEnv('WEBHOOK_URL', ''),
+  winWebhookUrl: optionalEnv('WIN_WEBHOOK_URL', ''),
 };
 
+// ============================================================
+// Validation
+// ============================================================
+
+// Validate channel snowflakes
 CONFIG.monitoredChannels.forEach((id, i) => assertSnowflake(id, `MONITORED_CHANNELS[${i}]`));
 assertSnowflake(CONFIG.trackerChannelId, 'TRACKER_CHANNEL_ID');
+
+// Validate admin user IDs
 CONFIG.adminUserIds.forEach((id, i) => assertSnowflake(id, `ADMIN_USER_IDS[${i}]`));
 
+// Ensure at least one token is provided
 if (CONFIG.tokens.length === 0) {
   throw new Error('At least one token is required in DISCORD_TOKENS');
 }
+
+// ============================================================
+// Optional Config Checks (warnings only)
+// ============================================================
 
 const mongoUri = process.env.MONGO_URI;
 if (!mongoUri) {
@@ -99,6 +160,17 @@ if (!premiumRoleId) {
   console.warn('[Config] Warning: PREMIUM_ROLE_ID is not a valid Discord Snowflake');
 }
 
+const guildId = process.env.GUILD_ID;
+if (!guildId) {
+  console.warn('[Config] Warning: GUILD_ID not set — AutoJoiner will not start');
+} else if (!/^\d{17,19}$/.test(guildId)) {
+  console.warn('[Config] Warning: GUILD_ID is not a valid Discord Snowflake');
+}
+
+// ============================================================
+// Config Log
+// ============================================================
+
 console.log('[Config] Loaded successfully');
 console.log(`  - Accounts: ${CONFIG.tokens.length}`);
 console.log(`  - Bot Token: ${CONFIG.botToken ? 'Set' : 'Missing'}`);
@@ -110,3 +182,9 @@ console.log(`  - Notification Cooldown: ${CONFIG.notificationCooldown}s`);
 console.log(`  - Admins: ${CONFIG.adminUserIds.length || 'None'}`);
 console.log(`  - Owner ID: ${ownerId ? 'Set' : 'Missing'}`);
 console.log(`  - Premium Role ID: ${premiumRoleId ? 'Set' : 'Missing'}`);
+console.log(`  - Guild ID: ${guildId ? 'Set' : 'Missing'}`);
+console.log(`  - AutoJoin Settings:`);
+console.log(`    - Max Retries: ${CONFIG.maxRetries}`);
+console.log(`    - Retry Delay: ${CONFIG.retryDelayMs}ms`);
+console.log(`    - Button Delay: ${CONFIG.buttonDelayMs}ms`);
+console.log(`  - Webhooks: ${CONFIG.webhookUrl ? 'Set' : 'Not set'} | ${CONFIG.winWebhookUrl ? 'Win webhook set' : 'Win webhook not set'}`);
