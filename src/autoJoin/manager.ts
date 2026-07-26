@@ -39,7 +39,7 @@ import {
   updateAutoJoinEntryStatus,
   cleanupAutoJoinEntries,
 } from '../database.js';
-import { decryptToken } from '../premium/tokenManager.js';
+import { decryptToken, validateDiscordToken } from '../premium/tokenManager.js';
 import { CONFIG } from '../config.js';
 
 // ---------------------------------------------------------------------------
@@ -82,6 +82,8 @@ interface UserSession {
   isActive: boolean;
   stats: SessionStats;
   heartbeatInterval?: NodeJS.Timeout;
+  reconnectAttempts: number;
+  maxReconnectAttempts: number;
 }
 
 interface SessionStats {
@@ -105,6 +107,8 @@ const SESSION_REFRESH_INTERVAL_MS = 120_000;
 const HEARTBEAT_INTERVAL_MS = 60_000;
 const MAX_SESSIONS = 5;
 const PROCESSING_CACHE_TTL_MS = 60000; // 1 minute for processing set
+const MAX_RECONNECT_ATTEMPTS = 3;
+const RECONNECT_DELAY_MS = 60000; // 1 minute between reconnects
 
 const KNOWN_GIVEAWAY_BOT_IDS: ReadonlySet<string> = new Set([
   '294882584201003009', // GiveawayBot
@@ -219,6 +223,7 @@ export class AutoJoinManager extends EventEmitter {
   private refreshInterval: NodeJS.Timeout | null = null;
   private cleanupInterval: NodeJS.Timeout | null = null;
   private memoryCheckInterval: NodeJS.Timeout | null = null;
+  private reconnectCheckInterval: NodeJS.Timeout | null = null;
   private isShuttingDown = false;
   private sessionStartPromises: Map<string, Promise<boolean>> = new Map();
 
@@ -231,6 +236,7 @@ export class AutoJoinManager extends EventEmitter {
     this.startSessionRefresher();
     this.startCleanupInterval();
     this.startMemoryCheck();
+    this.startReconnectChecker();
   }
 
   // -------------------------------------------------------------------------
@@ -257,16 +263,10 @@ export class AutoJoinManager extends EventEmitter {
         }))
       });
       
-      // IMPORTANT: Include users with tokenActive === false AND tokenActive === null/undefined
-      // We should attempt to start sessions for ALL users with tokens, regardless of active status
-      const validUsers = allPremiumUsers.filter(u => {
-        if (!u.token) return false;
-        // Don't filter by tokenActive - try to start regardless
-        // The startSession will handle failures and update tokenActive accordingly
-        return true;
-      });
+      // Include ALL users with tokens, regardless of tokenActive status
+      const validUsers = allPremiumUsers.filter(u => u.token);
       
-      logger.info('Users with tokens (including inactive)', {
+      logger.info('Users with tokens', {
         component: 'AutoJoin',
         count: validUsers.length,
         active: validUsers.filter(u => u.tokenActive !== false).length,
@@ -282,15 +282,22 @@ export class AutoJoinManager extends EventEmitter {
       }
 
       let started = 0;
+      let failed = 0;
       for (const user of usersToStart) {
         const success = await this.startSession(user.userId, user.guildId);
-        if (success) started++;
+        if (success) {
+          started++;
+        } else {
+          failed++;
+        }
         await delay(2000);
       }
 
-      logger.info(`AutoJoin sessions started: ${started} active`, {
+      logger.info(`AutoJoin sessions started: ${started} active (${failed} failed)`, {
         component: 'AutoJoin',
         sessions: this.sessions.size,
+        started,
+        failed
       });
     } catch (error) {
       logger.error('Failed to start AutoJoin sessions', {
@@ -367,16 +374,30 @@ export class AutoJoinManager extends EventEmitter {
       let decryptedToken: string;
       try {
         decryptedToken = decryptToken(user.token);
+        logger.debug('Token decrypted successfully', { component: 'AutoJoin', userId });
       } catch (error) {
         logger.error('Failed to decrypt token', { 
           userId, 
           error: formatError(error),
           tokenPreview: user.token?.slice(0, 20) + '...'
         });
-        // Mark token as inactive if decryption fails
         await setTokenActive(userId, guildId, false);
         return false;
       }
+
+      // Validate token before trying to start session
+      logger.debug('Validating token...', { component: 'AutoJoin', userId });
+      const isValid = await validateDiscordToken(decryptedToken);
+      if (!isValid) {
+        logger.error('Token validation failed', {
+          component: 'AutoJoin',
+          userId,
+          label: user.tokenLabel || 'main'
+        });
+        await setTokenActive(userId, guildId, false);
+        return false;
+      }
+      logger.debug('Token validation successful', { component: 'AutoJoin', userId });
 
       // Create client with minimal caching to save memory
       const client = new Client({
@@ -398,24 +419,16 @@ export class AutoJoinManager extends EventEmitter {
           failed: 0,
           wins: 0,
         },
+        reconnectAttempts: 0,
+        maxReconnectAttempts: MAX_RECONNECT_ATTEMPTS,
       };
 
       this.registerEvents(session);
 
       // Try to login
-      try {
-        await this.loginWithTimeout(client, decryptedToken);
-        await this.waitForReady(client);
-      } catch (loginError) {
-        logger.error('Login failed for user', {
-          component: 'AutoJoin',
-          userId,
-          error: formatError(loginError)
-        });
-        // Mark token as inactive if login fails
-        await setTokenActive(userId, guildId, false);
-        return false;
-      }
+      logger.debug('Logging in...', { component: 'AutoJoin', userId });
+      await this.loginWithTimeout(client, decryptedToken);
+      await this.waitForReady(client);
 
       this.sessions.set(sessionKey, session);
       this.startHeartbeat(session);
@@ -424,7 +437,7 @@ export class AutoJoinManager extends EventEmitter {
       await setTokenActive(userId, guildId, true);
       await updateTokenLastUsed(userId, guildId);
 
-      logger.info('AutoJoin session started', {
+      logger.info('✅ AutoJoin session started', {
         userId,
         label: session.label,
         username: client.user?.username,
@@ -435,12 +448,14 @@ export class AutoJoinManager extends EventEmitter {
       return true;
 
     } catch (error) {
+      const errorMsg = formatError(error);
       logger.error('Failed to start AutoJoin session', {
         userId,
         guildId,
-        error: formatError(error),
+        error: errorMsg,
       });
       
+      // Mark token as inactive on failure
       await setTokenActive(userId, guildId, false);
       return false;
     }
@@ -488,14 +503,37 @@ export class AutoJoinManager extends EventEmitter {
       if (this.isShuttingDown || !session.isActive) return;
 
       if (!session.client.isReady()) {
-        logger.warn('Session client not ready, attempting reconnect', {
+        logger.warn('Session client not ready, checking reconnect...', {
           component: 'AutoJoin',
           userId: session.userId,
+          attempts: session.reconnectAttempts,
+          maxAttempts: session.maxReconnectAttempts
         });
         
-        (session.client as any).destroy();
-        this._startSessionInternal(session.userId, session.guildId)
-          .catch(err => logger.error('Reconnect failed', { error: formatError(err) }));
+        if (session.reconnectAttempts < session.maxReconnectAttempts) {
+          session.reconnectAttempts++;
+          logger.info(`Attempting reconnect ${session.reconnectAttempts}/${session.maxReconnectAttempts}`, {
+            component: 'AutoJoin',
+            userId: session.userId
+          });
+          
+          (session.client as any).destroy();
+          this._startSessionInternal(session.userId, session.guildId)
+            .then(success => {
+              if (success) {
+                session.reconnectAttempts = 0;
+                logger.info('Reconnect successful', { component: 'AutoJoin', userId: session.userId });
+              }
+            })
+            .catch(err => logger.error('Reconnect failed', { error: formatError(err) }));
+        } else {
+          logger.error('Max reconnect attempts reached, stopping session', {
+            component: 'AutoJoin',
+            userId: session.userId
+          });
+          session.isActive = false;
+          this.stopSession(session.userId, session.guildId);
+        }
       }
     }, HEARTBEAT_INTERVAL_MS);
 
@@ -513,14 +551,20 @@ export class AutoJoinManager extends EventEmitter {
     try {
       const allPremiumUsers = await this.getAllPremiumUsersAcrossAllGuilds();
       let restored = 0;
-      let inactive = 0;
+      let failed = 0;
+      let skipped = 0;
       
       for (const user of allPremiumUsers) {
-        if (!user.token) continue;
+        if (!user.token) {
+          skipped++;
+          continue;
+        }
         
-        // Try to restore even if tokenActive is false (it might have been deactivated due to a temporary issue)
         const sessionKey = this.makeSessionKey(user.userId);
-        if (this.sessions.has(sessionKey)) continue;
+        if (this.sessions.has(sessionKey)) {
+          skipped++;
+          continue;
+        }
         
         logger.debug('Attempting to restore session for user', {
           component: 'AutoJoin',
@@ -533,16 +577,17 @@ export class AutoJoinManager extends EventEmitter {
         if (success) {
           restored++;
         } else {
-          inactive++;
+          failed++;
         }
         await delay(500);
       }
       
-      logger.info(`Restored ${restored} AutoJoin sessions (${inactive} failed)`, {
+      logger.info(`Restored ${restored} AutoJoin sessions (${failed} failed, ${skipped} skipped)`, {
         component: 'AutoJoin',
         total: this.sessions.size,
         restored,
-        failed: inactive
+        failed,
+        skipped
       });
     } catch (error) {
       logger.error('Failed to restore AutoJoin sessions', {
@@ -591,10 +636,10 @@ export class AutoJoinManager extends EventEmitter {
 
     try {
       const allPremiumUsers = await this.getAllPremiumUsersAcrossAllGuilds();
-      // Include ALL users with tokens, regardless of tokenActive status
+      // Include ALL users with tokens
       const activeUserIds = new Set(
         allPremiumUsers
-          .filter(u => u.token) // Just check if they have a token
+          .filter(u => u.token)
           .map(u => u.userId)
       );
 
@@ -618,6 +663,36 @@ export class AutoJoinManager extends EventEmitter {
       this.logStats();
     } catch (error) {
       logger.error('Failed to refresh sessions', {
+        component: 'AutoJoin',
+        error: formatError(error),
+      });
+    }
+  }
+
+  /**
+   * Retry failed sessions (ones with tokenActive false)
+   */
+  async retryFailedSessions(): Promise<void> {
+    if (this.isShuttingDown) return;
+    
+    try {
+      const allPremiumUsers = await this.getAllPremiumUsersAcrossAllGuilds();
+      const failedUsers = allPremiumUsers.filter(u => u.token && u.tokenActive === false);
+      
+      if (failedUsers.length === 0) return;
+      
+      logger.info(`Retrying ${failedUsers.length} failed sessions...`, { component: 'AutoJoin' });
+      
+      for (const user of failedUsers) {
+        const sessionKey = this.makeSessionKey(user.userId);
+        if (!this.sessions.has(sessionKey)) {
+          logger.debug(`Retrying session for user ${user.userId}`, { component: 'AutoJoin' });
+          await this.startSession(user.userId, user.guildId);
+          await delay(2000);
+        }
+      }
+    } catch (error) {
+      logger.error('Failed to retry sessions', {
         component: 'AutoJoin',
         error: formatError(error),
       });
@@ -658,6 +733,10 @@ export class AutoJoinManager extends EventEmitter {
     if (this.memoryCheckInterval) {
       clearInterval(this.memoryCheckInterval);
       this.memoryCheckInterval = null;
+    }
+    if (this.reconnectCheckInterval) {
+      clearInterval(this.reconnectCheckInterval);
+      this.reconnectCheckInterval = null;
     }
 
     logger.info('Shutting down AutoJoin sessions...', { component: 'AutoJoin' });
@@ -796,7 +875,6 @@ export class AutoJoinManager extends EventEmitter {
         expiresAt: Date.now() + ENTRY_TTL_MS,
       };
 
-      // Store in MongoDB - the database function will add the _id
       await saveAutoJoinEntry(entryData);
 
       session.stats.detected++;
@@ -809,7 +887,6 @@ export class AutoJoinManager extends EventEmitter {
         channel: `#${entryData.channelName}`,
       });
 
-      // Enter the giveaway
       await this.enterGiveaway(entryId, session);
 
     } catch (error) {
@@ -842,11 +919,9 @@ export class AutoJoinManager extends EventEmitter {
 
     if (!hasSignal) return null;
 
-    // Try immediate extraction
     const immediate = this.tryExtractEntry(message, isKnownBot);
     if (immediate) return immediate;
 
-    // Retry with delay (components may load late)
     for (let i = 0; i < COMPONENT_RETRY_ATTEMPTS; i++) {
       await delay(COMPONENT_RETRY_DELAY_MS);
       try {
@@ -991,7 +1066,6 @@ export class AutoJoinManager extends EventEmitter {
       }
     }
 
-    // All attempts failed
     await updateAutoJoinEntryStatus(
       session.userId,
       entry.messageId,
@@ -1132,7 +1206,6 @@ export class AutoJoinManager extends EventEmitter {
     const allText = this.extractAllText(message);
     if (!WIN_PATTERNS.some(re => re.test(allText))) return;
 
-    // Dedup
     const dedupKey = `${message.channel.id}:${message.author?.id ?? 'unknown'}`;
     const lastWin = this.recentWins.get(dedupKey);
     if (lastWin && Date.now() - lastWin < WIN_DEDUP_TTL_MS) {
@@ -1188,7 +1261,7 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   // -------------------------------------------------------------------------
-  // Webhooks - Priority: User Personal > WIN_WEBHOOK_URL > WEBHOOK_URL
+  // Webhooks
   // -------------------------------------------------------------------------
 
   private async sendWinWebhook(
@@ -1358,14 +1431,13 @@ export class AutoJoinManager extends EventEmitter {
   private startCleanupInterval(): void {
     this.cleanupInterval = setInterval(async () => {
       try {
-        // Clean up old entries for all sessions
         for (const [_, session] of this.sessions) {
           await cleanupAutoJoinEntries(session.userId);
         }
       } catch (error) {
         logger.debug('Cleanup error', { error: formatError(error) });
       }
-    }, 5 * 60_000); // Every 5 minutes
+    }, 5 * 60_000);
 
     if (this.cleanupInterval.unref) {
       this.cleanupInterval.unref();
@@ -1404,6 +1476,21 @@ export class AutoJoinManager extends EventEmitter {
 
     if (this.memoryCheckInterval.unref) {
       this.memoryCheckInterval.unref();
+    }
+  }
+
+  private startReconnectChecker(): void {
+    this.reconnectCheckInterval = setInterval(() => {
+      this.retryFailedSessions().catch((error) => {
+        logger.error('Reconnect check failed', {
+          component: 'AutoJoin',
+          error: formatError(error),
+        });
+      });
+    }, RECONNECT_DELAY_MS);
+
+    if (this.reconnectCheckInterval.unref) {
+      this.reconnectCheckInterval.unref();
     }
   }
 
