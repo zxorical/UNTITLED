@@ -24,7 +24,6 @@ import {
   truncate,
   sanitizeForLog,
   formatTimestamp,
-  formatDuration,
   hasGiveawayKeyword,
 } from '../utils.js';
 import {
@@ -80,7 +79,7 @@ interface GiveawayButton {
 interface UserSession {
   client: Client;
   userId: string;
-  guildId: string; // Primary guild where they have premium
+  guildId: string; // The guild where they have premium (for DB lookups)
   token: string;
   label: string;
   startedAt: number;
@@ -272,6 +271,7 @@ export class AutoJoinManager extends EventEmitter {
 
   /**
    * Start a single user session
+   * One session per user - monitors ALL servers they have access to
    */
   async startSession(userId: string, guildId: string): Promise<boolean> {
     const sessionKey = this.makeSessionKey(userId);
@@ -357,7 +357,7 @@ export class AutoJoinManager extends EventEmitter {
         userId,
         label: session.label,
         username: client.user?.username,
-        guilds: client.guilds.cache.size,
+        guilds: client.guilds.cache.size, // Show how many servers they're in
       });
 
       this.emit('sessionStarted', { userId, guildId });
@@ -378,6 +378,7 @@ export class AutoJoinManager extends EventEmitter {
 
   /**
    * Restore sessions from database (for VPS restarts)
+   * This ensures users don't need to re-enter their tokens
    */
   async restoreSessionsFromDatabase(): Promise<void> {
     logger.info('Restoring AutoJoin sessions from database...', { component: 'AutoJoin' });
@@ -1191,8 +1192,12 @@ export class AutoJoinManager extends EventEmitter {
     return `${message.channel.id}:${message.id}`;
   }
 
+  /**
+   * Create a session key using ONLY userId
+   * One session per user monitors ALL servers they have access to
+   */
   private makeSessionKey(userId: string): string {
-    return userId; // No guildId needed since we monitor all servers
+    return userId;
   }
 
   private findSessionByUserId(userId: string): UserSession | null {
