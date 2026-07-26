@@ -1,6 +1,7 @@
 /**
  * @module index
  * Application entry point – with BotManager timeout and fallback.
+ * Now includes AutoJoiner for premium users.
  */
 
 import http from 'http';
@@ -14,6 +15,7 @@ import GiveawayManager from './giveawayManager.js';
 import { BotManager } from './bot.js';
 import { delay, formatError, formatDuration } from './utils.js';
 import { getDb, closeDb, cleanupOldGiveaways } from './database.js';
+import { AutoJoinManager } from './autoJoin/index.js';
 
 // ----------------------------------------------------------------------------
 // HEALTH SERVER
@@ -57,6 +59,7 @@ process.on('unhandledRejection', (reason) => {
 // ----------------------------------------------------------------------------
 let activeManagers: GiveawayManager[] = [];
 let botManager: BotManager | null = null;
+let autoJoiner: AutoJoinManager | null = null;
 let statsInterval: ReturnType<typeof setInterval> | null = null;
 let shuttingDown = false;
 
@@ -114,7 +117,28 @@ async function main(): Promise<void> {
   }
 
   // --------------------------------------------------------------------------
-  // START ACCOUNT CLIENTS
+  // START AUTOJOINER
+  // --------------------------------------------------------------------------
+  const guildId = process.env.GUILD_ID;
+  if (!guildId) {
+    logger.warn('GUILD_ID not set - AutoJoiner will not start', { component: 'Bootstrap' });
+  } else {
+    try {
+      logger.info('Starting AutoJoiner...', { component: 'Bootstrap' });
+      autoJoiner = new AutoJoinManager(guildId);
+      await autoJoiner.startAllSessions();
+      logger.info('AutoJoiner started successfully.', { component: 'Bootstrap' });
+    } catch (err) {
+      logger.warn('AutoJoiner failed to start:', {
+        component: 'Bootstrap',
+        error: formatError(err),
+      });
+      autoJoiner = null;
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // START ACCOUNT CLIENTS (Public Detectors)
   // --------------------------------------------------------------------------
   activeManagers = [];
   let authFailures = 0;
@@ -205,9 +229,22 @@ async function main(): Promise<void> {
     failures: authFailures,
   });
 
+  if (autoJoiner) {
+    const stats = autoJoiner.getStats();
+    logger.info(`✅ AutoJoiner running with ${stats.activeSessions}/${stats.totalSessions} active sessions`, {
+      component: 'Bootstrap',
+    });
+  }
+
   statsInterval = setInterval(() => {
     for (const m of activeManagers) {
       m.logStats();
+    }
+    if (autoJoiner) {
+      const stats = autoJoiner.getStats();
+      logger.info(`AutoJoiner: ${stats.activeSessions}/${stats.totalSessions} sessions active`, {
+        component: 'Bootstrap',
+      });
     }
   }, CONFIG.statsIntervalMs);
   statsInterval.unref();
@@ -315,13 +352,23 @@ function registerShutdown(): void {
 
     if (statsInterval) { clearInterval(statsInterval); statsInterval = null; }
 
+    // Shutdown public detectors
     for (const m of activeManagers) {
       await m.shutdown();
     }
 
+    // Shutdown AutoJoiner
+    if (autoJoiner) {
+      logger.info('Shutting down AutoJoiner...', { component: 'Shutdown' });
+      await autoJoiner.shutdown();
+      autoJoiner = null;
+    }
+
+    // Shutdown BotManager
     if (botManager) {
       logger.info('Shutting down BotManager...', { component: 'Shutdown' });
       await botManager.destroy();
+      botManager = null;
     }
 
     closeDb();
@@ -374,10 +421,17 @@ async function boot(): Promise<void> {
         process.exit(1);
       }
 
+      // Cleanup
       for (const m of activeManagers) {
         try { (m as any).client?.destroy(); } catch {}
       }
       activeManagers = [];
+      
+      if (autoJoiner) {
+        try { await autoJoiner.shutdown(); } catch {}
+        autoJoiner = null;
+      }
+      
       shuttingDown = false;
 
       logger.info(`Retrying in ${BOOT_RETRY_DELAY_MS / 1000}s...`, { component: 'Bootstrap' });
