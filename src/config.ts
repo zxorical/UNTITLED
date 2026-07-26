@@ -160,12 +160,9 @@ if (!premiumRoleId) {
   console.warn('[Config] Warning: PREMIUM_ROLE_ID is not a valid Discord Snowflake');
 }
 
-const guildId = process.env.GUILD_ID;
-if (!guildId) {
-  console.warn('[Config] Warning: GUILD_ID not set — AutoJoiner will not start');
-} else if (!/^\d{17,19}$/.test(guildId)) {
-  console.warn('[Config] Warning: GUILD_ID is not a valid Discord Snowflake');
-}
+// ============================================================
+// GUILD_ID is NO LONGER REQUIRED - AutoJoiner monitors ALL servers
+// ============================================================
 
 // ============================================================
 // Config Log
@@ -182,9 +179,9 @@ console.log(`  - Notification Cooldown: ${CONFIG.notificationCooldown}s`);
 console.log(`  - Admins: ${CONFIG.adminUserIds.length || 'None'}`);
 console.log(`  - Owner ID: ${ownerId ? 'Set' : 'Missing'}`);
 console.log(`  - Premium Role ID: ${premiumRoleId ? 'Set' : 'Missing'}`);
-console.log(`  - Guild ID: ${guildId ? 'Set' : 'Missing'}`);
 console.log(`  - AutoJoin Settings:`);
 console.log(`    - Max Retries: ${CONFIG.maxRetries}`);
 console.log(`    - Retry Delay: ${CONFIG.retryDelayMs}ms`);
 console.log(`    - Button Delay: ${CONFIG.buttonDelayMs}ms`);
 console.log(`  - Webhooks: ${CONFIG.webhookUrl ? 'Set' : 'Not set'} | ${CONFIG.winWebhookUrl ? 'Win webhook set' : 'Win webhook not set'}`);
+console.log(`  - AutoJoiner: Monitors ALL servers (no GUILD_ID required)`);
