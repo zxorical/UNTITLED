@@ -246,7 +246,32 @@ export class AutoJoinManager extends EventEmitter {
     try {
       const allPremiumUsers = await this.getAllPremiumUsersAcrossAllGuilds();
       
-      const validUsers = allPremiumUsers.filter(u => u.token && u.tokenActive !== false);
+      logger.info('Found premium users in database', {
+        component: 'AutoJoin',
+        count: allPremiumUsers.length,
+        sample: allPremiumUsers.slice(0, 3).map(u => ({
+          userId: u.userId,
+          hasToken: !!u.token,
+          tokenActive: u.tokenActive,
+          isPremium: u.isPremium
+        }))
+      });
+      
+      // IMPORTANT: Include users with tokenActive === false AND tokenActive === null/undefined
+      // We should attempt to start sessions for ALL users with tokens, regardless of active status
+      const validUsers = allPremiumUsers.filter(u => {
+        if (!u.token) return false;
+        // Don't filter by tokenActive - try to start regardless
+        // The startSession will handle failures and update tokenActive accordingly
+        return true;
+      });
+      
+      logger.info('Users with tokens (including inactive)', {
+        component: 'AutoJoin',
+        count: validUsers.length,
+        active: validUsers.filter(u => u.tokenActive !== false).length,
+        inactive: validUsers.filter(u => u.tokenActive === false).length
+      });
       
       const usersToStart = validUsers.slice(0, MAX_SESSIONS);
       
@@ -277,7 +302,24 @@ export class AutoJoinManager extends EventEmitter {
 
   private async getAllPremiumUsersAcrossAllGuilds(): Promise<any[]> {
     try {
-      return await getAllPremiumUsersAllGuilds();
+      const users = await getAllPremiumUsersAllGuilds();
+      
+      // If no users found, try getting premium users from the specific guild
+      if (users.length === 0) {
+        const { getAllPremiumUsers } = await import('../database.js');
+        const guildId = process.env.GUILD_ID;
+        if (guildId) {
+          const guildUsers = await getAllPremiumUsers(guildId);
+          logger.info('Fallback: Found premium users in specific guild', {
+            component: 'AutoJoin',
+            count: guildUsers.length,
+            guildId
+          });
+          return guildUsers;
+        }
+      }
+      
+      return users;
     } catch (error) {
       logger.error('Failed to get premium users', { error: formatError(error) });
       return [];
@@ -288,6 +330,7 @@ export class AutoJoinManager extends EventEmitter {
     const sessionKey = this.makeSessionKey(userId);
     
     if (this.sessions.has(sessionKey)) {
+      logger.debug('Session already running', { component: 'AutoJoin', userId });
       return true;
     }
 
@@ -317,6 +360,7 @@ export class AutoJoinManager extends EventEmitter {
     try {
       const user = await getPremiumUser(userId, guildId);
       if (!user?.token) {
+        logger.debug('No token found for user', { component: 'AutoJoin', userId });
         return false;
       }
 
@@ -324,7 +368,12 @@ export class AutoJoinManager extends EventEmitter {
       try {
         decryptedToken = decryptToken(user.token);
       } catch (error) {
-        logger.error('Failed to decrypt token', { userId, error: formatError(error) });
+        logger.error('Failed to decrypt token', { 
+          userId, 
+          error: formatError(error),
+          tokenPreview: user.token?.slice(0, 20) + '...'
+        });
+        // Mark token as inactive if decryption fails
         await setTokenActive(userId, guildId, false);
         return false;
       }
@@ -353,12 +402,25 @@ export class AutoJoinManager extends EventEmitter {
 
       this.registerEvents(session);
 
-      await this.loginWithTimeout(client, decryptedToken);
-      await this.waitForReady(client);
+      // Try to login
+      try {
+        await this.loginWithTimeout(client, decryptedToken);
+        await this.waitForReady(client);
+      } catch (loginError) {
+        logger.error('Login failed for user', {
+          component: 'AutoJoin',
+          userId,
+          error: formatError(loginError)
+        });
+        // Mark token as inactive if login fails
+        await setTokenActive(userId, guildId, false);
+        return false;
+      }
 
       this.sessions.set(sessionKey, session);
       this.startHeartbeat(session);
       
+      // Mark token as active on successful login
       await setTokenActive(userId, guildId, true);
       await updateTokenLastUsed(userId, guildId);
 
@@ -397,14 +459,12 @@ export class AutoJoinManager extends EventEmitter {
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => reject(new Error('Ready timeout')), 10000);
       
-      // Check if already ready
       if (client.isReady()) {
         clearTimeout(timeout);
         resolve();
         return;
       }
       
-      // Use type assertion for the client to access once
       const selfbotClient = client as any;
       
       selfbotClient.once('ready', () => { 
@@ -433,7 +493,6 @@ export class AutoJoinManager extends EventEmitter {
           userId: session.userId,
         });
         
-        // Use type assertion for destroy
         (session.client as any).destroy();
         this._startSessionInternal(session.userId, session.guildId)
           .catch(err => logger.error('Reconnect failed', { error: formatError(err) }));
@@ -454,22 +513,36 @@ export class AutoJoinManager extends EventEmitter {
     try {
       const allPremiumUsers = await this.getAllPremiumUsersAcrossAllGuilds();
       let restored = 0;
+      let inactive = 0;
       
       for (const user of allPremiumUsers) {
         if (!user.token) continue;
-        if (user.tokenActive === false) continue;
         
+        // Try to restore even if tokenActive is false (it might have been deactivated due to a temporary issue)
         const sessionKey = this.makeSessionKey(user.userId);
         if (this.sessions.has(sessionKey)) continue;
         
+        logger.debug('Attempting to restore session for user', {
+          component: 'AutoJoin',
+          userId: user.userId,
+          tokenActive: user.tokenActive,
+          hasToken: !!user.token
+        });
+        
         const success = await this.startSession(user.userId, user.guildId);
-        if (success) restored++;
+        if (success) {
+          restored++;
+        } else {
+          inactive++;
+        }
         await delay(500);
       }
       
-      logger.info(`Restored ${restored} AutoJoin sessions`, {
+      logger.info(`Restored ${restored} AutoJoin sessions (${inactive} failed)`, {
         component: 'AutoJoin',
         total: this.sessions.size,
+        restored,
+        failed: inactive
       });
     } catch (error) {
       logger.error('Failed to restore AutoJoin sessions', {
@@ -493,7 +566,6 @@ export class AutoJoinManager extends EventEmitter {
         session.heartbeatInterval = undefined;
       }
       
-      // Use type assertion for destroy
       await Promise.race([
         (session.client as any).destroy(),
         delay(5000),
@@ -519,21 +591,23 @@ export class AutoJoinManager extends EventEmitter {
 
     try {
       const allPremiumUsers = await this.getAllPremiumUsersAcrossAllGuilds();
+      // Include ALL users with tokens, regardless of tokenActive status
       const activeUserIds = new Set(
         allPremiumUsers
-          .filter(u => u.token && u.tokenActive !== false)
+          .filter(u => u.token) // Just check if they have a token
           .map(u => u.userId)
       );
 
+      // Stop sessions for users who no longer have tokens
       for (const [key, session] of this.sessions) {
         if (!activeUserIds.has(session.userId)) {
           await this.stopSession(session.userId, session.guildId);
         }
       }
 
+      // Start sessions for users with tokens
       for (const user of allPremiumUsers) {
         if (!user.token) continue;
-        if (user.tokenActive === false) continue;
         
         const sessionKey = this.makeSessionKey(user.userId);
         if (!this.sessions.has(sessionKey)) {
@@ -1113,7 +1187,8 @@ export class AutoJoinManager extends EventEmitter {
     this.emit('giveawayWon', { message, prize, userId, source: 'dm' });
   }
 
-  // -------------------------------------------------------------------------  // Webhooks - Priority: User Personal > WIN_WEBHOOK_URL > WEBHOOK_URL
+  // -------------------------------------------------------------------------
+  // Webhooks - Priority: User Personal > WIN_WEBHOOK_URL > WEBHOOK_URL
   // -------------------------------------------------------------------------
 
   private async sendWinWebhook(
@@ -1303,7 +1378,6 @@ export class AutoJoinManager extends EventEmitter {
       const heapUsedMB = Math.round(memUsage.heapUsed / 1024 / 1024);
       const heapTotalMB = Math.round(memUsage.heapTotal / 1024 / 1024);
       
-      // Log memory usage
       logger.debug('AutoJoin Memory Usage', {
         component: 'AutoJoin',
         heapUsed: `${heapUsedMB}MB`,
@@ -1313,7 +1387,6 @@ export class AutoJoinManager extends EventEmitter {
         recentWins: this.recentWins.size,
       });
 
-      // If memory is too high, force cleanup
       if (heapUsedMB > 300) {
         logger.warn('High memory usage detected, forcing cleanup', {
           component: 'AutoJoin',
@@ -1323,12 +1396,11 @@ export class AutoJoinManager extends EventEmitter {
         this.processingCache.clear();
         this.recentWins.clear();
         
-        // Force garbage collection if available
         if (global.gc) {
           global.gc();
         }
       }
-    }, 60_000); // Every minute
+    }, 60_000);
 
     if (this.memoryCheckInterval.unref) {
       this.memoryCheckInterval.unref();
