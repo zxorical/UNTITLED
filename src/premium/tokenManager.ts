@@ -129,3 +129,50 @@ export function isSessionActive(userId: string, guildId: string): boolean {
 export function getAllSessions(): TokenSession[] {
   return Array.from(sessions.values());
 }
+
+// ============================================================================
+// Restore Sessions from Database
+// ============================================================================
+
+export async function restoreTokenSessionsFromDatabase(): Promise<number> {
+  try {
+    // Import dynamically to avoid circular dependency
+    const { getAllPremiumUsersAllGuilds } = await import('../database.js');
+    
+    const users = await getAllPremiumUsersAllGuilds();
+    let restored = 0;
+
+    for (const user of users) {
+      if (!user.token || user.tokenActive === false) continue;
+
+      const sessionKey = `${user.userId}:${user.guildId}`;
+      if (sessions.has(sessionKey)) continue;
+
+      try {
+        const decryptedToken = decryptToken(user.token);
+        startTokenSession(user.userId, user.guildId, decryptedToken, user.tokenLabel || 'main');
+        restored++;
+      } catch (error) {
+        logger.error('Failed to restore token session', {
+          userId: user.userId,
+          error: String(error),
+        });
+        // Mark token as inactive if decryption fails
+        const { setTokenActive } = await import('../database.js');
+        await setTokenActive(user.userId, user.guildId, false);
+      }
+    }
+
+    logger.info(`Restored ${restored} token sessions from database`, {
+      component: 'TokenManager',
+    });
+
+    return restored;
+  } catch (error) {
+    logger.error('Failed to restore token sessions', {
+      component: 'TokenManager',
+      error: String(error),
+    });
+    return 0;
+  }
+}
