@@ -4,8 +4,8 @@
  * Premium AutoJoiner - PRODUCTION GRADE
  * 
  * Optimizations:
- * 1. No batching latency - 50ms batch or direct processing
- * 2. Critical data written instantly, analytics batched
+ * 1. Direct processing (no batching latency)
+ * 2. Critical data written instantly
  * 3. Worker-based architecture for scaling
  * 4. RAM cache for processed messages (no DB hit per message)
  * 5. O(1) session lookups with Map
@@ -14,11 +14,15 @@
  * 8. Circuit breakers for Discord API
  * 9. Token encryption at rest, decrypted only when needed
  * 10. SessionUserIdMap for O(1) lookups
+ * 11. Connection pooling with HTTP/HTTPS agents
+ * 12. Proper ClientOptions for discord.js-selfbot-v13
  */
 
-import { Client, Message, TextChannel } from 'discord.js-selfbot-v13';
+import { Client, Message, TextChannel, ClientOptions } from 'discord.js-selfbot-v13';
 import { EventEmitter } from 'events';
 import axios from 'axios';
+import http from 'http';
+import https from 'https';
 import { logger } from '../logger.js';
 import {
   delay,
@@ -79,8 +83,7 @@ interface UserSession {
   client: Client;
   userId: string;
   guildId: string;
-  // Token is NOT stored here - decrypted on demand, cleared after use
-  token?: string; // Only exists during login/validation, cleared after
+  token?: string;
   label: string;
   startedAt: number;
   isActive: boolean;
@@ -103,27 +106,13 @@ interface SessionStats {
 // Constants - Optimized regex
 // ---------------------------------------------------------------------------
 
-// SINGLE combined regex patterns for performance
 const PATTERNS = {
-  // Combined entry button patterns - one regex instead of many
   ENTRY_BUTTON: /\b(enter|join|participate|raffle|sweepstakes|submit|claim|sign\s*up|go)\b|🎉|🎁|🏆|^\d[\d,]*$/i,
-  
-  // Combined blocked labels
   BLOCKED_BUTTON: /\b(leave|quit|exit|unenter|withdraw|remove\s+entry|cancel\s+(entry|giveaway)|end\s+giveaway)\b/i,
-  
-  // Combined blocked message content
   BLOCKED_CONTENT: /\b(already\s+entered|already\s+(?:in|participating)|already\s+joined|leave\s+giveaway)\b/i,
-  
-  // Combined win patterns
   WIN: /(?:congratulations?|you(?:(?:'ve|\s+have)\s+won| won\s| are|'re)|winner|has\s+won|won\s+(?:the\s+)?giveaway|won\s+(?:a\s+)?(?:prize|raffle))/i,
-  
-  // Timestamp
   TIMESTAMP: /<t:(\d{10,13})(?::[a-zA-Z])?>/,
-  
-  // Draft buttons
   DRAFT_BUTTON: /\b(start|edit|cancel|preview|setup)\b/i,
-  
-  // Giveaway keywords
   GIVEAWAY_KEYWORD: /\bgiveaway\b|\braffle\b|\bsweepstakes\b|\bwin\b|\bprize\b/i,
 } as const;
 
@@ -143,7 +132,6 @@ const TRUSTED_ENTRY_CUSTOM_IDS: ReadonlySet<string> = new Set([
 // Constants - Optimized values
 // ---------------------------------------------------------------------------
 
-const MAX_CONCURRENT = 1;
 const ENTRY_TTL_MS = 2 * 60 * 60 * 1000;
 const WIN_DEDUP_TTL_MS = 30 * 60 * 1000;
 const COMPONENT_RETRY_DELAY_MS = 300;
@@ -158,16 +146,14 @@ const INTERACTION_RETRY_ATTEMPTS = 3;
 const INTERACTION_RETRY_DELAY_MS = 2000;
 const NO_RESPONSE_COOLDOWN_MS = 5000;
 
-// Cache sizes
-const CACHE_MAX_ENTRIES = 500;
+const CACHE_PROCESSED_MESSAGES = 1000;
 const CACHE_MAX_PROCESSING = 200;
 const CACHE_MAX_WINS = 50;
 const CACHE_MAX_COOLDOWN = 20;
-const CACHE_PROCESSED_MESSAGES = 1000; // RAM cache for processed messages
+const CACHE_MAX_TOKEN = 10;
 
-// Circuit breaker
-const CIRCUIT_BREAKER_THRESHOLD = 10; // Failures before opening
-const CIRCUIT_BREAKER_TIMEOUT_MS = 30000; // 30 second cooldown
+const CIRCUIT_BREAKER_THRESHOLD = 10;
+const CIRCUIT_BREAKER_TIMEOUT_MS = 30000;
 const CIRCUIT_BREAKER_HALF_OPEN_ATTEMPTS = 3;
 
 // ---------------------------------------------------------------------------
@@ -357,7 +343,7 @@ class CircuitBreaker {
 // ---------------------------------------------------------------------------
 
 class TokenManager {
-  private decryptedCache = new LRUCache<string, { token: string; timestamp: number }>(10, 30000); // 30 second TTL
+  private decryptedCache = new LRUCache<string, { token: string; timestamp: number }>(CACHE_MAX_TOKEN, 30000);
 
   async getDecryptedToken(userId: string, guildId: string, encryptedToken: string): Promise<string> {
     const cacheKey = `${userId}:${guildId}`;
@@ -366,8 +352,6 @@ class TokenManager {
 
     const decrypted = decryptToken(encryptedToken);
     this.decryptedCache.set(cacheKey, { token: decrypted, timestamp: Date.now() });
-    
-    // Return a copy - don't keep reference
     return decrypted;
   }
 
@@ -422,26 +406,18 @@ class TokenBucket {
 // ---------------------------------------------------------------------------
 
 export class AutoJoinManager extends EventEmitter {
-  // Sessions
   private sessions: Map<string, UserSession> = new Map();
-  private sessionsByUserId: Map<string, UserSession> = new Map(); // O(1) lookup
+  private sessionsByUserId: Map<string, UserSession> = new Map();
   
-  // Caches
-  private processedMessages: LRUCache<string, number>; // RAM cache - avoids DB hits
+  private processedMessages: LRUCache<string, number>;
   private processingCache: LRUCache<string, number>;
   private recentWins: LRUCache<string, number>;
   private noResponseCooldown: LRUCache<string, number>;
   
-  // Token manager - decrypts on demand only
   private tokenManager: TokenManager;
-  
-  // Logger
   private asyncLogger: AsyncLogger;
-  
-  // Circuit breaker for Discord API
   private apiCircuitBreaker: CircuitBreaker;
   
-  // Intervals
   private refreshInterval: NodeJS.Timeout | null = null;
   private cleanupInterval: NodeJS.Timeout | null = null;
   private memoryCheckInterval: NodeJS.Timeout | null = null;
@@ -453,16 +429,28 @@ export class AutoJoinManager extends EventEmitter {
 
   private readonly http = axios.create({
     timeout: 10_000,
-    maxSockets: 10,
-    maxFreeSockets: 5,
+    // Use httpAgent/httpsAgent for connection pooling
+    httpAgent: new http.Agent({
+      keepAlive: true,
+      keepAliveMsecs: 1000,
+      maxSockets: 10,
+      maxFreeSockets: 5,
+      scheduling: 'lifo',
+    }),
+    httpsAgent: new https.Agent({
+      keepAlive: true,
+      keepAliveMsecs: 1000,
+      maxSockets: 10,
+      maxFreeSockets: 5,
+      scheduling: 'lifo',
+    }),
   });
 
   constructor(workerId: string = 'main') {
     super();
     this.workerId = workerId;
     
-    // Initialize caches with size limits
-    this.processedMessages = new LRUCache<string, number>(CACHE_PROCESSED_MESSAGES, 300000); // 5 min TTL
+    this.processedMessages = new LRUCache<string, number>(CACHE_PROCESSED_MESSAGES, 300000);
     this.processingCache = new LRUCache<string, number>(CACHE_MAX_PROCESSING, PROCESSING_CACHE_TTL_MS);
     this.recentWins = new LRUCache<string, number>(CACHE_MAX_WINS, WIN_DEDUP_TTL_MS);
     this.noResponseCooldown = new LRUCache<string, number>(CACHE_MAX_COOLDOWN);
@@ -563,7 +551,6 @@ export class AutoJoinManager extends EventEmitter {
       const user = await getPremiumUser(userId, guildId);
       if (!user?.token) return false;
 
-      // Decrypt token ONLY for validation, then clear
       let decryptedToken: string;
       try {
         decryptedToken = await this.tokenManager.getDecryptedToken(userId, guildId, user.token);
@@ -573,7 +560,6 @@ export class AutoJoinManager extends EventEmitter {
         return false;
       }
 
-      // Validate token
       const isValid = await validateDiscordToken(decryptedToken);
       if (!isValid) {
         this.asyncLogger.error('Token validation failed', { userId });
@@ -582,18 +568,51 @@ export class AutoJoinManager extends EventEmitter {
         return false;
       }
 
-      // Create client with minimal caching
-      const client = new Client({
-        messageCacheMaxSize: 10,
+      // Proper ClientOptions for discord.js-selfbot-v13
+      const clientOptions: ClientOptions = {
+        // Message caching - minimal to save memory
         messageCacheLifetime: 60,
         messageSweepInterval: 300,
-      });
+        // Disable unused features
+        restRequestTimeout: 15000,
+        restGlobalRateLimit: 50,
+        retryLimit: 3,
+        // Disable voice and presence for self-bot
+        allowedMentions: { parse: [] },
+        partials: [],
+        intents: [
+          1 << 0, // GUILDS
+          1 << 1, // GUILD_MEMBERS
+          1 << 9, // GUILD_MESSAGES
+          1 << 10, // GUILD_MESSAGE_REACTIONS
+          1 << 12, // GUILD_MESSAGE_TYPING
+          1 << 13, // DIRECT_MESSAGES
+          1 << 14, // DIRECT_MESSAGE_REACTIONS
+          1 << 15, // DIRECT_MESSAGE_TYPING
+        ],
+        // Disable cache for things we don't need
+        makeCache: (manager: any) => {
+          // Only cache messages, and only 10 per channel
+          if (manager.name === 'MessageManager') {
+            return manager.collection;
+          }
+          // Disable cache for other managers
+          return null;
+        },
+        sweepers: {
+          messages: {
+            interval: 300,
+            lifetime: 60,
+          },
+        },
+      };
+
+      const client = new Client(clientOptions);
       
       const session: UserSession = {
         client,
         userId,
         guildId,
-        // Token is NOT stored - only used for login
         label: user.tokenLabel || 'main',
         startedAt: Date.now(),
         isActive: true,
@@ -605,15 +624,13 @@ export class AutoJoinManager extends EventEmitter {
 
       this.registerEvents(session);
       
-      // Login - token is used here and then cleared from memory
       await this.loginWithTimeout(client, decryptedToken);
       await this.waitForReady(client);
       
-      // Clear decrypted token from memory immediately after login
       this.tokenManager.clearCache(userId, guildId);
 
       this.sessions.set(sessionKey, session);
-      this.sessionsByUserId.set(userId, session); // O(1) lookup
+      this.sessionsByUserId.set(userId, session);
       this.startHeartbeat(session);
       
       await setTokenActive(userId, guildId, true);
@@ -810,26 +827,24 @@ export class AutoJoinManager extends EventEmitter {
       sessionStats: stats,
       worker: this.workerId,
       circuitBreakerState: this.apiCircuitBreaker.getState(),
+      cacheSize: this.processedMessages.size,
     };
   }
 
   async shutdown(): Promise<void> {
     this.isShuttingDown = true;
 
-    // Clear all intervals
     [this.refreshInterval, this.cleanupInterval, this.memoryCheckInterval, this.reconnectCheckInterval]
       .forEach(interval => {
         if (interval) { clearInterval(interval); }
       });
 
-    // Stop all sessions
     const stopPromises: Promise<void>[] = [];
     for (const [key, session] of this.sessions) {
       stopPromises.push(this.stopSession(session.userId, session.guildId));
     }
     await Promise.all(stopPromises);
 
-    // Clear caches
     this.sessions.clear();
     this.sessionsByUserId.clear();
     this.processedMessages.clear();
@@ -838,7 +853,6 @@ export class AutoJoinManager extends EventEmitter {
     this.noResponseCooldown.clear();
     this.tokenManager.clearAll();
     
-    // Shutdown logger
     this.asyncLogger.shutdown();
     
     this.asyncLogger.info('AutoJoin shutdown complete', { worker: this.workerId });
@@ -887,7 +901,7 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   // -------------------------------------------------------------------------
-  // Message Handling - Optimized with RAM cache
+  // Message Handling
   // -------------------------------------------------------------------------
 
   private async handleMessage(message: Message, session: UserSession): Promise<void> {
@@ -898,20 +912,11 @@ export class AutoJoinManager extends EventEmitter {
 
     const entryId = this.makeEntryId(session, message);
 
-    // 1. Check RAM cache first (fastest)
-    if (this.processedMessages.has(entryId)) {
-      return;
-    }
+    if (this.processedMessages.has(entryId)) return;
+    if (this.processingCache.get(entryId) !== undefined) return;
 
-    // 2. Check processing cache
-    if (this.processingCache.get(entryId) !== undefined) {
-      return;
-    }
-
-    // 3. Only then check DB (expensive)
     const existing = await getAutoJoinEntry(session.userId, message.id, message.channel.id);
     if (existing) {
-      // Cache it in RAM so we don't hit DB again
       this.processedMessages.set(entryId, Date.now());
       if (existing.status === 'pending' || existing.status === 'attempting') {
         this.processingCache.set(entryId, Date.now());
@@ -946,10 +951,7 @@ export class AutoJoinManager extends EventEmitter {
         expiresAt: Date.now() + ENTRY_TTL_MS,
       };
 
-      // CRITICAL: Save immediately - no batching for critical data
       await saveAutoJoinEntry(entryData);
-      
-      // Mark as processed in RAM cache
       this.processedMessages.set(entryId, Date.now());
 
       session.stats.detected++;
@@ -976,13 +978,12 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   // -------------------------------------------------------------------------
-  // Giveaway Detection - Optimized with combined regex
+  // Giveaway Detection
   // -------------------------------------------------------------------------
 
   private async detectGiveaway(message: Message): Promise<{ prize: string; button: GiveawayButton } | null> {
     const rawContent = message.content ?? '';
     
-    // Fast check with combined regex
     if (PATTERNS.BLOCKED_CONTENT.test(rawContent)) {
       return null;
     }
@@ -1020,7 +1021,6 @@ export class AutoJoinManager extends EventEmitter {
     const components = msgAny['components'] as unknown[] | undefined;
     if (!components?.length) return null;
 
-    // For known bots, be more permissive
     if (isKnownBot) {
       for (const row of components) {
         const rowAny = row as Record<string, unknown>;
@@ -1037,7 +1037,6 @@ export class AutoJoinManager extends EventEmitter {
 
           const label = ((c['label'] as string | undefined) ?? '').trim();
           
-          // Skip draft buttons with combined regex
           if (PATTERNS.DRAFT_BUTTON.test(label)) continue;
 
           if (customId.includes('giveaway') || customId.includes('enter') || customId.includes('join')) {
@@ -1052,7 +1051,6 @@ export class AutoJoinManager extends EventEmitter {
       return null;
     }
 
-    // For unknown bots, be strict
     let hasDraftButton = false;
     for (const row of components) {
       const rowAny = row as Record<string, unknown>;
@@ -1317,7 +1315,7 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   // -------------------------------------------------------------------------
-  // Interaction Helpers - With Circuit Breaker
+  // Interaction Helpers
   // -------------------------------------------------------------------------
 
   private async clickButton(message: Message, button: GiveawayButton, session: UserSession): Promise<void> {
@@ -1342,7 +1340,6 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   private async postInteraction(message: Message, button: GiveawayButton, session: UserSession): Promise<void> {
-    // Check circuit breaker
     if (this.apiCircuitBreaker.isOpen()) {
       throw new Error(`Circuit breaker is open (${this.apiCircuitBreaker.getState()})`);
     }
@@ -1584,7 +1581,7 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   // -------------------------------------------------------------------------
-  // Helpers - O(1) lookups
+  // Helpers
   // -------------------------------------------------------------------------
 
   private isKnownGiveawayBot(message: Message): boolean {
@@ -1655,7 +1652,6 @@ export class AutoJoinManager extends EventEmitter {
     return userId;
   }
 
-  // O(1) lookup using sessionsByUserId Map
   private findSessionByUserId(userId: string): UserSession | null {
     return this.sessionsByUserId.get(userId) || null;
   }
