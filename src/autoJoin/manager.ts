@@ -382,6 +382,34 @@ export class AutoJoinManager extends EventEmitter {
         }
       };
       
+      // ✅ FIX: Register the session BEFORE calling client.login().
+      // 'ready' fires synchronously as part of the login sequence — before
+      // the login() promise resolves and before this.sessions.set(...) used
+      // to run. That meant this.sessions.get(sessionKey) was ALWAYS
+      // undefined inside the 'ready' handler below, so the
+      // messageCreate/messageUpdate listeners were NEVER attached, and
+      // giveaway detection + joining silently never ran at all.
+      const session: AutoJoinSession = {
+        userId,
+        guildId,
+        client,
+        token: user.token,
+        label: user.tokenLabel || 'main',
+        isActive: false,
+        startedAt: Date.now(),
+        lastActivityAt: Date.now(),
+        stats: {
+          detected: 0,
+          entered: 0,
+          failed: 0,
+          wins: 0,
+        },
+        messageHandler,
+        messageUpdateHandler,
+        winHandler,
+      };
+      this.sessions.set(sessionKey, session);
+
       // Set up event handlers
       client.on('ready', async () => {
         logger.info(`AutoJoin session ready for user ${userId}`, {
@@ -392,10 +420,10 @@ export class AutoJoinManager extends EventEmitter {
           tag: client.user?.tag
         });
         
-        const session = this.sessions.get(sessionKey);
-        if (session) {
-          session.isActive = true;
-          session.lastActivityAt = Date.now();
+        const activeSession = this.sessions.get(sessionKey);
+        if (activeSession) {
+          activeSession.isActive = true;
+          activeSession.lastActivityAt = Date.now();
           
           // ✅ Attach message listeners
           client.on('messageCreate', messageHandler);
@@ -404,8 +432,21 @@ export class AutoJoinManager extends EventEmitter {
           // ✅ Attach win detection listener
           client.on('messageCreate', winHandler);
           
+          logger.info(`AutoJoin listeners attached for user ${userId}`, {
+            component: 'AutoJoinManager',
+            userId,
+            guildId
+          });
+          
           // Cache warmup for existing messages
-          await this.warmupCache(session);
+          await this.warmupCache(activeSession);
+        } else {
+          // Should never happen now, but log loudly if it ever does.
+          logger.error(`No session found for ${sessionKey} in 'ready' handler — listeners NOT attached`, {
+            component: 'AutoJoinManager',
+            userId,
+            guildId
+          });
         }
       });
 
@@ -438,32 +479,11 @@ export class AutoJoinManager extends EventEmitter {
         });
       });
 
-      // Login with decrypted token
+      // Login with decrypted token. The 'ready' listener above will find
+      // the session already in the map (registered earlier) and flip
+      // isActive to true / attach the message listeners.
       await client.login(decryptedToken);
 
-      // Register session
-      const session: AutoJoinSession = {
-        userId,
-        guildId,
-        client,
-        token: user.token,
-        label: user.tokenLabel || 'main',
-        isActive: true,
-        startedAt: Date.now(),
-        lastActivityAt: Date.now(),
-        stats: {
-          detected: 0,
-          entered: 0,
-          failed: 0,
-          wins: 0,
-        },
-        messageHandler,
-        messageUpdateHandler,
-        winHandler,
-      };
-
-      this.sessions.set(sessionKey, session);
-      
       // Mark token as active
       await setTokenActive(userId, guildId, true);
       
@@ -483,6 +503,10 @@ export class AutoJoinManager extends EventEmitter {
         guildId,
         error: formatError(error)
       });
+      // ✅ FIX: remove the pre-registered (now dead) session so a later
+      // retry doesn't see sessions.has(sessionKey) === true and bail out
+      // early in startSession() thinking a working session already exists.
+      this.sessions.delete(sessionKey);
       await setTokenActive(userId, guildId, false);
       return false;
     }
