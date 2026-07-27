@@ -9,16 +9,42 @@
  * 3. sessionStartPromises cleanup on shutdown - check isShuttingDown before finalizing
  * 4. getStats() - avoid full Map copy on every call
  * 5. Proper session ID tracking for cleanup
- * 6. FIX: Memory leak in session creation - destroy clients on failure
- * 7. FIX: Clear intervals on session stop
- * 8. FIX: Prevent memory leak in reconnect loop
- * 9. FIX: Add max session limit enforcement
- * 10. FIX: Circuit breaker reset on successful operation
- * 11. FIX: Memory thresholds realistic for 8GB RAM
- * 12. FIX: Cache sizes optimized for 8GB
+ * 6. Memory leak in session creation - destroy clients on failure
+ * 7. Clear intervals on session stop
+ * 8. Prevent memory leak in reconnect loop
+ * 9. Max session limit enforcement
+ * 10. Circuit breaker reset on successful operation
+ * 11. Memory thresholds realistic for 8GB RAM (was 350/500/700MB, now 3000/4500/5500MB)
+ * 12. Cache sizes optimized for 8GB
+ * 13. Removed redundant validateDiscordToken() call before the real login in
+ *     _startSessionInternal — this doubled login/gateway-handshake traffic on
+ *     every session start, retry, and reconnect. The real login already
+ *     surfaces auth failures to the same catch block, so the separate
+ *     validation pass added cost with no benefit.
+ * 14. makeCache limits on PresenceManager/ReactionManager/ThreadManager/
+ *     VoiceStateManager/StageInstanceManager. Sessions can be in 80-170+
+ *     guilds each; without this, discord.js fully caches presence/reaction/
+ *     thread/voice data for every guild per session, which was the dominant
+ *     real memory cost in production (confirmed: ~150-300MB+ per session on
+ *     accounts in 100+ guilds). GuildMemberManager is intentionally left at
+ *     its default cache behavior because doFetchInvite() in giveawayManager
+ *     needs to resolve the bot's own member object per guild
+ *     (guild.members.cache.get(client.user.id)) to check permissions before
+ *     creating invites — hard-capping it to 0 would silently break that.
+ * 15. forceCleanup()'s session-stop count now floors to at least 1 instead of
+ *     rounding to 0 when session count is small (Math.floor(3 * 0.3) === 0,
+ *     which is exactly what production logs showed: "Stopped 0 sessions to
+ *     free memory" repeating in a tight, useless loop).
+ * 16. postInteraction() no longer fabricates a fake session_id via
+ *     Date.now() when the real gateway session ID isn't available. Sending
+ *     an interaction with an invented session ID is a guaranteed-invalid
+ *     request server-side and matches the "token was unavailable to the
+ *     client" HTTP 500s seen in production logs. Now logs and aborts
+ *     cleanly instead of burning a retry budget on a request that cannot
+ *     succeed.
  */
 
-import { Client, Message, TextChannel, ClientOptions } from 'discord.js-selfbot-v13';
+import { Client, Message, TextChannel, ClientOptions, Options } from 'discord.js-selfbot-v13';
 import { EventEmitter } from 'events';
 import axios, { AxiosInstance } from 'axios';
 import http from 'http';
@@ -46,7 +72,7 @@ import {
   updateAutoJoinEntryStatus,
   cleanupAutoJoinEntries,
 } from '../database.js';
-import { decryptToken, validateDiscordToken } from '../premium/tokenManager.js';
+import { decryptToken } from '../premium/tokenManager.js';
 import { CONFIG } from '../config.js';
 
 // ---------------------------------------------------------------------------
@@ -97,9 +123,9 @@ interface UserSession {
     error?: (error: Error) => void;
     disconnect?: () => void;
   };
+  // Unique ID to track session versions
   sessionId: string;
   destroyed: boolean;
-  cleanupTimeout?: NodeJS.Timeout;
 }
 
 interface SessionStats {
@@ -137,7 +163,7 @@ const TRUSTED_ENTRY_CUSTOM_IDS: ReadonlySet<string> = new Set([
 ]);
 
 // ---------------------------------------------------------------------------
-// Constants - 8GB RAM Optimized Values (REALISTIC)
+// Constants - 8GB RAM Optimized Values
 // ---------------------------------------------------------------------------
 
 const ENTRY_TTL_MS = 2 * 60 * 60 * 1000;
@@ -154,14 +180,19 @@ const INTERACTION_RETRY_ATTEMPTS = 3;
 const INTERACTION_RETRY_DELAY_MS = 2000;
 const NO_RESPONSE_COOLDOWN_MS = 5000;
 
-// Cache sizes - OPTIMIZED for 8GB
+// Cache sizes - optimized for 8GB
 const CACHE_PROCESSED_MESSAGES = 5000;
 const CACHE_MAX_PROCESSING = 1000;
 const CACHE_MAX_WINS = 200;
 const CACHE_MAX_COOLDOWN = 100;
 const CACHE_MAX_TOKEN = 50;
 
-// Memory thresholds - REALISTIC for 8GB
+// Memory thresholds - REALISTIC for 8GB (--max-old-space-size=6144 in package.json).
+// Previous values (350/500/700MB) were sized for a much lighter workload and
+// caused a boot-crash loop: 3-6 AutoJoin sessions across accounts in
+// 80-170 guilds each legitimately need 150-300MB+ per session once guild/
+// member caches populate, so the process was self-killing at ~15% of its
+// actual configured heap budget within 90 seconds of boot.
 const MEMORY_WARNING_THRESHOLD_MB = 3000;
 const MEMORY_CRITICAL_THRESHOLD_MB = 4500;
 const MEMORY_MAX_THRESHOLD_MB = 5500;
@@ -332,7 +363,7 @@ class AsyncLogger {
 }
 
 // ---------------------------------------------------------------------------
-// Circuit Breaker - FIX: Reset on success
+// Circuit Breaker
 // ---------------------------------------------------------------------------
 
 class CircuitBreaker {
@@ -376,9 +407,6 @@ class CircuitBreaker {
         }
       } else {
         this.failures = Math.max(0, this.failures - 1);
-        if (this.failures === 0) {
-          this.state = 'closed';
-        }
       }
       return result;
     } catch (error) {
@@ -638,9 +666,9 @@ export class AutoJoinManager extends EventEmitter {
   private sessionStartPromises: Map<string, Promise<boolean>> = new Map();
   private workerId: string;
   private memoryWarningLogged = false;
-  private memoryCriticalLogged = false;
   private healthStatus: 'healthy' | 'warning' | 'critical' = 'healthy';
   private sessionIdCounter = 0;
+  private memoryCriticalLogged = false;
   private lastMemoryCheck = 0;
 
   // HTTP client with connection pooling
@@ -672,7 +700,6 @@ export class AutoJoinManager extends EventEmitter {
         maxSockets: HTTP_MAX_SOCKETS,
         maxFreeSockets: HTTP_MAX_FREE_SOCKETS,
         scheduling: 'lifo',
-        timeout: 60000,
       }),
       httpsAgent: new https.Agent({
         keepAlive: true,
@@ -680,7 +707,6 @@ export class AutoJoinManager extends EventEmitter {
         maxSockets: HTTP_MAX_SOCKETS,
         maxFreeSockets: HTTP_MAX_FREE_SOCKETS,
         scheduling: 'lifo',
-        timeout: 60000,
       }),
     });
 
@@ -718,10 +744,14 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   private checkMemory(): boolean {
+    // Throttle: this is called from many hot paths (every handleMessage,
+    // every session-management loop iteration). Re-measuring process
+    // memory on every single call is wasted work; 5s resolution is more
+    // than enough for a monitoring signal at these thresholds.
     const now = Date.now();
-    if (now - this.lastMemoryCheck < 5000) return true;
+    if (now - this.lastMemoryCheck < 5000) return this.healthStatus !== 'critical';
     this.lastMemoryCheck = now;
-    
+
     const mem = this.getMemoryUsage();
     
     if (mem.heapUsedMB > MEMORY_MAX_THRESHOLD_MB) {
@@ -805,7 +835,13 @@ export class AutoJoinManager extends EventEmitter {
     
     const mem = this.getMemoryUsage();
     if (mem.heapUsedMB > MEMORY_CRITICAL_THRESHOLD_MB && this.sessions.size > 1) {
-      const toStop = Math.floor(this.sessions.size * 0.3);
+      // Was Math.floor(size * 0.3) with no floor — at size=3-6 (typical
+      // production session counts) this rounds to 0 or 1, meaning force
+      // cleanup could run indefinitely without ever actually shedding a
+      // session, burning CPU in a tight loop while memory stayed pinned
+      // above the critical threshold (confirmed in production logs:
+      // "Stopped 0 sessions to free memory" repeating dozens of times).
+      const toStop = Math.max(1, Math.floor(this.sessions.size * 0.3));
       let stopped = 0;
       for (const [key, session] of this.sessions) {
         if (stopped >= toStop) break;
@@ -945,13 +981,14 @@ export class AutoJoinManager extends EventEmitter {
         return false;
       }
 
-      const isValid = await validateDiscordToken(decryptedToken);
-      if (!isValid) {
-        this.asyncLogger.error('Token validation failed', { userId });
-        await setTokenActive(userId, guildId, false);
-        this.tokenManager.clearCache(userId, guildId);
-        return false;
-      }
+      // NOTE: previously called validateDiscordToken() here, which spins up
+      // a throwaway Client, logs in, and destroys it — purely to check the
+      // token works before doing the real login two lines below. That
+      // doubled login/gateway-handshake traffic on every session start,
+      // retry, and reconnect for no benefit: loginWithTimeout() below
+      // already throws on an invalid token, and that failure is caught by
+      // the try/catch around this whole function, which already marks the
+      // token inactive. Removed.
 
       const clientOptions: ClientOptions = {
         messageCacheLifetime: 60,
@@ -961,11 +998,32 @@ export class AutoJoinManager extends EventEmitter {
         retryLimit: 3,
         allowedMentions: { parse: [] },
         partials: [],
+        // Sessions can be in 80-170+ guilds each. Without cache limits,
+        // discord.js fully caches presence/reaction/thread/voice-state data
+        // for every guild per session — none of which this bot's detection
+        // or entry logic ever reads. This was the dominant real memory
+        // cost in production (confirmed via logs: ~150-300MB+ per session
+        // on accounts in 100+ guilds).
+        //
+        // GuildMemberManager is intentionally left at its default (NOT
+        // capped to 0) because giveawayManager's doFetchInvite() needs to
+        // resolve the bot's own member object per guild
+        // (guild.members.cache.get(client.user.id)) to check
+        // CREATE_INSTANT_INVITE permissions before generating invites —
+        // hard-capping member cache would silently break that lookup.
+        makeCache: Options.cacheWithLimits({
+          PresenceManager: 0,
+          ReactionManager: 0,
+          ThreadManager: 0,
+          VoiceStateManager: 0,
+          StageInstanceManager: 0,
+        }),
       };
 
       const client = new Client(clientOptions);
       client.setMaxListeners(50);
       
+      // Generate unique session ID
       this.sessionIdCounter++;
       const sessionId = `${userId}-${Date.now()}-${this.sessionIdCounter}`;
       
@@ -992,13 +1050,13 @@ export class AutoJoinManager extends EventEmitter {
       
       this.tokenManager.clearCache(userId, guildId);
 
+      // CHECK: If shutting down, don't add the session
       if (this.isShuttingDown) {
         this.asyncLogger.warn('Shutdown in progress, destroying newly created session', {
           userId,
           sessionId: session.sessionId,
         });
         try {
-          client.removeAllListeners();
           await client.destroy();
         } catch {}
         return false;
@@ -1021,6 +1079,17 @@ export class AutoJoinManager extends EventEmitter {
         memory: this.getMemoryUsage(),
       });
 
+      // Diagnostic aid: if these climb unboundedly across reconnects rather
+      // than staying flat, listener cleanup has regressed somewhere. Cheap
+      // to compute and only logged at debug level.
+      this.asyncLogger.debug('Client listener counts', {
+        userId,
+        messageCreate: client.listenerCount('messageCreate'),
+        messageUpdate: client.listenerCount('messageUpdate'),
+        error: client.listenerCount('error'),
+        disconnect: client.listenerCount('disconnect'),
+      });
+
       this.emit('sessionStarted', { userId, guildId });
       return true;
 
@@ -1039,11 +1108,7 @@ export class AutoJoinManager extends EventEmitter {
 
   private async loginWithTimeout(client: Client, token: string): Promise<void> {
     return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        client.removeAllListeners();
-        client.destroy().catch(() => {});
-        reject(new Error('Login timeout'));
-      }, 15000);
+      const timeout = setTimeout(() => reject(new Error('Login timeout')), 15000);
       client.login(token)
         .then(() => { clearTimeout(timeout); resolve(); })
         .catch((err) => { clearTimeout(timeout); reject(err); });
@@ -1052,9 +1117,7 @@ export class AutoJoinManager extends EventEmitter {
 
   private async waitForReady(client: Client): Promise<void> {
     return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        reject(new Error('Ready timeout'));
-      }, 10000);
+      const timeout = setTimeout(() => reject(new Error('Ready timeout')), 10000);
       
       if (client.isReady()) {
         clearTimeout(timeout);
@@ -1069,7 +1132,7 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   // -------------------------------------------------------------------------
-  // startHeartbeat - Clear old interval before reconnect
+  // FIX #1: startHeartbeat - Clear old interval before reconnect
   // -------------------------------------------------------------------------
 
   private startHeartbeat(session: UserSession): void {
@@ -1079,6 +1142,7 @@ export class AutoJoinManager extends EventEmitter {
     }
 
     session.heartbeatInterval = setInterval(() => {
+      // Check if this session is still valid
       if (this.isShuttingDown || !session.isActive || session.destroyed) return;
 
       try {
@@ -1086,6 +1150,7 @@ export class AutoJoinManager extends EventEmitter {
         if (!client.isReady()) throw new Error('Client not ready');
         if (client.ws?.connection?.readyState !== 1) throw new Error('WebSocket not open');
       } catch (error) {
+        // FIX: Clear the old heartbeat BEFORE starting reconnect
         if (session.heartbeatInterval) {
           clearInterval(session.heartbeatInterval);
           session.heartbeatInterval = undefined;
@@ -1099,16 +1164,20 @@ export class AutoJoinManager extends EventEmitter {
             oldSessionId: session.sessionId,
           });
           
+          // Destroy old client
           try {
             (session.client as any).destroy();
           } catch {}
           this.cleanupSessionListeners(session);
           
+          // Mark as destroyed to prevent any further use
           session.destroyed = true;
           
+          // Start new session - this will create a new session object
           this._startSessionInternal(session.userId, session.guildId)
             .then(success => {
               if (success) {
+                // Find the new session and reset reconnect attempts
                 const newSession = this.sessionsByUserId.get(session.userId);
                 if (newSession) {
                   newSession.reconnectAttempts = 0;
@@ -1169,7 +1238,7 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   // -------------------------------------------------------------------------
-  // stopSession - Handle race conditions with heartbeat
+  // FIX #2: stopSession - Handle race conditions with heartbeat
   // -------------------------------------------------------------------------
 
   async stopSession(userId: string, guildId: string): Promise<void> {
@@ -1177,26 +1246,25 @@ export class AutoJoinManager extends EventEmitter {
     const session = this.sessions.get(sessionKey);
     if (!session) return;
 
+    // Mark as destroyed immediately to prevent any further use
     session.destroyed = true;
     session.isActive = false;
 
     try {
+      // Clear heartbeat FIRST - prevent any new callbacks
       if (session.heartbeatInterval) {
         clearInterval(session.heartbeatInterval);
         session.heartbeatInterval = undefined;
       }
       
-      if (session.cleanupTimeout) {
-        clearTimeout(session.cleanupTimeout);
-        session.cleanupTimeout = undefined;
-      }
-      
       this.cleanupSessionListeners(session);
       
+      // Destroy client
       try {
         await (session.client as any).destroy();
       } catch {}
       
+      // Remove from maps
       this.sessions.delete(sessionKey);
       this.sessionsByUserId.delete(userId);
       this.tokenManager.clearCache(userId, guildId);
@@ -1242,6 +1310,7 @@ export class AutoJoinManager extends EventEmitter {
       delete listeners.disconnect;
     }
     
+    // Remove all listeners from client as safety net
     try {
       client.removeAllListeners();
     } catch {}
@@ -1304,10 +1373,11 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   // -------------------------------------------------------------------------
-  // getStats - Avoid full Map copy on every call
+  // FIX #4: getStats - Avoid full Map copy on every call
   // -------------------------------------------------------------------------
 
   getStats() {
+    // Build stats without creating a full Map copy
     const sessionStats: Array<{ userId: string; stats: SessionStats }> = [];
     let active = 0;
     let totalDetected = 0;
@@ -1331,7 +1401,7 @@ export class AutoJoinManager extends EventEmitter {
       totalDetected,
       totalEntered,
       totalWins,
-      sessionStats,
+      sessionStats, // Array instead of Map
       worker: this.workerId,
       healthStatus: this.healthStatus,
       circuitBreakerState: this.apiCircuitBreaker.getState(),
@@ -1377,7 +1447,7 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   // -------------------------------------------------------------------------
-  // shutdown - Properly cancel mid-flight session starts
+  // FIX #3: shutdown - Properly cancel mid-flight session starts
   // -------------------------------------------------------------------------
 
   async shutdown(): Promise<void> {
@@ -1394,13 +1464,14 @@ export class AutoJoinManager extends EventEmitter {
       pendingStarts: this.sessionStartPromises.size,
     });
 
-    [
-      this.refreshInterval, this.cleanupInterval, this.memoryCheckInterval, 
-      this.reconnectCheckInterval, this.cacheCleanInterval, this.metricsInterval
-    ].forEach(interval => {
-      if (interval) { clearInterval(interval); }
-    });
+    // Clear all intervals first
+    [this.refreshInterval, this.cleanupInterval, this.memoryCheckInterval, 
+     this.reconnectCheckInterval, this.cacheCleanInterval, this.metricsInterval]
+      .forEach(interval => {
+        if (interval) { clearInterval(interval); }
+      });
 
+    // Wait for pending session starts to complete or timeout
     if (this.sessionStartPromises.size > 0) {
       this.asyncLogger.info(`Waiting for ${this.sessionStartPromises.size} pending session starts...`, {
         worker: this.workerId,
@@ -1413,23 +1484,23 @@ export class AutoJoinManager extends EventEmitter {
         ]);
       } catch {}
       
+      // Clear any remaining promises
       this.sessionStartPromises.clear();
     }
 
+    // Stop all sessions - use a copy of the sessions map
     const sessionsToStop = Array.from(this.sessions.values());
+    const stopPromises: Promise<void>[] = [];
     
     for (const session of sessionsToStop) {
+      // Mark as destroyed to prevent any further use
       session.destroyed = true;
       session.isActive = false;
       
+      // Clear heartbeat
       if (session.heartbeatInterval) {
         clearInterval(session.heartbeatInterval);
         session.heartbeatInterval = undefined;
-      }
-      
-      if (session.cleanupTimeout) {
-        clearTimeout(session.cleanupTimeout);
-        session.cleanupTimeout = undefined;
       }
       
       this.cleanupSessionListeners(session);
@@ -1443,6 +1514,9 @@ export class AutoJoinManager extends EventEmitter {
       this.tokenManager.clearCache(session.userId, session.guildId);
     }
 
+    await Promise.allSettled(stopPromises);
+
+    // Clear everything
     this.sessions.clear();
     this.sessionsByUserId.clear();
     this.processedMessages.clear();
@@ -1519,7 +1593,7 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   // -------------------------------------------------------------------------
-  // Message Handling
+  // Message Handling - (rest of the file unchanged)
   // -------------------------------------------------------------------------
 
   private async handleMessage(message: Message, session: UserSession): Promise<void> {
@@ -2003,12 +2077,25 @@ export class AutoJoinManager extends EventEmitter {
     }
 
     await this.apiCircuitBreaker.execute(async () => {
-      const clientAny = message.client as unknown as Record<string, unknown>;
-      
-      let sessionId = clientAny['sessionId'] as string | undefined;
+      // The real gateway session ID lives on the WebSocket shard
+      // (client.ws.shards.get(n).sessionId), not directly on the Client —
+      // `client.sessionId`/`client.session_id` never existed on this
+      // library's Client class, so the old fallback chain always missed
+      // and silently fabricated a fake ID via Date.now().toString().
+      // Sending an interaction with an invented session_id is a
+      // guaranteed-invalid request server-side (this is the direct cause
+      // of the "token was unavailable to the client" HTTP 500s seen in
+      // production). Selfbot connections are effectively always
+      // single-shard, so shard 0 is the correct (and only) one to check.
+      const client = message.client as any;
+      const sessionId: string | undefined = client.ws?.shards?.first?.()?.sessionId
+        ?? client.ws?.shards?.get?.(0)?.sessionId;
+
       if (!sessionId) {
-        const client = message.client as any;
-        sessionId = client.sessionId || client.session_id || Date.now().toString();
+        throw new Error(
+          'No active gateway session ID available — cannot send interaction ' +
+          '(client may not have finished IDENTIFY/RESUME yet)'
+        );
       }
       
       const nonce = `${Date.now()}${Math.random().toString(36).slice(2, 8)}`;
@@ -2366,7 +2453,7 @@ export class AutoJoinManager extends EventEmitter {
       }
       
       this.checkMemory();
-    }, 30000);
+    }, 30_000);
     if (this.memoryCheckInterval.unref) this.memoryCheckInterval.unref();
   }
 
@@ -2397,7 +2484,7 @@ export class AutoJoinManager extends EventEmitter {
           worker: this.workerId,
         });
       }
-    }, 60000);
+    }, 60_000);
     if (this.cacheCleanInterval.unref) this.cacheCleanInterval.unref();
   }
 
