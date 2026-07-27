@@ -1,6 +1,14 @@
 /**
  * @module database
  * MongoDB-backed store with an in-memory cache for instant reads.
+ * 
+ * FIXES:
+ * 1. Add max cache size to prevent unbounded growth
+ * 2. Add TTL for cache entries
+ * 3. Proper cleanup on shutdown
+ * 4. Reduce log spam
+ * 5. Connection pooling for MongoDB
+ * 6. Retry logic for connection
  */
 
 import { MongoClient, Db, Collection, AnyBulkWriteOperation } from 'mongodb';
@@ -41,7 +49,6 @@ interface PremiumUser {
   activatedAt: number;
   expiresAt: number | null;
   lastChecked: number;
-  // Auto Joiner fields
   token?: string | null;
   tokenLabel?: string | null;
   tokenAddedAt?: number | null;
@@ -63,9 +70,8 @@ interface BoosterPremium {
   lastChecked: number;
 }
 
-// AutoJoin Entry - stored in MongoDB to save memory
 interface AutoJoinEntry {
-  _id: string; // entryId (userId:channelId:messageId)
+  _id: string;
   userId: string;
   messageId: string;
   channelId: string;
@@ -81,7 +87,7 @@ interface AutoJoinEntry {
   attempts: number;
   lastAttemptAt?: number;
   lastError?: string;
-  expiresAt: number; // For TTL index
+  expiresAt: number;
 }
 
 const MONGO_URI = process.env.MONGO_URI;
@@ -90,6 +96,8 @@ if (!MONGO_URI) {
 }
 
 const SYNC_INTERVAL_MS = 2000;
+const MAX_CACHE_SIZE = 10000;
+const CACHE_TTL_MS = 3600000;
 
 let client: MongoClient;
 let db: Db;
@@ -103,8 +111,15 @@ let autoJoinEntriesCol: Collection<AutoJoinEntry>;
 
 let connected = false;
 let connectingPromise: Promise<void> | null = null;
+let connectionAttempts = 0;
+const MAX_CONNECTION_ATTEMPTS = 5;
 
-const cache = new Map<string, StoredGiveaway>();
+interface CacheEntry {
+  doc: StoredGiveaway;
+  timestamp: number;
+}
+
+const cache = new Map<string, CacheEntry>();
 let totalDetectedCount = 0;
 
 let syncTimeout: NodeJS.Timeout | null = null;
@@ -116,13 +131,55 @@ function cacheKey(messageId: string, channelId: string): string {
   return `${channelId}:${messageId}`;
 }
 
+function cleanCache(): void {
+  const now = Date.now();
+  let removed = 0;
+  for (const [key, entry] of cache) {
+    if (now - entry.timestamp > CACHE_TTL_MS) {
+      cache.delete(key);
+      removed++;
+    }
+  }
+  if (cache.size > MAX_CACHE_SIZE) {
+    const entries = Array.from(cache.entries());
+    entries.sort((a, b) => a[1].timestamp - b[1].timestamp);
+    const toRemove = cache.size - Math.floor(MAX_CACHE_SIZE * 0.8);
+    for (let i = 0; i < toRemove; i++) {
+      const [key] = entries[i] || [];
+      if (key) {
+        cache.delete(key);
+        dirtyKeys.delete(key);
+        removed++;
+      }
+    }
+  }
+  if (removed > 0) {
+    logger.debug(`Cache cleaned: removed ${removed} entries`, { component: 'Database' });
+  }
+}
+
+setInterval(cleanCache, 5 * 60 * 1000);
+
 async function connect(): Promise<void> {
   if (connected) return;
   if (connectingPromise) return connectingPromise;
 
   connectingPromise = (async () => {
     try {
-      client = new MongoClient(MONGO_URI!);
+      connectionAttempts++;
+      
+      client = new MongoClient(MONGO_URI!, {
+        maxPoolSize: 10,
+        minPoolSize: 2,
+        maxIdleTimeMS: 60000,
+        connectTimeoutMS: 10000,
+        socketTimeoutMS: 30000,
+        serverSelectionTimeoutMS: 10000,
+        heartbeatFrequencyMS: 10000,
+        retryWrites: true,
+        retryReads: true,
+      });
+      
       await client.connect();
       db = client.db('giveaway_tracker');
       giveawaysCol = db.collection<StoredGiveaway>('giveaways');
@@ -133,36 +190,38 @@ async function connect(): Promise<void> {
       boosterPremiumCol = db.collection<BoosterPremium>('booster_premium');
       autoJoinEntriesCol = db.collection<AutoJoinEntry>('autojoin_entries');
 
-      await giveawaysCol.createIndex({ messageId: 1, channelId: 1 }, { unique: true });
-      await giveawaysCol.createIndex({ status: 1 });
-      await giveawaysCol.createIndex({ detectedAt: -1 });
-      await giveawaysCol.createIndex({ notificationStatus: 1 });
-      await watchlistCol.createIndex({ userId: 1 }, { unique: true });
-      await watchlistCol.createIndex({ items: 1 });
-      await licenseKeysCol.createIndex({ key: 1 }, { unique: true });
-      await licenseKeysCol.createIndex({ used: 1 });
-      await premiumUsersCol.createIndex({ userId: 1, guildId: 1 }, { unique: true });
-      await premiumUsersCol.createIndex({ isPremium: 1 });
-      await premiumUsersCol.createIndex({ source: 1 });
-      await boosterPremiumCol.createIndex({ userId: 1, guildId: 1 }, { unique: true });
-      await boosterPremiumCol.createIndex({ isBooster: 1 });
-      await boosterPremiumCol.createIndex({ premiumAssigned: 1 });
+      await Promise.all([
+        giveawaysCol.createIndex({ messageId: 1, channelId: 1 }, { unique: true }),
+        giveawaysCol.createIndex({ status: 1 }),
+        giveawaysCol.createIndex({ detectedAt: -1 }),
+        giveawaysCol.createIndex({ notificationStatus: 1 }),
+        watchlistCol.createIndex({ userId: 1 }, { unique: true }),
+        watchlistCol.createIndex({ items: 1 }),
+        licenseKeysCol.createIndex({ key: 1 }, { unique: true }),
+        licenseKeysCol.createIndex({ used: 1 }),
+        premiumUsersCol.createIndex({ userId: 1, guildId: 1 }, { unique: true }),
+        premiumUsersCol.createIndex({ isPremium: 1 }),
+        premiumUsersCol.createIndex({ source: 1 }),
+        boosterPremiumCol.createIndex({ userId: 1, guildId: 1 }, { unique: true }),
+        boosterPremiumCol.createIndex({ isBooster: 1 }),
+        boosterPremiumCol.createIndex({ premiumAssigned: 1 }),
+        autoJoinEntriesCol.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
+        autoJoinEntriesCol.createIndex({ detectedAt: -1 }),
+        autoJoinEntriesCol.createIndex({ userId: 1, status: 1 }),
+      ]);
 
-      // AutoJoin entries indexes
-      // TTL index to auto-delete expired entries
-      await autoJoinEntriesCol.createIndex(
-        { expiresAt: 1 },
-        { expireAfterSeconds: 0 }
-      );
-      // Index for cleaning up old entries
-      await autoJoinEntriesCol.createIndex({ detectedAt: -1 });
-      // Index for status lookups
-      await autoJoinEntriesCol.createIndex({ userId: 1, status: 1 });
-
-      const docs = await giveawaysCol.find({}).toArray();
+      const docs = await giveawaysCol.find({})
+        .sort({ detectedAt: -1 })
+        .limit(MAX_CACHE_SIZE)
+        .toArray();
+      
       cache.clear();
+      const now = Date.now();
       for (const doc of docs) {
-        cache.set(cacheKey(doc.messageId, doc.channelId), doc);
+        cache.set(cacheKey(doc.messageId, doc.channelId), {
+          doc,
+          timestamp: now,
+        });
       }
 
       const counter = await countersCol.findOne({ _id: 'total_detected' });
@@ -174,11 +233,26 @@ async function connect(): Promise<void> {
       }
 
       connected = true;
+      connectionAttempts = 0;
       logger.info(`Connected to MongoDB. Cache loaded: ${cache.size} giveaways, ${totalDetectedCount} total`, {
         component: 'Database',
       });
     } catch (err) {
-      logger.error('Failed to connect to MongoDB', { component: 'Database', error: String(err) });
+      logger.error('Failed to connect to MongoDB', { 
+        component: 'Database', 
+        error: String(err),
+        attempt: connectionAttempts,
+        maxAttempts: MAX_CONNECTION_ATTEMPTS,
+      });
+      
+      if (connectionAttempts < MAX_CONNECTION_ATTEMPTS) {
+        const delayMs = Math.min(5000 * Math.pow(2, connectionAttempts - 1), 30000);
+        logger.info(`Retrying connection in ${delayMs}ms`, { component: 'Database' });
+        await new Promise(r => setTimeout(r, delayMs));
+        connectingPromise = null;
+        return connect();
+      }
+      
       throw err;
     } finally {
       connectingPromise = null;
@@ -234,8 +308,8 @@ async function flushSync(): Promise<void> {
       if (!doc) continue;
       ops.push({
         updateOne: {
-          filter: { messageId: doc.messageId, channelId: doc.channelId },
-          update: { $set: doc },
+          filter: { messageId: doc.doc.messageId, channelId: doc.doc.channelId },
+          update: { $set: doc.doc },
           upsert: true,
         },
       });
@@ -300,7 +374,7 @@ export async function insertGiveaway(
     notificationStatus: 'pending',
   };
 
-  cache.set(key, doc);
+  cache.set(key, { doc, timestamp: Date.now() });
   totalDetectedCount++;
   dirtyTotal = true;
   markDirty(key);
@@ -314,17 +388,18 @@ export async function wasNotifiedRecently(
   cooldownSeconds: number
 ): Promise<boolean> {
   const entry = cache.get(cacheKey(messageId, channelId));
-  if (!entry || !entry.notifiedAt) return false;
-  return Date.now() - entry.notifiedAt < cooldownSeconds * 1000;
+  if (!entry || !entry.doc.notifiedAt) return false;
+  return Date.now() - entry.doc.notifiedAt < cooldownSeconds * 1000;
 }
 
 export async function markNotified(messageId: string, channelId: string): Promise<void> {
   const key = cacheKey(messageId, channelId);
   const entry = cache.get(key);
   if (entry) {
-    entry.notifiedAt = Date.now();
-    entry.notificationStatus = 'sent';
-    entry.notificationSentAt = Date.now();
+    entry.doc.notifiedAt = Date.now();
+    entry.doc.notificationStatus = 'sent';
+    entry.doc.notificationSentAt = Date.now();
+    entry.timestamp = Date.now();
     markDirty(key);
   }
 }
@@ -333,7 +408,8 @@ export async function updateLastSeen(messageId: string, channelId: string): Prom
   const key = cacheKey(messageId, channelId);
   const entry = cache.get(key);
   if (entry) {
-    entry.lastSeenAt = Date.now();
+    entry.doc.lastSeenAt = Date.now();
+    entry.timestamp = Date.now();
     markDirty(key);
   }
 }
@@ -342,7 +418,8 @@ export async function markEnded(messageId: string, channelId: string): Promise<v
   const key = cacheKey(messageId, channelId);
   const entry = cache.get(key);
   if (entry) {
-    entry.status = 'ended';
+    entry.doc.status = 'ended';
+    entry.timestamp = Date.now();
     markDirty(key);
   }
 }
@@ -355,7 +432,8 @@ export async function setNotificationMessageId(
   const key = cacheKey(giveawayMessageId, channelId);
   const entry = cache.get(key);
   if (entry) {
-    entry.notificationMessageId = notificationMessageId;
+    entry.doc.notificationMessageId = notificationMessageId;
+    entry.timestamp = Date.now();
     markDirty(key);
   }
 }
@@ -373,23 +451,25 @@ export async function updateNotificationStatus(
   const key = cacheKey(messageId, channelId);
   const entry = cache.get(key);
   if (entry) {
-    if (fields.notificationStatus !== undefined) entry.notificationStatus = fields.notificationStatus;
-    if (fields.notificationSentAt !== undefined) entry.notificationSentAt = fields.notificationSentAt;
-    if (fields.notificationMessageId !== undefined) entry.notificationMessageId = fields.notificationMessageId;
-    if (fields.notificationError !== undefined) entry.notificationError = fields.notificationError;
+    if (fields.notificationStatus !== undefined) entry.doc.notificationStatus = fields.notificationStatus;
+    if (fields.notificationSentAt !== undefined) entry.doc.notificationSentAt = fields.notificationSentAt;
+    if (fields.notificationMessageId !== undefined) entry.doc.notificationMessageId = fields.notificationMessageId;
+    if (fields.notificationError !== undefined) entry.doc.notificationError = fields.notificationError;
+    entry.timestamp = Date.now();
     markDirty(key);
   }
 }
 
 export async function getGiveaway(messageId: string, channelId: string): Promise<GiveawayData | null> {
   const entry = cache.get(cacheKey(messageId, channelId));
-  return entry ? rowToGiveaway(entry) : null;
+  return entry ? rowToGiveaway(entry.doc) : null;
 }
 
 export async function getActiveGiveaways(limit: number = 50): Promise<GiveawayData[]> {
   const now = Date.now();
   const active: StoredGiveaway[] = [];
-  for (const d of cache.values()) {
+  for (const entry of cache.values()) {
+    const d = entry.doc;
     if (d.status === 'active' && (d.endsAt === null || d.endsAt > now)) active.push(d);
   }
   return active
@@ -400,6 +480,7 @@ export async function getActiveGiveaways(limit: number = 50): Promise<GiveawayDa
 
 export async function getAllGiveaways(limit: number = 100): Promise<GiveawayData[]> {
   return Array.from(cache.values())
+    .map(e => e.doc)
     .sort((a, b) => b.detectedAt - a.detectedAt)
     .slice(0, limit)
     .map(rowToGiveaway);
@@ -411,7 +492,8 @@ export async function getStats(): Promise<GiveawayStats> {
   let last: number | null = null;
   const guildIds = new Set<string>();
 
-  for (const d of cache.values()) {
+  for (const entry of cache.values()) {
+    const d = entry.doc;
     if (d.status === 'active' && (d.endsAt === null || d.endsAt > now)) active++;
     guildIds.add(d.guildId);
     if (last === null || d.detectedAt > last) last = d.detectedAt;
@@ -442,7 +524,8 @@ export async function resetDatabase(): Promise<void> {
 
 export async function cleanupOldGiveaways(days: number = 30): Promise<void> {
   const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
-  for (const [key, d] of cache) {
+  for (const [key, entry] of cache) {
+    const d = entry.doc;
     if (d.status !== 'active' && d.detectedAt < cutoff) {
       cache.delete(key);
       dirtyKeys.delete(key);
@@ -454,7 +537,8 @@ export async function purgeEndedGiveaways(): Promise<GiveawayData[]> {
   const now = Date.now();
   const removed: GiveawayData[] = [];
 
-  for (const [key, d] of cache) {
+  for (const [key, entry] of cache) {
+    const d = entry.doc;
     const isRunning = d.status === 'active' && (d.endsAt === null || d.endsAt > now);
     if (!isRunning) {
       removed.push(rowToGiveaway(d));
@@ -480,7 +564,9 @@ export async function closeDb(): Promise<void> {
   await flushSync();
 
   if (client) {
-    await client.close();
+    try {
+      await client.close();
+    } catch {}
     connected = false;
   }
 }
@@ -722,10 +808,6 @@ export async function getAllPremiumUsers(guildId: string): Promise<PremiumUser[]
   }).toArray();
 }
 
-/**
- * Get ALL premium users across ALL guilds (no guild filter)
- * Used by AutoJoiner to monitor all servers
- */
 export async function getAllPremiumUsersAllGuilds(): Promise<PremiumUser[]> {
   await ensureConnected();
   return premiumUsersCol.find({
@@ -884,7 +966,6 @@ export async function setTokenActive(
 
 // ---------------------------------------------------------------------------
 // AutoJoin Entries - MongoDB storage for giveaway entries
-// FIXED: Include userId in _id to prevent duplicate key errors
 // ---------------------------------------------------------------------------
 
 export async function getAutoJoinEntriesCollection(): Promise<Collection<AutoJoinEntry>> {
@@ -894,7 +975,6 @@ export async function getAutoJoinEntriesCollection(): Promise<Collection<AutoJoi
 
 export async function saveAutoJoinEntry(entry: Omit<AutoJoinEntry, '_id'>): Promise<void> {
   await ensureConnected();
-  // FIX: Include userId in _id to prevent duplicate key errors
   const entryWithId: AutoJoinEntry = {
     ...entry,
     _id: `${entry.userId}:${entry.channelId}:${entry.messageId}`,
@@ -939,7 +1019,7 @@ export async function deleteAutoJoinEntry(
 
 export async function cleanupAutoJoinEntries(userId: string): Promise<number> {
   await ensureConnected();
-  const cutoff = Date.now() - 2 * 60 * 60 * 1000; // 2 hours
+  const cutoff = Date.now() - 2 * 60 * 60 * 1000;
   const result = await autoJoinEntriesCol.deleteMany({
     userId,
     status: { $in: ['success', 'failed', 'skipped'] },
