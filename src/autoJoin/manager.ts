@@ -6,12 +6,13 @@
  * FIXES APPLIED:
  * 1. Fixed 'this' type error in getStats()
  * 2. Fixed Promise type error in shutdown()
- * 3. Proper session management
- * 4. Queue processing with batching
- * 5. Retry logic with exponential backoff
- * 6. Webhook support
- * 7. Comprehensive stats
- * 8. Proper cleanup on shutdown
+ * 3. Added proper validation for userId/guildId in processEntry
+ * 4. Proper session management
+ * 5. Queue processing with batching
+ * 6. Retry logic with exponential backoff
+ * 7. Webhook support
+ * 8. Comprehensive stats
+ * 9. Proper cleanup on shutdown
  */
 
 import { Client, Message, TextChannel } from 'discord.js-selfbot-v13';
@@ -161,6 +162,11 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   public async startSession(userId: string, guildId: string): Promise<boolean> {
+    if (!userId || !guildId) {
+      logger.warn('startSession called with invalid parameters', { userId, guildId });
+      return false;
+    }
+
     const sessionKey = `${userId}:${guildId}`;
     
     if (this.sessions.has(sessionKey)) {
@@ -264,6 +270,11 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   public async stopSession(userId: string, guildId: string): Promise<void> {
+    if (!userId || !guildId) {
+      logger.warn('stopSession called with invalid parameters', { userId, guildId });
+      return;
+    }
+
     const sessionKey = `${userId}:${guildId}`;
     const session = this.sessions.get(sessionKey);
     
@@ -447,6 +458,13 @@ export class AutoJoinManager extends EventEmitter {
 
   private async processEntry(entry: GiveawayToJoin): Promise<{ success: boolean; error?: string }> {
     const { userId, guildId, messageId, channelId, prize } = entry;
+    
+    // ✅ FIX: Validate required fields
+    if (!userId || !guildId || !messageId || !channelId) {
+      logger.warn('processEntry called with missing required fields', { userId, guildId, messageId, channelId });
+      return { success: false, error: 'Missing required fields' };
+    }
+    
     const entryId = `${userId}:${channelId}:${messageId}`;
     
     if (this.processingEntries.has(entryId)) {
@@ -765,11 +783,13 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   public getSession(userId: string, guildId: string): AutoJoinSession | null {
+    if (!userId || !guildId) return null;
     const sessionKey = `${userId}:${guildId}`;
     return this.sessions.get(sessionKey) || null;
   }
 
   public isUserSessionActive(userId: string, guildId: string): boolean {
+    if (!userId || !guildId) return false;
     const sessionKey = `${userId}:${guildId}`;
     const session = this.sessions.get(sessionKey);
     return session ? session.isActive : false;
