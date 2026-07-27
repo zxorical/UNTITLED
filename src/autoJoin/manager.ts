@@ -537,8 +537,21 @@ export class AutoJoinManager extends EventEmitter {
     // giveaways are always posted by bots, so require message.author.bot
     // for the keyword fallback path too (isKnownBot already implies this).
     const hasKeyword = !!message.author?.bot && this.messageHasKeyword(message);
-    
+
+    // ✅ FIX: isKnownBot used to bypass ALL content checks — any message at
+    // all from a known giveaway bot's ID (welcome messages, "Messages Sent"
+    // stats pings, bare "0" messages, role-panel posts) got queued as a
+    // giveaway. A known bot's ID is a strong signal but not sufficient on
+    // its own — require the message to also actually look giveaway-shaped:
+    // has an embed, has interactive components (entry button), or matches
+    // the keyword patterns.
+    const looksLikeGiveaway =
+      !!message.embeds?.length ||
+      !!(message as any).components?.length ||
+      this.messageHasKeyword(message);
+
     if (!isKnownBot && !hasKeyword) return;
+    if (isKnownBot && !looksLikeGiveaway) return;
 
     // Prevent duplicate scanning
     const scanKey = `${message.id}:${userId}`;
@@ -1361,7 +1374,33 @@ export class AutoJoinManager extends EventEmitter {
 
   private async postInteraction(message: Message, customId: string, session: AutoJoinSession): Promise<void> {
     const clientAny = session.client as unknown as Record<string, unknown>;
-    const sessionId = (clientAny['sessionId'] ?? clientAny['session_id'] ?? Date.now().toString()) as string;
+    // ✅ FIX: the previous fallback chain checked clientAny['sessionId'] /
+    // ['session_id'] directly on the Client object — neither exists there in
+    // discord.js-selfbot-v13, so it always fell through to
+    // Date.now().toString(). A timestamp is never a valid gateway session
+    // id, so Discord rejected every one of these interaction POSTs with
+    // HTTP 400. The real session id lives on the websocket shard.
+    const wsAny = (clientAny['ws'] ?? {}) as Record<string, unknown>;
+    const shardsAny = wsAny['shards'] as Map<number, Record<string, unknown>> | undefined;
+    const firstShard = shardsAny?.get?.(0) ?? (shardsAny as any)?.first?.();
+    const sessionId = (
+      firstShard?.['sessionId'] ??
+      firstShard?.['session_id'] ??
+      wsAny['sessionId'] ??
+      wsAny['session_id'] ??
+      clientAny['sessionId'] ??
+      clientAny['session_id']
+    ) as string | undefined;
+
+    if (!sessionId) {
+      // Don't even attempt the POST with a bogus id — it will always 400.
+      // Surface a clear error instead so this shows up distinctly in logs
+      // rather than as an opaque HTTP 400.
+      throw new Error(
+        'Could not resolve a valid gateway session_id for interaction POST — client.ws.shards may not be populated yet'
+      );
+    }
+
     const nonce = `${Date.now()}${Math.random().toString(36).slice(2, 8)}`;
     const messageAny = message as unknown as Record<string, unknown>;
     const appId = (messageAny['applicationId'] ?? messageAny['application_id'] ?? message.author?.id) as string | undefined;
