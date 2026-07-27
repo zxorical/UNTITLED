@@ -131,24 +131,66 @@ interface NotificationJob {
   messageId: string;
 }
 
+// How long a messageId needs to be remembered for dedup purposes. Duplicate
+// enqueue() calls for the same giveaway only happen from near-simultaneous
+// retries/races in the detection pipeline (multiple accounts seeing the same
+// message, a message being edited and re-processed, etc.) — anything beyond
+// a few minutes apart is not a duplicate, it's just the same messageId
+// reappearing much later for an unrelated reason and doesn't need
+// protecting against.
+const DEDUP_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const DEDUP_SWEEP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+
 class NotificationService {
   private queue: NotificationJob[] = [];
   private processing = false;
-  private dedupSet = new Set<string>();
+  // Was: private dedupSet = new Set<string>() — every notification ever
+  // sent added an entry with no expiry and no cap. Across the lifetime of
+  // this process that grows without bound (production logs showed 23,000+
+  // giveaways tracked historically), and was a real contributor to the
+  // slow, ongoing memory climb. Replaced with a TTL map + periodic sweep,
+  // since dedup only needs to cover a short window, not forever.
+  private dedupMap = new Map<string, number>();
+  private dedupSweepInterval: NodeJS.Timeout | null = null;
   private bot: Client;
   private metrics: MetricsCollector;
 
   constructor(bot: Client, metrics: MetricsCollector) {
     this.bot = bot;
     this.metrics = metrics;
+    this.dedupSweepInterval = setInterval(() => this.sweepDedup(), DEDUP_SWEEP_INTERVAL_MS);
+    if (this.dedupSweepInterval.unref) this.dedupSweepInterval.unref();
+  }
+
+  private sweepDedup(): void {
+    const now = Date.now();
+    let removed = 0;
+    for (const [messageId, addedAt] of this.dedupMap) {
+      if (now - addedAt > DEDUP_TTL_MS) {
+        this.dedupMap.delete(messageId);
+        removed++;
+      }
+    }
+    if (removed > 0) {
+      logger.debug('Notification dedup cache swept', { removed, remaining: this.dedupMap.size });
+    }
+  }
+
+  /** Call on process shutdown to stop the sweep interval cleanly. */
+  shutdown(): void {
+    if (this.dedupSweepInterval) {
+      clearInterval(this.dedupSweepInterval);
+      this.dedupSweepInterval = null;
+    }
   }
 
   enqueue(data: GiveawayData, inviteUrl: string) {
-    if (this.dedupSet.has(data.messageId)) {
+    const existing = this.dedupMap.get(data.messageId);
+    if (existing !== undefined && Date.now() - existing < DEDUP_TTL_MS) {
       logger.debug('Notification duplicate prevented', { messageId: data.messageId });
       return;
     }
-    this.dedupSet.add(data.messageId);
+    this.dedupMap.set(data.messageId, Date.now());
     (data as any).cachedInviteUrl = inviteUrl;
 
     this.queue.push({
@@ -565,6 +607,7 @@ export class BotManager {
     if (this.presenceInterval) clearInterval(this.presenceInterval);
     if (this.cleanupInterval) clearInterval(this.cleanupInterval);
     if (this.verificationInterval) clearInterval(this.verificationInterval);
+    this.notifications.shutdown();
     await this.client.destroy();
   }
 
