@@ -11,6 +11,7 @@
  * 6. Proper cleanup on shutdown
  * 7. Consistency checking
  * 8. Reduced log spam
+ * 9. ALL autoJoin functions included
  */
 
 import { MongoClient, Db, Collection, AnyBulkWriteOperation } from 'mongodb';
@@ -485,6 +486,7 @@ async function createIndexes(): Promise<void> {
     await autoJoinEntriesCol.createIndex({ detectedAt: -1 });
     await autoJoinEntriesCol.createIndex({ userId: 1, status: 1 });
     await autoJoinEntriesCol.createIndex({ status: 1, detectedAt: 1 });
+    await autoJoinEntriesCol.createIndex({ archived: 1 });
     
     logger.debug('Database indexes created/verified', { component: 'Database' });
   } catch (err) {
@@ -1325,7 +1327,7 @@ export async function removePremiumUser(
       $set: {
         isPremium: false,
         lastChecked: Date.now(),
-        version: { $inc: 1 },
+        version: { $inc: 1 } as any,
       }
     }
   );
@@ -1433,7 +1435,7 @@ export async function updateUserToken(
         tokenWins: 0,
         tokenActive: true,
         lastChecked: Date.now(),
-        version: { $inc: 1 },
+        version: { $inc: 1 } as any,
       }
     },
     { upsert: true }
@@ -1461,7 +1463,7 @@ export async function updateUserWebhook(
         webhookAddedAt: Date.now(),
         webhookLastUsed: null,
         lastChecked: Date.now(),
-        version: { $inc: 1 },
+        version: { $inc: 1 } as any,
       }
     },
     { upsert: true }
@@ -1506,7 +1508,7 @@ export async function incrementTokenEntries(
   await ensureConnected();
   await premiumUsersCol.updateOne(
     { userId, guildId },
-    { $inc: { tokenEntries: 1, version: 1 } }
+    { $inc: { tokenEntries: 1, version: 1 } as any }
   );
 }
 
@@ -1519,7 +1521,7 @@ export async function incrementTokenWins(
   await ensureConnected();
   await premiumUsersCol.updateOne(
     { userId, guildId },
-    { $inc: { tokenWins: 1, version: 1 } }
+    { $inc: { tokenWins: 1, version: 1 } as any }
   );
 }
 
@@ -1532,7 +1534,7 @@ export async function updateTokenLastUsed(
   await ensureConnected();
   await premiumUsersCol.updateOne(
     { userId, guildId },
-    { $set: { tokenLastUsed: Date.now(), version: { $inc: 1 } } }
+    { $set: { tokenLastUsed: Date.now(), version: { $inc: 1 } as any } }
   );
 }
 
@@ -1546,7 +1548,7 @@ export async function setTokenActive(
   await ensureConnected();
   await premiumUsersCol.updateOne(
     { userId, guildId },
-    { $set: { tokenActive: active, version: { $inc: 1 } } }
+    { $set: { tokenActive: active, version: { $inc: 1 } as any } }
   );
 }
 
@@ -1671,7 +1673,7 @@ export async function batchSaveJoinOutcomes(outcomes: Array<{
       }
     }));
     
-    await autoJoinEntriesCol.bulkWrite(bulkOps, { ordered: false });
+    await autoJoinEntriesCol.bulkWrite(bulkOps as any, { ordered: false });
   } catch (err) {
     logger.error('batchSaveJoinOutcomes error', { 
       component: 'Database',
@@ -1705,7 +1707,7 @@ export async function batchUpdateDetectionConfidence(updates: Array<{
       }
     }));
     
-    await autoJoinEntriesCol.bulkWrite(bulkOps, { ordered: false });
+    await autoJoinEntriesCol.bulkWrite(bulkOps as any, { ordered: false });
   } catch (err) {
     logger.error('batchUpdateDetectionConfidence error', { 
       component: 'Database',
@@ -1884,7 +1886,7 @@ export async function setBoosterPremium(
         premiumAssigned: isBooster,
         assignedAt: isBooster ? Date.now() : 0,
         lastChecked: Date.now(),
-        version: { $inc: 1 },
+        version: { $inc: 1 } as any,
       }
     },
     { upsert: true }
@@ -1926,7 +1928,7 @@ export async function removeBoosterPremium(
         isBooster: false,
         premiumAssigned: false,
         lastChecked: Date.now(),
-        version: { $inc: 1 },
+        version: { $inc: 1 } as any,
       }
     }
   );
@@ -2072,6 +2074,7 @@ connect().catch((err) => {
 });
 
 export default {
+  // Giveaway functions
   getDb,
   getTotalDetected,
   insertGiveaway,
@@ -2089,17 +2092,23 @@ export default {
   resetDatabase,
   cleanupOldGiveaways,
   purgeEndedGiveaways,
+  
+  // Watchlist functions
   addItem,
   removeItem,
   getItems,
   getAllWatchlists,
   clearItems,
+  
+  // License functions
   createLicenseKey,
   getLicenseKey,
   validateLicenseKey,
   useLicenseKey,
   listLicenseKeys,
   getLicenseStats,
+  
+  // Premium functions
   setPremiumUser,
   removePremiumUser,
   getPremiumUser,
@@ -2108,6 +2117,8 @@ export default {
   getAllPremiumUsersAllGuilds,
   getPremiumUsersBySource,
   getPremiumStats,
+  
+  // Token & Webhook functions
   updateUserToken,
   updateUserWebhook,
   getUserToken,
@@ -2116,6 +2127,8 @@ export default {
   incrementTokenWins,
   updateTokenLastUsed,
   setTokenActive,
+  
+  // Auto-join functions
   getAutoJoinEntriesCollection,
   saveAutoJoinEntry,
   getAutoJoinEntry,
@@ -2132,12 +2145,16 @@ export default {
   updateDetectionProfile,
   saveQueueState,
   loadQueueState,
+  
+  // Booster functions
   setBoosterPremium,
   getBoosterPremium,
   getActiveBoosters,
   removeBoosterPremium,
   updateBoosterPremiumStatus,
   getBoosterPremiumStats,
+  
+  // Admin functions
   closeDb,
   getDatabaseStats,
   resyncCache,
