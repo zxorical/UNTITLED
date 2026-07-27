@@ -189,9 +189,6 @@ export class GiveawayManager extends EventEmitter {
     startedAt: Date.now(),
   };
 
-  // Track message edit versions to handle delayed embed population
-  private messageEditTracker = new Map<string, { version: number; timestamp: number }>();
-
   // Invite refresher interval
   private inviteRefresherInterval: NodeJS.Timeout | null = null;
 
@@ -296,55 +293,52 @@ export class GiveawayManager extends EventEmitter {
       } else {
         // Initial check
         result = this.isCreationMessage(message);
-        
-        // Track if we've seen this message before (for edit detection)
-        const editKey = message.id;
-        const editInfo = this.messageEditTracker.get(editKey);
-        const version = editInfo ? editInfo.version + 1 : 1;
-        this.messageEditTracker.set(editKey, { version, timestamp: Date.now() });
-        
-        // DEBUG: Log original message state
-        console.log(`[DEBUG] Original message ${message.id}:`);
-        console.log("CONTENT:", message.content || "(empty)");
-        console.log("EMBEDS:", message.embeds.length);
-        console.log("EMBEDS DATA:", message.embeds.map(e => ({
-            title: e.title,
-            description: e.description?.slice(0, 100),
-            footer: e.footer?.text,
-            fields: e.fields?.length
-        })));
-        console.log("COMPONENTS:", (message as any).components?.length || 0);
-        console.log("COMPONENTS DATA:", (message as any).components ? 
-            JSON.stringify((message as any).components, null, 2).slice(0, 500) : 
-            "none"
-        );
-        console.log("SCORE:", result.score);
-        console.log("IS_CREATION:", result.isCreation);
-        console.log("---");
-        
+
+        if (CONFIG.logLevel === 'debug') {
+          const components = (message as any).components;
+          this.log.debug('Message analysis (original)', {
+            messageId: message.id,
+            content: message.content?.slice(0, 100) || '(empty)',
+            embeds: message.embeds.length,
+            embedsData: message.embeds.map(e => ({
+              title: e.title,
+              description: e.description?.slice(0, 100),
+              footer: e.footer?.text,
+              fields: e.fields?.length,
+            })),
+            components: components?.length || 0,
+            componentsData: components ? JSON.stringify(components).slice(0, 500) : 'none',
+            score: result.score,
+            isCreation: result.isCreation,
+          });
+        }
+
         // Smart refresh: only fetch if important data is missing
         if (!result.isCreation && this.shouldRefreshMessage(message)) {
           try {
             // Use channel.messages.fetch() for a fresh API request
-            console.log(`[DEBUG] Fetching fresh version of message ${message.id}...`);
             const refreshed = await message.channel.messages.fetch(message.id);
-            
-            console.log(`[DEBUG] Fresh message ${message.id}:`);
-            console.log("  Original embeds:", message.embeds.length);
-            console.log("  Fetched embeds:", refreshed.embeds.length);
-            console.log("  Original components:", (message as any).components?.length || 0);
-            console.log("  Fetched components:", (refreshed as any).components?.length || 0);
-            
+
             const refreshedResult = this.isCreationMessage(refreshed);
+
+            if (CONFIG.logLevel === 'debug') {
+              this.log.debug('Message analysis (refreshed)', {
+                messageId: message.id,
+                originalEmbeds: message.embeds.length,
+                fetchedEmbeds: refreshed.embeds.length,
+                originalComponents: (message as any).components?.length || 0,
+                fetchedComponents: (refreshed as any).components?.length || 0,
+                scoreChange: `${result.score} -> ${refreshedResult.score}`,
+                isCreationChange: `${result.isCreation} -> ${refreshedResult.isCreation}`,
+              });
+            }
+
             // Only use refreshed result if it changed (score increased or became a creation)
             if (refreshedResult.isCreation || refreshedResult.score > result.score) {
-              console.log(`[DEBUG] Using refreshed result: score ${result.score} -> ${refreshedResult.score}, isCreation ${result.isCreation} -> ${refreshedResult.isCreation}`);
               result = refreshedResult;
-            } else {
-              console.log(`[DEBUG] Refreshed result unchanged, keeping original`);
             }
           } catch (err) {
-            console.log(`[DEBUG] Failed to fetch fresh message: ${formatError(err)}`);
+            this.log.debug(`Failed to fetch fresh message: ${formatError(err)}`);
             // If fetch fails, keep original result
           }
         }
@@ -1466,6 +1460,16 @@ export class GiveawayManager extends EventEmitter {
         this.log.debug(`Failed to refresh invite for ${guildId}: ${formatError(err)}`);
       });
     }
+  }
+
+  /**
+   * Prune cached invite data for a guild (e.g. after the bot leaves it).
+   * Prevents inviteCache from silently accumulating entries for guilds
+   * we're no longer in.
+   */
+  public clearInviteCache(guildId: string): void {
+    this.inviteCache.delete(guildId);
+    this.pendingInvites.delete(guildId);
   }
 
   // -------------------------------------------------------------------------
