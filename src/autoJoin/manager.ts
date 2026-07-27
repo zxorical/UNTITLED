@@ -18,9 +18,14 @@
  * 12. ✅ FIX: Proper button detection with TRUSTED_ENTRY_CUSTOM_IDS
  * 13. ✅ FIX: Handle GiveawayBoat bare participant count buttons
  * 14. ✅ FIX: postInteraction uses session.client not this.client
+ * 15. ✅ FIX: Added message scanning via messageCreate event
+ * 16. ✅ FIX: Added win detection for guild messages and DMs
+ * 17. ✅ FIX: Added messageUpdate handling for late component arrival
+ * 18. ✅ FIX: Added deduplication map for recently scanned messages
+ * 19. ✅ FIX: Added proper message handler cleanup on session stop
  */
 
-import { Client, Message, TextChannel } from 'discord.js-selfbot-v13';
+import { Client, Message, TextChannel, NewsChannel } from 'discord.js-selfbot-v13';
 import { EventEmitter } from 'events';
 import axios from 'axios';
 import { logger } from '../logger.js';
@@ -157,6 +162,9 @@ interface AutoJoinSession {
     wins: number;
     lastEntryAt?: number;
   };
+  // Store message handler references for cleanup
+  messageHandler?: (message: Message) => Promise<void>;
+  winHandler?: (message: Message) => Promise<void>;
 }
 
 interface GiveawayToJoin {
@@ -194,6 +202,7 @@ const QUEUE_PROCESS_INTERVAL_MS = 1000;
 const WIN_DEDUP_TTL_MS = 30 * 60 * 1000;
 const COMPONENT_RETRY_DELAY_MS = 300;
 const COMPONENT_RETRY_ATTEMPTS = 3;
+const SCAN_COOLDOWN_MS = 2000; // Prevent duplicate message scans
 
 // ============================================================================
 // AutoJoinManager
@@ -204,6 +213,7 @@ export class AutoJoinManager extends EventEmitter {
   private processingEntries = new Set<string>();
   private cleanupInterval: NodeJS.Timeout | null = null;
   private queueInterval: NodeJS.Timeout | null = null;
+  private scanCooldownCleaner: NodeJS.Timeout | null = null;
   private isShuttingDown = false;
   private entryQueue: GiveawayToJoin[] = [];
   private isProcessingQueue = false;
@@ -217,6 +227,9 @@ export class AutoJoinManager extends EventEmitter {
   // Win dedup map: `${channelId}:${authorId}` → timestamp
   private recentWins = new Map<string, number>();
   
+  // Scan dedup map: `${messageId}:${userId}` → timestamp
+  private recentlyScanned = new Map<string, number>();
+  
   // HTTP client for interactions
   private readonly http: ReturnType<typeof axios.create>;
 
@@ -224,6 +237,7 @@ export class AutoJoinManager extends EventEmitter {
     super();
     this.startCleanupInterval();
     this.startQueueProcessor();
+    this.startScanCooldownCleaner();
     
     // HTTP client for direct interactions
     this.http = axios.create({
@@ -290,6 +304,10 @@ export class AutoJoinManager extends EventEmitter {
     const sessionKey = `${userId}:${guildId}`;
     
     if (this.sessions.has(sessionKey)) {
+      logger.debug(`Session already exists for ${sessionKey}`, {
+        component: 'AutoJoinManager',
+        userId
+      });
       return true;
     }
 
@@ -326,24 +344,50 @@ export class AutoJoinManager extends EventEmitter {
       }
 
       // Create client for this session
-      const client = new Client();
+      const client = new Client({
+        checkUpdate: false,
+      });
+      
+      // ✅ Create message handlers
+      const messageHandler = async (message: Message) => {
+        await this.scanMessageForGiveaway(message, userId, guildId);
+      };
+      
+      const winHandler = async (message: Message) => {
+        await this.scanMessageForWin(message, userId, guildId);
+      };
       
       // Set up event handlers
-      client.on('ready', () => {
-        logger.debug(`AutoJoin session ready`, {
+      client.on('ready', async () => {
+        logger.info(`AutoJoin session ready for user ${userId}`, {
           component: 'AutoJoinManager',
           userId,
-          guildId
+          guildId,
+          username: client.user?.username,
+          tag: client.user?.tag
         });
+        
         const session = this.sessions.get(sessionKey);
         if (session) {
           session.isActive = true;
           session.lastActivityAt = Date.now();
+          
+          // ✅ Attach message listeners
+          client.on('messageCreate', messageHandler);
+          client.on('messageUpdate', (_oldMsg, newMsg) => {
+            if (newMsg) messageHandler(newMsg as Message);
+          });
+          
+          // ✅ Attach win detection listener
+          client.on('messageCreate', winHandler);
+          
+          // Cache warmup for existing messages
+          await this.warmupCache(session);
         }
       });
 
       client.on('error', (error) => {
-        logger.error(`AutoJoin session error`, {
+        logger.error(`AutoJoin session error for ${userId}`, {
           component: 'AutoJoinManager',
           userId,
           guildId,
@@ -352,7 +396,7 @@ export class AutoJoinManager extends EventEmitter {
       });
 
       client.on('disconnect', () => {
-        logger.warn(`AutoJoin session disconnected`, {
+        logger.warn(`AutoJoin session disconnected for ${userId}`, {
           component: 'AutoJoinManager',
           userId,
           guildId
@@ -364,7 +408,7 @@ export class AutoJoinManager extends EventEmitter {
       });
 
       client.on('reconnecting', () => {
-        logger.debug(`AutoJoin session reconnecting`, {
+        logger.debug(`AutoJoin session reconnecting for ${userId}`, {
           component: 'AutoJoinManager',
           userId,
           guildId
@@ -389,7 +433,9 @@ export class AutoJoinManager extends EventEmitter {
           entered: 0,
           failed: 0,
           wins: 0,
-        }
+        },
+        messageHandler,
+        winHandler,
       };
 
       this.sessions.set(sessionKey, session);
@@ -418,6 +464,261 @@ export class AutoJoinManager extends EventEmitter {
     }
   }
 
+  // ============================================================================
+  // ✅ Message Scanning - Core giveaway detection
+  // ============================================================================
+
+  private async scanMessageForGiveaway(
+    message: Message, 
+    userId: string, 
+    guildId: string
+  ): Promise<void> {
+    // Ignore messages from self
+    const session = this.sessions.get(`${userId}:${guildId}`);
+    if (!session?.client?.user) return;
+    if (message.author?.id === session.client.user.id) return;
+
+    // Only process messages from guild channels
+    if (!message.guild) return;
+    
+    // Check if message is from a known giveaway bot or has giveaway keywords
+    const isKnownBot = this.isKnownGiveawayBot(message);
+    const hasKeyword = this.messageHasKeyword(message);
+    
+    if (!isKnownBot && !hasKeyword) return;
+
+    // Prevent duplicate scanning
+    const scanKey = `${message.id}:${userId}`;
+    const lastScan = this.recentlyScanned.get(scanKey);
+    if (lastScan && Date.now() - lastScan < SCAN_COOLDOWN_MS) {
+      return;
+    }
+    this.recentlyScanned.set(scanKey, Date.now());
+
+    logger.debug(`🔍 Scanning message for giveaway: ${message.id}`, {
+      component: 'AutoJoinManager',
+      userId,
+      authorId: message.author?.id,
+      authorName: message.author?.username,
+      isKnownBot,
+      hasKeyword,
+      hasEmbed: !!message.embeds?.length,
+      hasComponents: !!(message as any).components?.length,
+      content: message.content?.substring(0, 100)
+    });
+
+    // Check for blocked content (e.g., "already entered")
+    const content = message.content || '';
+    if (BLOCKED_MESSAGE_CONTENT.some(re => re.test(content))) {
+      logger.debug(`Blocked content detected in message`, {
+        component: 'AutoJoinManager',
+        userId,
+        messageId: message.id
+      });
+      return;
+    }
+
+    // Extract prize information
+    const prize = this.extractPrize(message);
+    
+    // Extract end time if available
+    let endsAt: number | null = null;
+    const embed = message.embeds?.[0];
+    if (embed?.footer?.text) {
+      const endMatch = embed.footer.text.match(/ends?\s*(?:at|in|on)?\s*<t:(\d+):[RrFfDdTt]>/i) ||
+                       embed.footer.text.match(/ends?\s*(?:at|in|on)?\s*(\d{4}-\d{2}-\d{2})/i);
+      if (endMatch) {
+        endsAt = endMatch[1] ? parseInt(endMatch[1]) * 1000 : new Date(endMatch[1]).getTime();
+      }
+    }
+
+    // Create giveaway entry and queue it
+    const giveaway: GiveawayToJoin = {
+      messageId: message.id,
+      channelId: message.channel.id,
+      guildId: message.guild.id,
+      guildName: message.guild.name,
+      channelName: (message.channel as any).name || 'unknown',
+      prize,
+      authorId: message.author?.id || '',
+      detectedAt: Date.now(),
+      endsAt,
+      userId,
+    };
+
+    // Queue the giveaway
+    this.entryQueue.push(giveaway);
+    
+    // Update session stats
+    session.stats.detected++;
+    session.lastActivityAt = Date.now();
+
+    logger.info(`🎯 Giveaway detected for user ${userId}`, {
+      component: 'AutoJoinManager',
+      prize: prize?.substring(0, 50),
+      channel: giveaway.channelName,
+      guild: giveaway.guildName,
+      hasComponents: !!(message as any).components?.length,
+      isKnownBot
+    });
+    
+    // Emit event
+    this.emit('giveawayDetected', giveaway);
+  }
+
+  // ============================================================================
+  // ✅ Win Detection - Guild messages and DMs
+  // ============================================================================
+
+  private async scanMessageForWin(
+    message: Message, 
+    userId: string, 
+    guildId: string
+  ): Promise<void> {
+    const session = this.sessions.get(`${userId}:${guildId}`);
+    if (!session?.client?.user) return;
+    
+    const myId = session.client.user.id;
+    
+    // Win detection for guild messages
+    if (message.guild) {
+      // Only process bot messages that mention us
+      if (!message.author?.bot) return;
+      
+      const mentionedInUsers = message.mentions?.users?.has(myId) ?? false;
+      const mentionedInContent = (message.content ?? '').includes(myId);
+      
+      if (!mentionedInUsers && !mentionedInContent) return;
+      
+      const allText = this.extractAllText(message);
+      if (!WIN_PATTERNS.some(re => re.test(allText))) return;
+      
+      await this.processWin(message, session, 'guild');
+    }
+    // Win detection for DMs (any message)
+    else {
+      const allText = this.extractAllText(message);
+      if (!WIN_PATTERNS.some(re => re.test(allText))) return;
+      
+      await this.processWin(message, session, 'dm');
+    }
+  }
+
+  private async processWin(
+    message: Message, 
+    session: AutoJoinSession, 
+    source: 'guild' | 'dm'
+  ): Promise<void> {
+    // Dedup
+    const dedupKey = `${message.channel.id}:${message.author?.id ?? 'unknown'}`;
+    const lastWin = this.recentWins.get(dedupKey);
+    if (lastWin && Date.now() - lastWin < WIN_DEDUP_TTL_MS) {
+      logger.debug(`Win dedup — suppressing duplicate notification`, {
+        component: 'AutoJoinManager',
+        userId: session.userId,
+        dedupKey
+      });
+      return;
+    }
+    this.recentWins.set(dedupKey, Date.now());
+
+    // Process win
+    session.stats.wins++;
+    await incrementTokenWins(session.userId, session.guildId);
+
+    const prize = this.extractPrize(message);
+    const sourceName = source === 'dm'
+      ? 'Direct Message'
+      : `#${(message.channel as { name?: string }).name ?? message.channel.id} in ${message.guild?.name ?? 'unknown server'}`;
+
+    logger.info(`🏆 WIN DETECTED!`, {
+      component: 'AutoJoinManager',
+      userId: session.userId,
+      prize,
+      source: sourceName,
+      guild: message.guild?.name ?? 'DM',
+    });
+
+    // Send win webhook
+    await this.sendWinWebhook(message, prize, sourceName, session.userId);
+    this.emit('giveawayWon', { message, prize, userId: session.userId });
+  }
+
+  // ============================================================================
+  // ✅ Cache Warmup - Scan existing messages for giveaways
+  // ============================================================================
+
+  private async warmupCache(session: AutoJoinSession): Promise<void> {
+    try {
+      const guild = session.client.guilds.cache.get(session.guildId);
+      if (!guild) return;
+
+      const channels = guild.channels.cache.filter(
+        ch => ch.type === 'GUILD_TEXT' || ch.type === 'GUILD_NEWS'
+      );
+      
+      logger.debug(`Warming up message cache for ${channels.size} channels`, {
+        component: 'AutoJoinManager',
+        userId: session.userId,
+        guild: guild.name
+      });
+
+      let scannedCount = 0;
+      
+      for (const [channelId, channel] of channels) {
+        try {
+          const textChannel = channel as TextChannel | NewsChannel;
+          const messages = await textChannel.messages.fetch({ limit: 10 });
+          
+          for (const [msgId, message] of messages) {
+            if (this.isKnownGiveawayBot(message) || this.messageHasKeyword(message)) {
+              await this.scanMessageForGiveaway(message, session.userId, session.guildId);
+              scannedCount++;
+            }
+          }
+        } catch {
+          continue;
+        }
+      }
+
+      logger.debug(`Cache warmup complete: scanned ${scannedCount} potential giveaways`, {
+        component: 'AutoJoinManager',
+        userId: session.userId
+      });
+    } catch (error) {
+      logger.warn(`Cache warmup failed for session`, {
+        component: 'AutoJoinManager',
+        userId: session.userId,
+        error: formatError(error)
+      });
+    }
+  }
+
+  // ============================================================================
+  // Scan Cooldown Cleaner
+  // ============================================================================
+
+  private startScanCooldownCleaner(): void {
+    if (this.scanCooldownCleaner) return;
+    
+    this.scanCooldownCleaner = setInterval(() => {
+      const cutoff = Date.now() - SCAN_COOLDOWN_MS * 2;
+      for (const [key, timestamp] of this.recentlyScanned) {
+        if (timestamp < cutoff) {
+          this.recentlyScanned.delete(key);
+        }
+      }
+    }, SCAN_COOLDOWN_MS * 2);
+    
+    if (this.scanCooldownCleaner.unref) {
+      this.scanCooldownCleaner.unref();
+    }
+  }
+
+  // ============================================================================
+  // Session Management
+  // ============================================================================
+
   public async stopSession(userId: string, guildId: string): Promise<void> {
     if (!userId || !guildId) {
       logger.warn('stopSession called with invalid parameters', { userId, guildId });
@@ -429,6 +730,15 @@ export class AutoJoinManager extends EventEmitter {
     
     if (session) {
       try {
+        // ✅ Remove message listeners before destroying
+        if (session.messageHandler) {
+          session.client.off('messageCreate', session.messageHandler);
+          session.client.off('messageUpdate', session.messageHandler);
+        }
+        if (session.winHandler) {
+          session.client.off('messageCreate', session.winHandler);
+        }
+        
         session.client.removeAllListeners();
         await session.client.destroy();
       } catch (error) {
@@ -798,7 +1108,7 @@ export class AutoJoinManager extends EventEmitter {
         } else {
           // Try refreshing the message to get components
           for (let i = 0; i < COMPONENT_RETRY_ATTEMPTS; i++) {
-            await delay(COMPONENT_RETRY_DELAY_MS);
+            await delay(COMPONENT_RETRY_DELAY_MS * (i + 1));
             try {
               const refreshed = await channel.messages.fetch(messageId);
               const refreshedButton = this.findEntryButton(refreshed);
@@ -855,9 +1165,6 @@ export class AutoJoinManager extends EventEmitter {
         
         // Update last used time
         await updateTokenLastUsed(session.userId, session.guildId);
-        
-        // Check for win detection
-        await this.checkForWin(message, session);
         
         // Save webhook if configured
         const webhookUrl = await getUserWebhook(session.userId, session.guildId);
@@ -1314,6 +1621,11 @@ export class AutoJoinManager extends EventEmitter {
       clearInterval(this.queueInterval);
       this.queueInterval = null;
     }
+    
+    if (this.scanCooldownCleaner) {
+      clearInterval(this.scanCooldownCleaner);
+      this.scanCooldownCleaner = null;
+    }
 
     // Clear queue
     this.entryQueue = [];
@@ -1337,6 +1649,7 @@ export class AutoJoinManager extends EventEmitter {
     this.sessions.clear();
     this.processingEntries.clear();
     this.recentWins.clear();
+    this.recentlyScanned.clear();
     
     logger.info('AutoJoinManager shutdown complete', {
       component: 'AutoJoinManager',
