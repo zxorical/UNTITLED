@@ -9,6 +9,9 @@
  * 3. Session cleanup on boot retry
  * 4. Health check with memory metrics
  * 5. Graceful shutdown with timeout
+ * 6. Destroy clients that time out during startup (was leaking sockets/listeners)
+ * 7. Gate noisy `debug` event listener behind log level
+ * 8. Prune GiveawayManager invite cache when the bot leaves a guild
  */
 
 import http from 'http';
@@ -258,16 +261,24 @@ async function main(): Promise<void> {
       continue;
     }
 
+    let client: Client | null = null;
+
     try {
       logger.info(`Starting account ${i + 1}/${CONFIG.tokens.length} (${label})...`, {
         component: 'Bootstrap',
       });
 
-      const client = new Client();
+      client = new Client();
 
-      client.on('debug', (info) => {
-        logger.debug(`[${label}] Debug: ${info}`, { component: 'Client' });
-      });
+      // Only attach the debug listener when debug logging is actually enabled.
+      // The `debug` event fires very frequently (heartbeats, gateway payloads),
+      // so building/logging a string on every tick when it'll be discarded
+      // anyway is wasted allocation across every account.
+      if (CONFIG.logLevel === 'debug') {
+        client.on('debug', (info) => {
+          logger.debug(`[${label}] Debug: ${info}`, { component: 'Client' });
+        });
+      }
 
       client.on('ready', () => {
         logger.info(`[${label}] Client ready event fired`, { component: 'Client' });
@@ -282,10 +293,22 @@ async function main(): Promise<void> {
 
       logger.info(`[${label}] Calling waitForReady...`, { component: 'Bootstrap' });
 
-      await Promise.race([
-        waitForReady(client, token, label),
-        timeout(CLIENT_READY_TIMEOUT_MS, `Client ${label} did not become ready`),
-      ]);
+      try {
+        await Promise.race([
+          waitForReady(client, token, label),
+          timeout(CLIENT_READY_TIMEOUT_MS, `Client ${label} did not become ready`),
+        ]);
+      } catch (raceErr) {
+        // If waitForReady lost the race (timed out) or errored, the client is
+        // half-initialized and would otherwise be dropped from scope while
+        // still holding an open gateway connection + listeners. Destroy it
+        // explicitly so it doesn't leak.
+        try {
+          client.removeAllListeners();
+          await client.destroy();
+        } catch {}
+        throw raceErr;
+      }
 
       logger.info(`[${label}] waitForReady resolved successfully`, { component: 'Bootstrap' });
 
@@ -408,6 +431,9 @@ function registerDiscordEvents(client: Client, manager: GiveawayManager): void {
       guildId: guild.id,
       guildName: guild.name,
     });
+    // Prevent inviteCache from silently accumulating entries for guilds
+    // we're no longer in.
+    manager.clearInviteCache(guild.id);
   });
 
   client.on('disconnect', () => logger.warn('Disconnected', { component: 'Events' }));
