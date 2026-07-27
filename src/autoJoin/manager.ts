@@ -23,6 +23,25 @@
  * 33. Per-guild and per-account monitoring stats
  * 34. Health check that verifies Discord connection
  * 35. Worker stall detection and auto-recovery
+ *
+ * MEMORY FIX (this revision):
+ * - discord.js-selfbot-v13's `messageCacheLifetime` / `messageSweepInterval`
+ *   ClientOptions fields are v12 leftovers and are silently ignored in v13.
+ *   Caching is controlled via `makeCache` (ceiling) + `sweepers` (active eviction).
+ *   Previously only Presence/Reaction/Thread/VoiceState/StageInstance managers
+ *   were capped, leaving MessageManager, ChannelManager, UserManager, and
+ *   GuildMemberManager completely unbounded. Since fetchMessage() /
+ *   enterViaButton() / refreshButtonData() fetch+cache a channel and message
+ *   on every single join attempt, this was the source of the steady
+ *   per-attempt RAM growth.
+ * - Added capped makeCache limits for MessageManager/ChannelManager/
+ *   UserManager/GuildMemberManager.
+ * - Added `sweepers` config for active eviction over time.
+ * - Added a manual periodic message-cache clear as a fallback in case this
+ *   selfbot fork's version predates `sweepers` support.
+ * - Reconnect path now awaits client.destroy() (with a timeout guard) instead
+ *   of fire-and-forget, preventing two live Client instances (and their
+ *   caches) from existing simultaneously during rapid reconnect storms.
  */
 
 import { Client, Message, TextChannel, ClientOptions, Options, NewsChannel, PartialMessage } from 'discord.js-selfbot-v13';
@@ -300,6 +319,14 @@ const INTERACTION_RETRY_DELAY_MS = 2000;
 const NO_RESPONSE_COOLDOWN_MS = 5000;
 const BATCH_DB_WRITE_INTERVAL_MS = 5000;
 const ARCHIVE_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
+// Client-level Discord cache sweeping (NEW - memory fix)
+const CLIENT_MESSAGE_CACHE_MAX_SIZE = 25;
+const CLIENT_MESSAGE_SWEEP_INTERVAL_SEC = 300; // 5 minutes
+const CLIENT_MESSAGE_SWEEP_LIFETIME_SEC = 120; // 2 minutes
+const CLIENT_CHANNEL_CACHE_MAX_SIZE = 200;
+const MANUAL_CLIENT_CACHE_SWEEP_INTERVAL_MS = 5 * 60_000;
+const CLIENT_DESTROY_TIMEOUT_MS = 8000;
 
 // Cache sizes
 const CACHE_PROCESSED_MESSAGES = 5000;
@@ -1451,6 +1478,7 @@ export class AutoJoinManager extends EventEmitter {
   private stallCheckInterval: NodeJS.Timeout | null = null;
   private batchDbInterval: NodeJS.Timeout | null = null;
   private archiveInterval: NodeJS.Timeout | null = null;
+  private clientCacheSweepInterval: NodeJS.Timeout | null = null; // NEW - memory fix
   
   // State
   private isShuttingDown = false;
@@ -1534,6 +1562,7 @@ export class AutoJoinManager extends EventEmitter {
     this.startStallChecker();
     this.startBatchDbWriter();
     this.startArchiveInterval();
+    this.startClientCacheSweeper(); // NEW - memory fix
 
     this.asyncLogger.info('🚀 Enhanced AutoJoinManager initialized', {
       worker: this.workerId,
@@ -1637,6 +1666,7 @@ export class AutoJoinManager extends EventEmitter {
     this.noResponseCooldown.clear();
     this.crosspostCache.clear();
     this.tokenManager.clearAll();
+    this.sweepAllClientCaches(); // NEW - memory fix
     
     if (this.sessionStartPromises.size > 10) {
       this.sessionStartPromises.clear();
@@ -1665,6 +1695,76 @@ export class AutoJoinManager extends EventEmitter {
         remaining: this.sessions.size,
       });
     }
+  }
+
+  /**
+   * NEW - memory fix.
+   * Manual fallback sweep for per-client Discord.js caches (messages/channels/
+   * users/members). This runs regardless of whether `sweepers` is honored by
+   * the installed discord.js-selfbot-v13 version, since some forks lag behind
+   * upstream and may not implement it. Safe to call even if sweepers ARE
+   * active — it's just a no-op extra pass in that case.
+   */
+  private sweepAllClientCaches(): void {
+    for (const session of this.sessions.values()) {
+      this.sweepClientCaches(session.client);
+    }
+  }
+
+  private sweepClientCaches(client: Client): void {
+    try {
+      const c = client as any;
+      const channels = c.channels?.cache;
+      if (channels) {
+        for (const channel of channels.values()) {
+          try {
+            if (channel?.messages?.cache?.size > CLIENT_MESSAGE_CACHE_MAX_SIZE) {
+              channel.messages.cache.clear();
+            }
+          } catch {}
+        }
+        // Keep only channels currently relevant (bounded ceiling)
+        if (channels.size > CLIENT_CHANNEL_CACHE_MAX_SIZE) {
+          const excess = channels.size - CLIENT_CHANNEL_CACHE_MAX_SIZE;
+          let removed = 0;
+          for (const [id] of channels) {
+            if (removed >= excess) break;
+            channels.delete(id);
+            removed++;
+          }
+        }
+      }
+
+      // Keep only the bot's own user/member cached; drop the rest
+      const selfId = c.user?.id;
+      if (c.users?.cache?.size > 1) {
+        for (const [id] of c.users.cache) {
+          if (id !== selfId) c.users.cache.delete(id);
+        }
+      }
+      if (c.guilds?.cache) {
+        for (const guild of c.guilds.cache.values()) {
+          try {
+            if (guild.members?.cache?.size > 1) {
+              for (const [id] of guild.members.cache) {
+                if (id !== selfId) guild.members.cache.delete(id);
+              }
+            }
+          } catch {}
+        }
+      }
+    } catch {
+      // Never let a sweep failure take down the session
+    }
+  }
+
+  private startClientCacheSweeper(): void {
+    this.clientCacheSweepInterval = setInterval(() => {
+      if (this.isShuttingDown) return;
+      this.sweepAllClientCaches();
+    }, MANUAL_CLIENT_CACHE_SWEEP_INTERVAL_MS);
+
+    if (this.clientCacheSweepInterval.unref) this.clientCacheSweepInterval.unref();
   }
 
   // -------------------------------------------------------------------------
@@ -1792,9 +1892,18 @@ export class AutoJoinManager extends EventEmitter {
         return false;
       }
 
+      // -----------------------------------------------------------------
+      // MEMORY FIX: `messageCacheLifetime` / `messageSweepInterval` are
+      // discord.js v12 fields and are silently ignored by v13 — they were
+      // doing nothing here. In v13, caching ceilings come from `makeCache`
+      // and active eviction comes from `sweepers`. Previously only
+      // Presence/Reaction/Thread/VoiceState/StageInstance were capped —
+      // MessageManager, ChannelManager, UserManager, and GuildMemberManager
+      // were fully unbounded, and every fetchMessage()/enterViaButton() call
+      // permanently grew those caches. This is the fix for the "RAM grows on
+      // every autojoin attempt" issue.
+      // -----------------------------------------------------------------
       const clientOptions: ClientOptions = {
-        messageCacheLifetime: 60,
-        messageSweepInterval: 300,
         restRequestTimeout: 15000,
         restGlobalRateLimit: 50,
         retryLimit: 3,
@@ -1806,7 +1915,35 @@ export class AutoJoinManager extends EventEmitter {
           ThreadManager: 0,
           VoiceStateManager: 0,
           StageInstanceManager: 0,
+          MessageManager: CLIENT_MESSAGE_CACHE_MAX_SIZE,
+          ChannelManager: {
+            maxSize: CLIENT_CHANNEL_CACHE_MAX_SIZE,
+            keepOverLimit: (channel: any) => channel.isDMBased?.() ?? false,
+          },
+          GuildMemberManager: {
+            maxSize: 1,
+            keepOverLimit: (member: any) => member.id === member.client?.user?.id,
+          },
+          UserManager: {
+            maxSize: 1,
+            keepOverLimit: (user: any) => user.id === user.client?.user?.id,
+          },
         }),
+        sweepers: {
+          ...(Options as any).defaultSweeperSettings,
+          messages: {
+            interval: CLIENT_MESSAGE_SWEEP_INTERVAL_SEC,
+            lifetime: CLIENT_MESSAGE_SWEEP_LIFETIME_SEC,
+          },
+          users: {
+            interval: CLIENT_MESSAGE_SWEEP_INTERVAL_SEC,
+            filter: () => (user: any) => user.id !== user.client?.user?.id,
+          },
+          guildMembers: {
+            interval: CLIENT_MESSAGE_SWEEP_INTERVAL_SEC,
+            filter: () => (member: any) => member.id !== member.client?.user?.id,
+          },
+        } as any,
       };
 
       const client = new Client(clientOptions);
@@ -1845,9 +1982,7 @@ export class AutoJoinManager extends EventEmitter {
           userId,
           sessionId: session.sessionId,
         });
-        try {
-          await client.destroy();
-        } catch {}
+        await this.destroyClientSafely(client);
         return false;
       }
 
@@ -1912,6 +2047,26 @@ export class AutoJoinManager extends EventEmitter {
     });
   }
 
+  /**
+   * NEW - memory fix helper.
+   * Awaits client.destroy() with a timeout guard so callers never block
+   * forever, but critically DO wait for destruction to actually begin
+   * completing before proceeding (e.g. before spinning up a replacement
+   * client on reconnect). Previously this was fire-and-forget
+   * (`try { destroy() } catch {}`), which could let two live Client
+   * instances (and their caches) coexist during rapid reconnect storms.
+   */
+  private async destroyClientSafely(client: Client): Promise<void> {
+    try {
+      await Promise.race([
+        (client as any).destroy(),
+        delay(CLIENT_DESTROY_TIMEOUT_MS),
+      ]);
+    } catch {
+      // Ignore — best effort
+    }
+  }
+
   // -------------------------------------------------------------------------
   // Heartbeat with reconnect
   // -------------------------------------------------------------------------
@@ -1947,14 +2102,14 @@ export class AutoJoinManager extends EventEmitter {
             oldSessionId: session.sessionId,
           });
           
-          try {
-            (session.client as any).destroy();
-          } catch {}
-          this.cleanupSessionListeners(session);
-          
           session.destroyed = true;
-          
-          this._startSessionInternal(session.userId, session.guildId)
+          this.cleanupSessionListeners(session);
+
+          // MEMORY FIX: await destruction (with timeout guard) before
+          // starting a replacement session, instead of fire-and-forget,
+          // so we never have two live Client instances/caches at once.
+          this.destroyClientSafely(session.client)
+            .then(() => this._startSessionInternal(session.userId, session.guildId))
             .then(success => {
               if (success) {
                 const newSession = this.sessionsByUserId.get(session.userId);
@@ -2032,9 +2187,7 @@ export class AutoJoinManager extends EventEmitter {
       
       this.cleanupSessionListeners(session);
       
-      try {
-        await (session.client as any).destroy();
-      } catch {}
+      await this.destroyClientSafely(session.client);
       
       this.sessions.delete(sessionKey);
       this.sessionsByUserId.delete(userId);
@@ -2252,7 +2405,7 @@ export class AutoJoinManager extends EventEmitter {
       this.refreshInterval, this.cleanupInterval, this.memoryCheckInterval,
       this.reconnectCheckInterval, this.cacheCleanInterval, this.metricsInterval,
       this.healthCheckInterval, this.queuePersistInterval, this.stallCheckInterval,
-      this.batchDbInterval, this.archiveInterval,
+      this.batchDbInterval, this.archiveInterval, this.clientCacheSweepInterval,
     ].forEach(interval => {
       if (interval) { clearInterval(interval); }
     });
@@ -2296,9 +2449,7 @@ export class AutoJoinManager extends EventEmitter {
       
       this.cleanupSessionListeners(session);
       
-      try {
-        await (session.client as any).destroy();
-      } catch {}
+      await this.destroyClientSafely(session.client);
       
       this.sessions.delete(this.makeSessionKey(session.userId));
       this.sessionsByUserId.delete(session.userId);
