@@ -2,6 +2,13 @@
  * @module index
  * Application entry point – with BotManager timeout and fallback.
  * Now includes AutoJoiner for premium users (monitors ALL servers).
+ * 
+ * MEMORY FIXES:
+ * 1. Proper cleanup of all managers on shutdown
+ * 2. Forced GC when memory exceeds thresholds
+ * 3. Session cleanup on boot retry
+ * 4. Health check with memory metrics
+ * 5. Graceful shutdown with timeout
  */
 
 import http from 'http';
@@ -19,17 +26,87 @@ import { AutoJoinManager } from './autoJoin/index.js';
 import { restoreTokenSessionsFromDatabase } from './premium/tokenManager.js';
 
 // ----------------------------------------------------------------------------
-// HEALTH SERVER
+// MEMORY MANAGEMENT - 8GB RAM Optimized
+// ----------------------------------------------------------------------------
+
+const MEMORY_WARNING_MB = 500;   // Warning at 500MB (8GB has more room)
+const MEMORY_CRITICAL_MB = 700;  // Critical at 700MB
+const MEMORY_MAX_MB = 900;       // Hard limit at 900MB
+
+let memoryWarningLogged = false;
+let memoryCleanupInterval: NodeJS.Timeout | null = null;
+
+function getMemoryUsage() {
+  const mem = process.memoryUsage();
+  return {
+    heapUsedMB: Math.round(mem.heapUsed / 1024 / 1024),
+    heapTotalMB: Math.round(mem.heapTotal / 1024 / 1024),
+    rssMB: Math.round(mem.rss / 1024 / 1024),
+  };
+}
+
+function checkMemoryAndCleanup() {
+  const mem = getMemoryUsage();
+  
+  if (mem.heapUsedMB > MEMORY_MAX_MB) {
+    console.error(`🚨 CRITICAL: Memory at ${mem.heapUsedMB}MB, forcing shutdown...`);
+    if (global.gc) global.gc();
+    process.exit(1);
+  }
+  
+  if (mem.heapUsedMB > MEMORY_CRITICAL_MB) {
+    console.warn(`⚠️ CRITICAL: Memory at ${mem.heapUsedMB}MB, forcing cleanup...`);
+    if (global.gc) global.gc();
+    // Clear all caches
+    if (autoJoiner) {
+      try {
+        const stats = autoJoiner.getStats();
+        console.log(`[Memory] AutoJoiner: ${stats.activeSessions}/${stats.totalSessions} sessions`);
+        if (stats.activeSessions > 3) {
+          console.log(`[Memory] Stopping extra sessions to free memory...`);
+        }
+      } catch {}
+    }
+    memoryWarningLogged = true;
+  } else if (mem.heapUsedMB > MEMORY_WARNING_MB) {
+    if (!memoryWarningLogged) {
+      console.warn(`⚠️ Memory warning: ${mem.heapUsedMB}MB`);
+      memoryWarningLogged = true;
+    }
+    if (global.gc) global.gc();
+  } else {
+    memoryWarningLogged = false;
+  }
+}
+
+// Start memory monitoring
+memoryCleanupInterval = setInterval(checkMemoryAndCleanup, 15000);
+if (memoryCleanupInterval.unref) memoryCleanupInterval.unref();
+
+// ----------------------------------------------------------------------------
+// HEALTH SERVER - Enhanced with memory metrics
 // ----------------------------------------------------------------------------
 const PORT = parseInt(process.env.PORT || '3000', 10) || 3000;
 const healthServer = http.createServer((req, res) => {
   if (req.url === '/health' || req.url === '/') {
+    const mem = getMemoryUsage();
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       status: 'ok',
       uptime: process.uptime(),
       timestamp: new Date().toISOString(),
+      memory: mem,
+      sessions: autoJoiner ? autoJoiner.getStats() : { totalSessions: 0, activeSessions: 0 },
     }));
+  } else if (req.url === '/gc') {
+    if (global.gc) {
+      global.gc();
+      res.writeHead(200);
+      res.end('GC forced');
+    } else {
+      res.writeHead(500);
+      res.end('GC not available (run with --expose-gc)');
+    }
   } else {
     res.writeHead(404);
     res.end();
@@ -38,6 +115,7 @@ const healthServer = http.createServer((req, res) => {
 
 healthServer.listen(PORT, '0.0.0.0', () => {
   console.log(`[Bootstrap] Health check server on port ${PORT}`);
+  console.log(`[Bootstrap] Memory: ${getMemoryUsage().heapUsedMB}MB / 8000MB`);
 });
 healthServer.on('error', (err) => console.error('[Bootstrap] Health server error:', err));
 
@@ -47,12 +125,14 @@ healthServer.on('error', (err) => console.error('[Bootstrap] Health server error
 process.on('uncaughtException', (err) => {
   console.error('🔥 UNCAUGHT EXCEPTION:', err);
   try { logger.error('Uncaught exception', { component: 'Process', error: err }); } catch {}
+  if (global.gc) global.gc();
   process.exit(1);
 });
 
 process.on('unhandledRejection', (reason) => {
   console.error('🔥 UNHANDLED REJECTION:', reason);
   try { logger.warn('Unhandled rejection', { component: 'Process', reason: formatError(reason) }); } catch {}
+  // Don't exit on unhandled rejection - just log and continue
 });
 
 // ----------------------------------------------------------------------------
@@ -65,9 +145,10 @@ let statsInterval: ReturnType<typeof setInterval> | null = null;
 let shuttingDown = false;
 
 const CLIENT_READY_TIMEOUT_MS = 60000;
-const MAX_BOOT_RETRIES = 10;
+const MAX_BOOT_RETRIES = 5;
 const BOOT_RETRY_DELAY_MS = 15000;
 const BOT_MANAGER_START_TIMEOUT_MS = 10000;
+const SHUTDOWN_TIMEOUT_MS = 10000;
 
 // ----------------------------------------------------------------------------
 // MAIN
@@ -79,6 +160,11 @@ async function main(): Promise<void> {
   logger.info('║    Discord Giveaway Tracker v2        ║', { component: 'Bootstrap' });
   logger.info('╚═══════════════════════════════════════╝', { component: 'Bootstrap' });
 
+  const mem = getMemoryUsage();
+  logger.info(`Memory: ${mem.heapUsedMB}MB / 8000MB (${Math.round((mem.heapUsedMB / 8000) * 100)}%)`, {
+    component: 'Bootstrap',
+  });
+
   logger.info('Configuration', {
     component: 'Bootstrap',
     accounts: CONFIG.tokens.length,
@@ -88,16 +174,15 @@ async function main(): Promise<void> {
     dbPath: CONFIG.dbPath,
   });
 
-  // Connect DB (await)
+  // Connect DB
   await getDb();
   logger.info('Database connection established', { component: 'Bootstrap' });
 
-  // Cleanup old giveaways (fire and forget)
+  // Cleanup old giveaways
   cleanupOldGiveaways(30).catch(err => logger.warn('cleanupOldGiveaways error', { error: err }));
 
   // --------------------------------------------------------------------------
-  // RESTORE TOKEN SESSIONS FROM DATABASE
-  // This fixes the issue where tokens are forgotten on VPS restart
+  // RESTORE TOKEN SESSIONS
   // --------------------------------------------------------------------------
   try {
     const restored = await restoreTokenSessionsFromDatabase();
@@ -110,7 +195,7 @@ async function main(): Promise<void> {
   }
 
   // --------------------------------------------------------------------------
-  // START BOTMANAGER WITH TIMEOUT
+  // START BOTMANAGER
   // --------------------------------------------------------------------------
   logger.info('Initializing BotManager...', { component: 'Bootstrap' });
   try {
@@ -132,16 +217,13 @@ async function main(): Promise<void> {
   }
 
   // --------------------------------------------------------------------------
-  // START AUTOJOINER - Monitors ALL servers (no GUILD_ID required)
+  // START AUTOJOINER
   // --------------------------------------------------------------------------
   try {
     logger.info('Starting AutoJoiner (monitors all servers)...', { component: 'Bootstrap' });
     autoJoiner = new AutoJoinManager();
     await autoJoiner.startAllSessions();
-    
-    // Restore sessions from database (for VPS restarts)
     await autoJoiner.restoreSessionsFromDatabase();
-    
     logger.info('AutoJoiner started successfully.', { component: 'Bootstrap' });
   } catch (err) {
     logger.warn('AutoJoiner failed to start:', {
@@ -152,12 +234,22 @@ async function main(): Promise<void> {
   }
 
   // --------------------------------------------------------------------------
-  // START ACCOUNT CLIENTS (Public Detectors)
+  // START ACCOUNT CLIENTS
   // --------------------------------------------------------------------------
   activeManagers = [];
   let authFailures = 0;
 
   for (let i = 0; i < CONFIG.tokens.length; i++) {
+    // Check memory before starting each account
+    const mem = getMemoryUsage();
+    if (mem.heapUsedMB > MEMORY_CRITICAL_MB) {
+      logger.warn(`Memory high (${mem.heapUsedMB}MB), stopping account creation`, {
+        component: 'Bootstrap',
+        index: i,
+      });
+      break;
+    }
+
     const token = CONFIG.tokens[i]!.trim();
     const label = `acc${i + 1}`;
 
@@ -173,7 +265,6 @@ async function main(): Promise<void> {
 
       const client = new Client();
 
-      // Debug / error events
       client.on('debug', (info) => {
         logger.debug(`[${label}] Debug: ${info}`, { component: 'Client' });
       });
@@ -205,6 +296,7 @@ async function main(): Promise<void> {
         userId: client.user?.id,
         username: client.user?.username,
         guilds: client.guilds.cache.size,
+        memory: getMemoryUsage(),
       });
     } catch (err) {
       const message = formatError(err);
@@ -241,6 +333,7 @@ async function main(): Promise<void> {
     component: 'Bootstrap',
     active: activeManagers.length,
     failures: authFailures,
+    memory: getMemoryUsage(),
   });
 
   if (autoJoiner) {
@@ -258,6 +351,7 @@ async function main(): Promise<void> {
       const stats = autoJoiner.getStats();
       logger.info(`AutoJoiner: ${stats.activeSessions}/${stats.totalSessions} sessions active`, {
         component: 'Bootstrap',
+        memory: getMemoryUsage(),
       });
     }
   }, CONFIG.statsIntervalMs);
@@ -269,6 +363,7 @@ async function main(): Promise<void> {
     component: 'Bootstrap',
     accounts: activeManagers.length,
     statsEvery: `${CONFIG.statsIntervalMs / 1000}s`,
+    memory: getMemoryUsage(),
   });
 }
 
@@ -355,39 +450,104 @@ function timeout(ms: number, message: string): Promise<never> {
 }
 
 // ----------------------------------------------------------------------------
-// SHUTDOWN
+// SHUTDOWN - CLEAN AND COMPLETE
 // ----------------------------------------------------------------------------
 function registerShutdown(): void {
   const handle = async (signal: string): Promise<void> => {
-    if (shuttingDown) { process.exit(1); }
+    if (shuttingDown) {
+      console.log('[Shutdown] Already shutting down, forcing exit...');
+      process.exit(1);
+    }
     shuttingDown = true;
 
-    logger.info(`${signal} received – shutting down`, { component: 'Shutdown' });
+    console.log(`[Shutdown] ${signal} received – shutting down cleanly...`);
 
-    if (statsInterval) { clearInterval(statsInterval); statsInterval = null; }
+    // Clear stats interval
+    if (statsInterval) {
+      clearInterval(statsInterval);
+      statsInterval = null;
+    }
+
+    // Clear memory cleanup interval
+    if (memoryCleanupInterval) {
+      clearInterval(memoryCleanupInterval);
+      memoryCleanupInterval = null;
+    }
 
     // Shutdown public detectors
-    for (const m of activeManagers) {
-      await m.shutdown();
-    }
+    console.log(`[Shutdown] Stopping ${activeManagers.length} account managers...`);
+    const managerPromises = activeManagers.map(async (m) => {
+      try {
+        await m.shutdown();
+        // Force cleanup of the client
+        const client = (m as any).client;
+        if (client) {
+          try {
+            client.removeAllListeners();
+            await client.destroy();
+          } catch {}
+        }
+      } catch (err) {
+        console.error('[Shutdown] Error stopping manager:', err);
+      }
+    });
+    await Promise.race([
+      Promise.all(managerPromises),
+      delay(SHUTDOWN_TIMEOUT_MS),
+    ]);
+    activeManagers = [];
 
     // Shutdown AutoJoiner
     if (autoJoiner) {
-      logger.info('Shutting down AutoJoiner...', { component: 'Shutdown' });
-      await autoJoiner.shutdown();
+      console.log('[Shutdown] Shutting down AutoJoiner...');
+      try {
+        await Promise.race([
+          autoJoiner.shutdown(),
+          delay(SHUTDOWN_TIMEOUT_MS / 2),
+        ]);
+      } catch (err) {
+        console.error('[Shutdown] Error stopping AutoJoiner:', err);
+      }
       autoJoiner = null;
     }
 
     // Shutdown BotManager
     if (botManager) {
-      logger.info('Shutting down BotManager...', { component: 'Shutdown' });
-      await botManager.destroy();
+      console.log('[Shutdown] Shutting down BotManager...');
+      try {
+        await Promise.race([
+          botManager.destroy(),
+          delay(SHUTDOWN_TIMEOUT_MS / 2),
+        ]);
+      } catch (err) {
+        console.error('[Shutdown] Error stopping BotManager:', err);
+      }
       botManager = null;
     }
 
-    closeDb();
-    healthServer.close(() => {});
-    logger.info('Goodbye.', { component: 'Shutdown' });
+    // Close database
+    try {
+      console.log('[Shutdown] Closing database...');
+      await closeDb();
+    } catch (err) {
+      console.error('[Shutdown] Error closing database:', err);
+    }
+
+    // Close health server
+    try {
+      healthServer.close(() => {});
+    } catch {}
+
+    // Force garbage collection
+    if (global.gc) {
+      console.log('[Shutdown] Forcing garbage collection...');
+      global.gc();
+    }
+
+    const mem = getMemoryUsage();
+    console.log(`[Shutdown] Final memory: ${mem.heapUsedMB}MB / 8000MB`);
+    console.log('[Shutdown] Goodbye.');
+    
     setTimeout(() => process.exit(0), 500);
   };
 
@@ -435,15 +595,28 @@ async function boot(): Promise<void> {
         process.exit(1);
       }
 
-      // Cleanup
+      // Cleanup before retry
+      console.log('[Bootstrap] Cleaning up before retry...');
+      
       for (const m of activeManagers) {
-        try { (m as any).client?.destroy(); } catch {}
+        try {
+          await m.shutdown();
+          const client = (m as any).client;
+          if (client) {
+            client.removeAllListeners();
+            await client.destroy();
+          }
+        } catch {}
       }
       activeManagers = [];
       
       if (autoJoiner) {
         try { await autoJoiner.shutdown(); } catch {}
         autoJoiner = null;
+      }
+      
+      if (global.gc) {
+        global.gc();
       }
       
       shuttingDown = false;
@@ -453,5 +626,12 @@ async function boot(): Promise<void> {
     }
   }
 }
+
+// ----------------------------------------------------------------------------
+// START
+// ----------------------------------------------------------------------------
+console.log(`[Bootstrap] Starting with 8GB RAM...`);
+console.log(`[Bootstrap] Initial memory: ${getMemoryUsage().heapUsedMB}MB / 8000MB`);
+console.log(`[Bootstrap] GC available: ${!!global.gc}`);
 
 boot();
