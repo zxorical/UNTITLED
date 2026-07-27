@@ -3,21 +3,22 @@
  * Reliable giveaway detector — scans everything, misses nothing.
  * 
  * FIXES APPLIED:
- * 1. parsedMessageCache with TTL and size limits (replaced WeakMap)
- * 2. Proper cleanup of cached entries
- * 3. Memory-efficient caching with LRU behavior
- * 4. Reduced log spam with sampling
- * 5. Fixed memory leak in message processing
- * 6. Added cache size limits
- * 7. Periodic cache cleanup
- * 8. Optimized watchlist matching
+ * 1. Added AppLogger type import
+ * 2. parsedMessageCache with TTL and size limits (replaced WeakMap)
+ * 3. Proper cleanup of cached entries
+ * 4. Memory-efficient caching with LRU behavior
+ * 5. Reduced log spam with sampling
+ * 6. Fixed memory leak in message processing
+ * 7. Added cache size limits
+ * 8. Periodic cache cleanup
+ * 9. Optimized watchlist matching
  */
 
 import { Client, Message, TextChannel } from 'discord.js-selfbot-v13';
 import { EventEmitter } from 'events';
 import { CONFIG } from './config.js';
-import { logger } from './logger.js';  // ✅ ADD THIS
-import { delay, formatError } from './utils.js';  // ✅ ADD THIS
+import { logger, AppLogger } from './logger.js';  // ✅ ADDED AppLogger
+import { delay, formatError } from './utils.js';
 import { GiveawayData } from './types.js';
 import {
   insertGiveaway,
