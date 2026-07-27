@@ -77,11 +77,19 @@ interface AutoJoinEntry {
   buttonCustomId?: string;
   detectedAt: number;
   endsAt?: number;
-  status: 'pending' | 'attempting' | 'success' | 'failed' | 'skipped';
+  status: 'pending' | 'queued' | 'attempting' | 'success' | 'failed' | 'skipped' | 'dead_letter';
   attempts: number;
   lastAttemptAt?: number;
   lastError?: string;
   expiresAt: number; // For TTL index
+  correlationId?: string;
+  detectionConfidence?: number;
+  detectionReasons?: string[];
+  crosspostSource?: string;
+  queuePosition?: number;
+  entryTimeMs?: number;
+  archived?: boolean;
+  archivedAt?: number;
 }
 
 const MONGO_URI = process.env.MONGO_URI;
@@ -953,7 +961,7 @@ export async function updateAutoJoinEntryStatus(
   userId: string,
   messageId: string,
   channelId: string,
-  status: 'pending' | 'attempting' | 'success' | 'failed' | 'skipped',
+  status: 'pending' | 'queued' | 'attempting' | 'success' | 'failed' | 'skipped' | 'dead_letter',
   updates?: Partial<Omit<AutoJoinEntry, '_id' | 'userId' | 'messageId' | 'channelId'>>
 ): Promise<void> {
   await ensureConnected();
@@ -991,6 +999,183 @@ export async function getPendingAutoJoinEntries(userId: string): Promise<AutoJoi
     userId,
     status: { $in: ['pending', 'attempting'] }
   }).toArray();
+}
+
+// ---------------------------------------------------------------------------
+// Batch Operations for AutoJoiner
+// ---------------------------------------------------------------------------
+
+export async function batchSaveJoinOutcomes(outcomes: any[]): Promise<void> {
+  await ensureConnected();
+  if (!outcomes || outcomes.length === 0) return;
+  
+  try {
+    const bulkOps = outcomes.map(outcome => ({
+      updateOne: {
+        filter: { 
+          _id: `${outcome.userId}:${outcome.channelId}:${outcome.messageId}` 
+        },
+        update: { 
+          $set: { 
+            status: outcome.status,
+            attempts: outcome.attempts,
+            entryTimeMs: outcome.entryTimeMs,
+            lastAttemptAt: Date.now(),
+          } 
+        },
+        upsert: false,
+      }
+    }));
+    
+    await autoJoinEntriesCol.bulkWrite(bulkOps, { ordered: false });
+  } catch (err) {
+    logger.error('batchSaveJoinOutcomes error', { error: String(err) });
+  }
+}
+
+export async function batchUpdateDetectionConfidence(updates: any[]): Promise<void> {
+  await ensureConnected();
+  if (!updates || updates.length === 0) return;
+  
+  try {
+    const bulkOps = updates.map(update => ({
+      updateOne: {
+        filter: { 
+          messageId: update.messageId, 
+          channelId: update.channelId 
+        },
+        update: { 
+          $set: { 
+            detectionConfidence: update.confidence,
+            detectionReasons: update.reasons,
+          } 
+        },
+      }
+    }));
+    
+    await autoJoinEntriesCol.bulkWrite(bulkOps, { ordered: false });
+  } catch (err) {
+    logger.error('batchUpdateDetectionConfidence error', { error: String(err) });
+  }
+}
+
+export async function archiveOldGiveaways(ageMs: number): Promise<number> {
+  await ensureConnected();
+  
+  try {
+    const cutoff = Date.now() - ageMs;
+    const result = await autoJoinEntriesCol.updateMany(
+      { 
+        detectedAt: { $lt: cutoff },
+        status: { $in: ['success', 'failed', 'skipped', 'dead_letter'] },
+        archived: { $ne: true }
+      },
+      { 
+        $set: { 
+          archived: true, 
+          archivedAt: Date.now() 
+        } 
+      }
+    );
+    return result.modifiedCount || 0;
+  } catch (err) {
+    logger.error('archiveOldGiveaways error', { error: String(err) });
+    return 0;
+  }
+}
+
+export async function saveWatchlistMatch(
+  userId: string, 
+  keyword: string, 
+  messageId: string, 
+  channelId: string
+): Promise<void> {
+  await ensureConnected();
+  
+  try {
+    const watchlistMatchesCol = db.collection('watchlist_matches');
+    await watchlistMatchesCol.insertOne({
+      userId,
+      keyword,
+      messageId,
+      channelId,
+      matchedAt: Date.now(),
+    });
+  } catch (err) {
+    logger.error('saveWatchlistMatch error', { error: String(err) });
+  }
+}
+
+export async function getWatchlistKeywords(userId: string): Promise<any[]> {
+  await ensureConnected();
+  
+  try {
+    const doc = await watchlistCol.findOne({ userId });
+    if (!doc || !doc.items) return [];
+    
+    return doc.items.map((keyword: string) => ({
+      keyword,
+      aliases: [],
+      matchCount: 0,
+      lastMatched: 0,
+    }));
+  } catch (err) {
+    logger.error('getWatchlistKeywords error', { error: String(err) });
+    return [];
+  }
+}
+
+export async function getDetectionProfiles(): Promise<any[]> {
+  await ensureConnected();
+  
+  try {
+    const detectionProfilesCol = db.collection('detection_profiles');
+    return await detectionProfilesCol.find({}).toArray();
+  } catch (err) {
+    logger.error('getDetectionProfiles error', { error: String(err) });
+    return [];
+  }
+}
+
+export async function updateDetectionProfile(profile: any): Promise<void> {
+  await ensureConnected();
+  
+  try {
+    const detectionProfilesCol = db.collection('detection_profiles');
+    await detectionProfilesCol.updateOne(
+      { botId: profile.botId },
+      { $set: profile },
+      { upsert: true }
+    );
+  } catch (err) {
+    logger.error('updateDetectionProfile error', { error: String(err) });
+  }
+}
+
+export async function saveQueueState(items: any[]): Promise<void> {
+  await ensureConnected();
+  
+  try {
+    const queueStateCol = db.collection('queue_state');
+    await queueStateCol.deleteMany({});
+    if (items.length > 0) {
+      await queueStateCol.insertMany(items);
+    }
+  } catch (err) {
+    logger.error('saveQueueState error', { error: String(err) });
+  }
+}
+
+export async function loadQueueState(): Promise<any[]> {
+  await ensureConnected();
+  
+  try {
+    const queueStateCol = db.collection('queue_state');
+    return await queueStateCol.find({}).toArray();
+  } catch (err) {
+    logger.error('loadQueueState error', { error: String(err) });
+    return [];
+  }
 }
 
 // ---------------------------------------------------------------------------
