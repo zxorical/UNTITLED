@@ -13,6 +13,7 @@
  * 7. Webhook support
  * 8. Comprehensive stats
  * 9. Proper cleanup on shutdown
+ * 10. ✅ FIX: Decrypt tokens before login
  */
 
 import { Client, Message, TextChannel } from 'discord.js-selfbot-v13';
@@ -20,6 +21,7 @@ import { EventEmitter } from 'events';
 import { logger } from '../logger.js';
 import { CONFIG } from '../config.js';
 import { delay, formatError } from '../utils.js';
+import { decryptToken } from '../premium/tokenManager.js';  // ✅ ADD THIS
 import {
   getAllPremiumUsersAllGuilds,
   getPremiumUser,
@@ -55,7 +57,7 @@ interface AutoJoinSession {
   userId: string;
   guildId: string;
   client: Client;
-  token: string;
+  token: string;  // Encrypted token stored for reference
   label: string;
   isActive: boolean;
   startedAt: number;
@@ -138,8 +140,20 @@ export class AutoJoinManager extends EventEmitter {
       let started = 0;
       let failed = 0;
       
+      // ✅ Add debug logging
+      logger.info(`Found ${premiumUsers.length} premium users, checking for tokens...`, {
+        component: 'AutoJoinManager'
+      });
+      
       for (const user of premiumUsers) {
         if (user.token && user.tokenActive !== false) {
+          logger.debug(`Attempting to start session for user ${user.userId}`, {
+            component: 'AutoJoinManager',
+            userId: user.userId,
+            hasToken: !!user.token,
+            tokenActive: user.tokenActive
+          });
+          
           const success = await this.startSession(user.userId, user.guildId);
           if (success) {
             started++;
@@ -177,6 +191,31 @@ export class AutoJoinManager extends EventEmitter {
       // Get user's token from database
       const user = await getPremiumUser(userId, guildId);
       if (!user || !user.token || user.tokenActive === false) {
+        logger.debug(`User ${userId} has no valid token`, {
+          component: 'AutoJoinManager',
+          userId,
+          hasToken: !!user?.token,
+          tokenActive: user?.tokenActive
+        });
+        return false;
+      }
+
+      // ✅ FIX: Decrypt the token before using it
+      let decryptedToken: string;
+      try {
+        decryptedToken = decryptToken(user.token);
+        logger.debug(`Token decrypted successfully for user ${userId}`, {
+          component: 'AutoJoinManager',
+          userId,
+          tokenLength: decryptedToken.length
+        });
+      } catch (error) {
+        logger.error(`Failed to decrypt token for user ${userId}`, {
+          component: 'AutoJoinManager',
+          userId,
+          error: formatError(error)
+        });
+        await setTokenActive(userId, guildId, false);
         return false;
       }
 
@@ -190,7 +229,6 @@ export class AutoJoinManager extends EventEmitter {
           userId,
           guildId
         });
-        // Update session active status
         const session = this.sessions.get(sessionKey);
         if (session) {
           session.isActive = true;
@@ -227,15 +265,15 @@ export class AutoJoinManager extends EventEmitter {
         });
       });
 
-      // Login
-      await client.login(user.token);
+      // ✅ FIX: Login with DECRYPTED token
+      await client.login(decryptedToken);
 
       // Register session
       const session: AutoJoinSession = {
         userId,
         guildId,
         client,
-        token: user.token,
+        token: user.token,  // Store encrypted token for reference
         label: user.tokenLabel || 'main',
         isActive: true,
         startedAt: Date.now(),
@@ -250,11 +288,15 @@ export class AutoJoinManager extends EventEmitter {
 
       this.sessions.set(sessionKey, session);
       
+      // ✅ Mark token as active
+      await setTokenActive(userId, guildId, true);
+      
       logger.info(`AutoJoin session started`, {
         component: 'AutoJoinManager',
         userId,
         guildId,
-        label: session.label
+        label: session.label,
+        username: client.user?.username
       });
 
       return true;
@@ -265,6 +307,7 @@ export class AutoJoinManager extends EventEmitter {
         guildId,
         error: formatError(error)
       });
+      await setTokenActive(userId, guildId, false);
       return false;
     }
   }
@@ -459,7 +502,6 @@ export class AutoJoinManager extends EventEmitter {
   private async processEntry(entry: GiveawayToJoin): Promise<{ success: boolean; error?: string }> {
     const { userId, guildId, messageId, channelId, prize } = entry;
     
-    // ✅ FIX: Validate required fields
     if (!userId || !guildId || !messageId || !channelId) {
       logger.warn('processEntry called with missing required fields', { userId, guildId, messageId, channelId });
       return { success: false, error: 'Missing required fields' };
