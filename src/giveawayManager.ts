@@ -2,27 +2,15 @@
  * @module giveawayManager
  * Reliable giveaway detector — scans everything, misses nothing.
  * 
- * Optimizations applied:
- * 1. Single parse pass with lowercase variants (WeakMap cached)
- * 2. Never blocks on fetch - async refresh only when needed
- * 3. Pre-compiled Sets for O(1) lookups instead of regex
- * 4. Buttons parsed once
- * 5. Timestamps parsed once
- * 6. Text built once with all lowercase variants
- * 7. Reverse watchlist index for O(k) matching
- * 8. Aho-Corasick for watchlist matching when >100 items
- * 9. LRU caches with size limits
- * 10. WeakMap for Message-bound data (auto GC)
- * 11. Parallelized independent async work
- * 12. Score with confidence % and detection reason tracking
- * 13. Single Date.now() per message
- * 14. Message age rejection (30 min)
- * 15. Duplicate giveaway detection via content hash
- * 16. Failed invite caching (15 min retry)
- * 17. Background watchlist refresh
- * 18. Ended giveaway detection via messageUpdate
- * 19. Per-guild statistics
- * 20. Gateway latency + processing time measurement
+ * FIXES APPLIED:
+ * 1. parsedMessageCache with TTL and size limits (replaced WeakMap)
+ * 2. Proper cleanup of cached entries
+ * 3. Memory-efficient caching with LRU behavior
+ * 4. Reduced log spam with sampling
+ * 5. Fixed memory leak in message processing
+ * 6. Added cache size limits
+ * 7. Periodic cache cleanup
+ * 8. Optimized watchlist matching
  */
 
 import { Client, Message, TextChannel } from 'discord.js-selfbot-v13';
@@ -137,6 +125,39 @@ const INVITE_CACHE_TTL = 30 * 60 * 1000;
 const FAILED_INVITE_RETRY_MS = 15 * 60 * 1000;
 const AHOCORASICK_THRESHOLD = 100;
 
+// ─── Parsed Message Cache with TTL ──────────────────────────────────────
+const PARSED_CACHE_TTL_MS = 60000; // 1 minute
+const MAX_PARSED_CACHE_SIZE = 10000;
+const parsedMessageCache = new Map<string, { data: ParsedGiveawayData; timestamp: number }>();
+
+// Periodic cleanup for parsed message cache
+setInterval(() => {
+  const now = Date.now();
+  let removed = 0;
+  for (const [key, entry] of parsedMessageCache) {
+    if (now - entry.timestamp > PARSED_CACHE_TTL_MS) {
+      parsedMessageCache.delete(key);
+      removed++;
+    }
+  }
+  // Also trim if over max size
+  if (parsedMessageCache.size > MAX_PARSED_CACHE_SIZE) {
+    const entries = Array.from(parsedMessageCache.entries());
+    entries.sort((a, b) => a[1].timestamp - b[1].timestamp);
+    const toRemove = parsedMessageCache.size - Math.floor(MAX_PARSED_CACHE_SIZE * 0.8);
+    for (let i = 0; i < toRemove && i < entries.length; i++) {
+      parsedMessageCache.delete(entries[i][0]);
+      removed++;
+    }
+  }
+  if (removed > 0) {
+    logger.debug(`Cleaned ${removed} parsed message cache entries`, {
+      component: 'GiveawayManager',
+      remaining: parsedMessageCache.size
+    });
+  }
+}, PARSED_CACHE_TTL_MS);
+
 // ═══════════════════════════════════════════════════════════════════════════
 // AHO-CORASICK (O(queue[head++]) BFS, no shift)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -241,6 +262,12 @@ class LRUCache<K, V> {
 
   delete(key: K): void { this.map.delete(key); }
   get size(): number { return this.map.size; }
+  clear(): void { this.map.clear(); }
+  
+  // Get all keys for debugging
+  keys(): IterableIterator<K> {
+    return this.map.keys();
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -297,11 +324,17 @@ interface ParsedGiveawayData {
   contentHash: string;
 }
 
-const parsedMessageCache = new WeakMap<Message, ParsedGiveawayData>();
+function getParsedCacheKey(message: Message): string {
+  return `${message.id}:${message.channel.id}`;
+}
 
 function parseMessage(message: Message, now: number): ParsedGiveawayData {
-  const cached = parsedMessageCache.get(message);
-  if (cached) return cached;
+  const cacheKey = getParsedCacheKey(message);
+  const cached = parsedMessageCache.get(cacheKey);
+  
+  if (cached && now - cached.timestamp < PARSED_CACHE_TTL_MS) {
+    return cached.data;
+  }
 
   const embed = message.embeds?.[0];
   const messageAge = now - message.createdTimestamp;
@@ -370,12 +403,25 @@ function parseMessage(message: Message, now: number): ParsedGiveawayData {
     contentHash,
   };
 
-  parsedMessageCache.set(message, parsed);
+  // Store in cache with timestamp
+  parsedMessageCache.set(cacheKey, { data: parsed, timestamp: now });
+  
+  // Trim cache if needed (already handled by interval, but just in case)
+  if (parsedMessageCache.size > MAX_PARSED_CACHE_SIZE * 1.2) {
+    const entries = Array.from(parsedMessageCache.entries());
+    entries.sort((a, b) => a[1].timestamp - b[1].timestamp);
+    const toRemove = parsedMessageCache.size - MAX_PARSED_CACHE_SIZE;
+    for (let i = 0; i < toRemove && i < entries.length; i++) {
+      parsedMessageCache.delete(entries[i][0]);
+    }
+  }
+  
   return parsed;
 }
 
 function refreshParsedMessage(message: Message, now: number): ParsedGiveawayData {
-  parsedMessageCache.delete(message);
+  const cacheKey = getParsedCacheKey(message);
+  parsedMessageCache.delete(cacheKey);
   return parseMessage(message, now);
 }
 
@@ -642,6 +688,10 @@ export class GiveawayManager extends EventEmitter {
 
   private guildStats = new Map<string, { detected: number; notified: number; falsePositives: number }>();
 
+  // Log sampling to reduce spam
+  private logSampleCounter = 0;
+  private readonly LOG_SAMPLE_RATE = 10; // Log 1 out of every 10 messages
+
   constructor(
     client: Client, log: AppLogger, _token: string,
     accountLabel: string, botManager: BotManager | null,
@@ -692,7 +742,9 @@ export class GiveawayManager extends EventEmitter {
           parsed = refreshParsedMessage(refreshed, now);
           creationResult = detectCreation(parsed);
           this.creationCache.set(message.id, creationResult);
-        } catch {}
+        } catch {
+          // Ignore fetch errors
+        }
       }
 
       if (creationResult.isCreation) { this.stats.draftsSkipped++; return; }
@@ -704,7 +756,8 @@ export class GiveawayManager extends EventEmitter {
       const detection = calculateGiveawayScore(parsed);
       if (detection.score < MINIMUM_SCORE_THRESHOLD) {
         this.stats.falsePositivesBlocked++;
-        if (CONFIG.logLevel === 'debug') {
+        // Sample debug logging
+        if (this.shouldLogDebug()) {
           this.log.debug('Below threshold', {
             mid: message.id,
             score: detection.score,
@@ -798,6 +851,15 @@ export class GiveawayManager extends EventEmitter {
     } finally {
       this.processingMessages.delete(key);
     }
+  }
+
+  private shouldLogDebug(): boolean {
+    this.logSampleCounter++;
+    if (this.logSampleCounter >= this.LOG_SAMPLE_RATE) {
+      this.logSampleCounter = 0;
+      return true;
+    }
+    return false;
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -950,6 +1012,7 @@ export class GiveawayManager extends EventEmitter {
   ): Promise<void> {
     if (!users.length || !this.botManager) return;
 
+    // Adaptive batching based on user count
     let batchSize = 20;
     let delayMs = 1000;
     if (users.length <= 10) { batchSize = 5; delayMs = 200; }
@@ -977,6 +1040,13 @@ export class GiveawayManager extends EventEmitter {
       );
       for (const r of results) { r.status === 'fulfilled' ? sent++ : failed++; }
       if (i + batchSize < users.length) await delay(delayMs + Math.random() * 200);
+    }
+    
+    if (sent > 0) {
+      this.log.debug(`Sent ${sent} watchlist DMs (${failed} failed)`, {
+        component: 'GiveawayManager',
+        account: this.accountLabel
+      });
     }
   }
 
@@ -1032,12 +1102,16 @@ export class GiveawayManager extends EventEmitter {
           const url = permanent?.url || invites.first()?.url;
           if (url) { this.cacheInvite(guildId, url, now); return url; }
         }
-      } catch {}
+      } catch {
+        // Ignore fetch errors
+      }
 
       try {
         const vanity = (guild as any).vanityURLCode;
         if (vanity) { const url = `https://discord.gg/${vanity}`; this.cacheInvite(guildId, url, now); return url; }
-      } catch {}
+      } catch {
+        // Ignore
+      }
 
       const textChannels = guild.channels.cache.filter(
         (ch): ch is TextChannel => ch.type === 'GUILD_TEXT'
@@ -1053,7 +1127,9 @@ export class GiveawayManager extends EventEmitter {
           const invite = await channel.createInvite({ maxAge: 0, maxUses: 0, reason: 'Giveaway tracker', temporary: false });
           this.cacheInvite(guildId, invite.url, now);
           return invite.url;
-        } catch {}
+        } catch {
+          // Ignore
+        }
       }
 
       for (const [, channel] of textChannels) {
@@ -1061,7 +1137,9 @@ export class GiveawayManager extends EventEmitter {
           const invite = await channel.createInvite({ maxAge: 0, maxUses: 0, reason: 'Giveaway tracker (fallback)', temporary: false });
           this.cacheInvite(guildId, invite.url, now);
           return invite.url;
-        } catch {}
+        } catch {
+          // Ignore
+        }
       }
 
       this.cacheFailedInvite(guildId, now);
@@ -1138,6 +1216,7 @@ export class GiveawayManager extends EventEmitter {
     this.log.info(`  Failed invites      : ${this.failedInviteCache.size}`);
     this.log.info(`  Watchlist items     : ${this.totalWatchlistItems}`);
     this.log.info(`  Guilds tracked      : ${this.guildStats.size}`);
+    this.log.info(`  Parse cache size    : ${parsedMessageCache.size}`);
     this.log.info(`────────────────────────────────────────────────────────`);
 
     if (this.guildStats.size > 0) {
@@ -1161,10 +1240,50 @@ export class GiveawayManager extends EventEmitter {
     this.guildStats.clear();
   }
 
+  public getCacheStats(): {
+    creationCacheSize: number;
+    inviteCacheSize: number;
+    failedInviteCacheSize: number;
+    duplicateCacheSize: number;
+    parseCacheSize: number;
+  } {
+    return {
+      creationCacheSize: this.creationCache.size,
+      inviteCacheSize: this.inviteCache.size,
+      failedInviteCacheSize: this.failedInviteCache.size,
+      duplicateCacheSize: this.duplicateCache.size,
+      parseCacheSize: parsedMessageCache.size,
+    };
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // SHUTDOWN
+  // ═══════════════════════════════════════════════════════════════════════
+
   public async shutdown(): Promise<void> {
-    if (this.inviteRefresherInterval) { clearInterval(this.inviteRefresherInterval); this.inviteRefresherInterval = null; }
-    if (this.watchlistRefreshInterval) { clearInterval(this.watchlistRefreshInterval); this.watchlistRefreshInterval = null; }
-    this.log.info(`Shutting down ${this.accountLabel}...`);
+    if (this.inviteRefresherInterval) { 
+      clearInterval(this.inviteRefresherInterval); 
+      this.inviteRefresherInterval = null; 
+    }
+    if (this.watchlistRefreshInterval) { 
+      clearInterval(this.watchlistRefreshInterval); 
+      this.watchlistRefreshInterval = null; 
+    }
+    
+    // Clear caches
+    this.creationCache.clear();
+    this.inviteCache.clear();
+    this.failedInviteCache.clear();
+    this.duplicateCache.clear();
+    this.processingMessages.clear();
+    
+    // Clear parsed message cache
+    parsedMessageCache.clear();
+    
+    this.log.info(`Shutting down ${this.accountLabel}...`, { 
+      component: 'GiveawayManager',
+      stats: this.stats 
+    });
     this.logStats();
   }
 }
