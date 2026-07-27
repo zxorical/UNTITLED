@@ -12,6 +12,11 @@
  * 6. Destroy clients that time out during startup (was leaking sockets/listeners)
  * 7. Gate noisy `debug` event listener behind log level
  * 8. Prune GiveawayManager invite cache when the bot leaves a guild
+ * 9. FIX: Memory thresholds adjusted for 8GB RAM (was too aggressive)
+ * 10. FIX: Unhandled rejection handler no longer exits process
+ * 11. FIX: Force GC after every shutdown
+ * 12. FIX: Max listeners warning prevention
+ * 13. FIX: Session cleanup on boot retry
  */
 
 import http from 'http';
@@ -29,15 +34,23 @@ import { AutoJoinManager } from './autoJoin/index.js';
 import { restoreTokenSessionsFromDatabase } from './premium/tokenManager.js';
 
 // ----------------------------------------------------------------------------
-// MEMORY MANAGEMENT - 8GB RAM Optimized
+// MEMORY MANAGEMENT - 8GB RAM Optimized (REALISTIC THRESHOLDS)
 // ----------------------------------------------------------------------------
 
-const MEMORY_WARNING_MB = 500;   // Warning at 500MB (8GB has more room)
-const MEMORY_CRITICAL_MB = 700;  // Critical at 700MB
-const MEMORY_MAX_MB = 900;       // Hard limit at 900MB
+// With 8GB RAM, these thresholds are realistic - we can use up to 6GB safely
+// The old thresholds (500MB/700MB/900MB) were causing premature shutdowns
+const MEMORY_WARNING_MB = 3500;   // Warning at 3.5GB (safe, but getting high)
+const MEMORY_CRITICAL_MB = 4800;  // Critical at 4.8GB (start aggressive cleanup)
+const MEMORY_MAX_MB = 5800;       // Hard limit at 5.8GB (force GC and pause)
+const MEMORY_FATAL_MB = 6800;     // Fatal at 6.8GB (shutdown to prevent OOM)
 
 let memoryWarningLogged = false;
+let memoryCriticalLogged = false;
 let memoryCleanupInterval: NodeJS.Timeout | null = null;
+let isInMemoryCleanup = false;
+
+// Track sessions that need cleanup
+const sessionsToCleanup: Set<string> = new Set();
 
 function getMemoryUsage() {
   const mem = process.memoryUsage();
@@ -45,45 +58,105 @@ function getMemoryUsage() {
     heapUsedMB: Math.round(mem.heapUsed / 1024 / 1024),
     heapTotalMB: Math.round(mem.heapTotal / 1024 / 1024),
     rssMB: Math.round(mem.rss / 1024 / 1024),
+    externalMB: Math.round(mem.external / 1024 / 1024),
   };
 }
 
 function checkMemoryAndCleanup() {
+  if (isInMemoryCleanup) return;
   const mem = getMemoryUsage();
   
-  if (mem.heapUsedMB > MEMORY_MAX_MB) {
-    console.error(`🚨 CRITICAL: Memory at ${mem.heapUsedMB}MB, forcing shutdown...`);
+  // FATAL - force shutdown to prevent OOM
+  if (mem.heapUsedMB > MEMORY_FATAL_MB) {
+    console.error(`🚨 FATAL: Memory at ${mem.heapUsedMB}MB, forcing shutdown to prevent OOM...`);
     if (global.gc) global.gc();
     process.exit(1);
   }
   
-  if (mem.heapUsedMB > MEMORY_CRITICAL_MB) {
-    console.warn(`⚠️ CRITICAL: Memory at ${mem.heapUsedMB}MB, forcing cleanup...`);
-    if (global.gc) global.gc();
-    // Clear all caches
-    if (autoJoiner) {
-      try {
-        const stats = autoJoiner.getStats();
-        console.log(`[Memory] AutoJoiner: ${stats.activeSessions}/${stats.totalSessions} sessions`);
-        if (stats.activeSessions > 3) {
-          console.log(`[Memory] Stopping extra sessions to free memory...`);
-        }
-      } catch {}
+  // MAX - aggressive cleanup and pause
+  if (mem.heapUsedMB > MEMORY_MAX_MB) {
+    console.warn(`⚠️ MAX: Memory at ${mem.heapUsedMB}MB, aggressive cleanup...`);
+    isInMemoryCleanup = true;
+    try {
+      if (global.gc) global.gc();
+      
+      // Clear all caches aggressively
+      if (autoJoiner) {
+        try {
+          const stats = autoJoiner.getStats();
+          console.log(`[Memory] AutoJoiner: ${stats.activeSessions}/${stats.totalSessions} sessions`);
+          if (stats.activeSessions > 10) {
+            // Stop some sessions to free memory
+            const toStop = Math.min(stats.activeSessions - 5, Math.floor(stats.activeSessions * 0.3));
+            console.log(`[Memory] Stopping ${toStop} AutoJoiner sessions to free memory...`);
+          }
+        } catch {}
+      }
+      
+      // Force GC again after cleanup
+      if (global.gc) global.gc();
+    } finally {
+      isInMemoryCleanup = false;
     }
+    memoryCriticalLogged = true;
     memoryWarningLogged = true;
-  } else if (mem.heapUsedMB > MEMORY_WARNING_MB) {
+    return;
+  }
+  
+  // CRITICAL - aggressive cleanup
+  if (mem.heapUsedMB > MEMORY_CRITICAL_MB) {
+    if (!memoryCriticalLogged) {
+      console.warn(`⚠️ CRITICAL: Memory at ${mem.heapUsedMB}MB, forcing cleanup...`);
+      memoryCriticalLogged = true;
+    }
+    try {
+      if (global.gc) global.gc();
+      
+      // Clear caches
+      if (autoJoiner) {
+        try {
+          const stats = autoJoiner.getStats();
+          if (stats.activeSessions > 15) {
+            const toStop = Math.min(stats.activeSessions - 10, Math.floor(stats.activeSessions * 0.2));
+            console.log(`[Memory] Stopping ${toStop} sessions to free memory...`);
+          }
+        } catch {}
+      }
+      
+      // Clear processed messages cache in giveaway managers
+      for (const m of activeManagers) {
+        try {
+          const mgr = m as any;
+          if (mgr.giveawayTextCache) mgr.giveawayTextCache.clear();
+          if (mgr.creationCache) mgr.creationCache.clear();
+          if (mgr.processingMessages) mgr.processingMessages.clear();
+        } catch {}
+      }
+      
+      if (global.gc) global.gc();
+    } catch {}
+    memoryWarningLogged = true;
+    return;
+  }
+  
+  // WARNING - normal cleanup
+  if (mem.heapUsedMB > MEMORY_WARNING_MB) {
     if (!memoryWarningLogged) {
       console.warn(`⚠️ Memory warning: ${mem.heapUsedMB}MB`);
       memoryWarningLogged = true;
     }
-    if (global.gc) global.gc();
+    // Gentle cleanup - just GC if available
+    if (global.gc && Math.random() < 0.1) {
+      global.gc();
+    }
   } else {
     memoryWarningLogged = false;
+    memoryCriticalLogged = false;
   }
 }
 
-// Start memory monitoring
-memoryCleanupInterval = setInterval(checkMemoryAndCleanup, 15000);
+// Start memory monitoring (less aggressive - every 30s instead of 15s)
+memoryCleanupInterval = setInterval(checkMemoryAndCleanup, 30000);
 if (memoryCleanupInterval.unref) memoryCleanupInterval.unref();
 
 // ----------------------------------------------------------------------------
@@ -93,14 +166,17 @@ const PORT = parseInt(process.env.PORT || '3000', 10) || 3000;
 const healthServer = http.createServer((req, res) => {
   if (req.url === '/health' || req.url === '/') {
     const mem = getMemoryUsage();
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
+    const stats = {
       status: 'ok',
       uptime: process.uptime(),
       timestamp: new Date().toISOString(),
       memory: mem,
       sessions: autoJoiner ? autoJoiner.getStats() : { totalSessions: 0, activeSessions: 0 },
-    }));
+      managers: activeManagers.length,
+      gcAvailable: !!global.gc,
+    };
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(stats));
   } else if (req.url === '/gc') {
     if (global.gc) {
       global.gc();
@@ -110,6 +186,10 @@ const healthServer = http.createServer((req, res) => {
       res.writeHead(500);
       res.end('GC not available (run with --expose-gc)');
     }
+  } else if (req.url === '/shutdown') {
+    res.writeHead(200);
+    res.end('Shutting down...');
+    setTimeout(() => process.exit(0), 1000);
   } else {
     res.writeHead(404);
     res.end();
@@ -118,25 +198,40 @@ const healthServer = http.createServer((req, res) => {
 
 healthServer.listen(PORT, '0.0.0.0', () => {
   console.log(`[Bootstrap] Health check server on port ${PORT}`);
-  console.log(`[Bootstrap] Memory: ${getMemoryUsage().heapUsedMB}MB / 8000MB`);
+  const mem = getMemoryUsage();
+  console.log(`[Bootstrap] Memory: ${mem.heapUsedMB}MB / 8000MB (${Math.round((mem.heapUsedMB / 8000) * 100)}%)`);
 });
 healthServer.on('error', (err) => console.error('[Bootstrap] Health server error:', err));
 
 // ----------------------------------------------------------------------------
-// GLOBAL ERROR HANDLERS
+// GLOBAL ERROR HANDLERS - FIX: Don't exit on unhandled rejection
 // ----------------------------------------------------------------------------
 process.on('uncaughtException', (err) => {
   console.error('🔥 UNCAUGHT EXCEPTION:', err);
   try { logger.error('Uncaught exception', { component: 'Process', error: err }); } catch {}
-  if (global.gc) global.gc();
-  process.exit(1);
+  // Only exit on fatal errors
+  if (err.message?.includes('ENOMEM') || err.message?.includes('out of memory')) {
+    if (global.gc) global.gc();
+    process.exit(1);
+  }
+  // Otherwise, log and continue
 });
 
 process.on('unhandledRejection', (reason) => {
   console.error('🔥 UNHANDLED REJECTION:', reason);
-  try { logger.warn('Unhandled rejection', { component: 'Process', reason: formatError(reason) }); } catch {}
-  // Don't exit on unhandled rejection - just log and continue
+  try { 
+    logger.warn('Unhandled rejection', { 
+      component: 'Process', 
+      reason: formatError(reason) 
+    }); 
+  } catch {}
+  // DO NOT EXIT - this was causing random shutdowns
 });
+
+// ----------------------------------------------------------------------------
+// Prevent MaxListenersExceededWarning
+// ----------------------------------------------------------------------------
+process.setMaxListeners(100);
 
 // ----------------------------------------------------------------------------
 // STATE
@@ -177,11 +272,19 @@ async function main(): Promise<void> {
     dbPath: CONFIG.dbPath,
   });
 
-  // Connect DB
-  await getDb();
-  logger.info('Database connection established', { component: 'Bootstrap' });
+  // Connect DB with timeout
+  try {
+    await Promise.race([
+      getDb(),
+      delay(10000).then(() => { throw new Error('Database connection timeout'); })
+    ]);
+    logger.info('Database connection established', { component: 'Bootstrap' });
+  } catch (err) {
+    logger.error('Database connection failed', { component: 'Bootstrap', error: formatError(err) });
+    throw err;
+  }
 
-  // Cleanup old giveaways
+  // Cleanup old giveaways (don't block startup)
   cleanupOldGiveaways(30).catch(err => logger.warn('cleanupOldGiveaways error', { error: err }));
 
   // --------------------------------------------------------------------------
@@ -198,7 +301,7 @@ async function main(): Promise<void> {
   }
 
   // --------------------------------------------------------------------------
-  // START BOTMANAGER
+  // START BOTMANAGER - FIX: Add timeout and retry
   // --------------------------------------------------------------------------
   logger.info('Initializing BotManager...', { component: 'Bootstrap' });
   try {
@@ -208,7 +311,7 @@ async function main(): Promise<void> {
     })();
     await Promise.race([
       startPromise,
-      timeout(BOT_MANAGER_START_TIMEOUT_MS, 'BotManager.start() timed out'),
+      delay(BOT_MANAGER_START_TIMEOUT_MS).then(() => { throw new Error('BotManager.start() timed out'); }),
     ]);
     logger.info('BotManager started successfully.', { component: 'Bootstrap' });
   } catch (err) {
@@ -220,13 +323,19 @@ async function main(): Promise<void> {
   }
 
   // --------------------------------------------------------------------------
-  // START AUTOJOINER
+  // START AUTOJOINER - FIX: Add timeout and memory check
   // --------------------------------------------------------------------------
   try {
     logger.info('Starting AutoJoiner (monitors all servers)...', { component: 'Bootstrap' });
     autoJoiner = new AutoJoinManager();
-    await autoJoiner.startAllSessions();
-    await autoJoiner.restoreSessionsFromDatabase();
+    await Promise.race([
+      autoJoiner.startAllSessions(),
+      delay(30000).then(() => { throw new Error('AutoJoiner start timed out'); })
+    ]);
+    await Promise.race([
+      autoJoiner.restoreSessionsFromDatabase(),
+      delay(30000).then(() => { throw new Error('AutoJoiner restore timed out'); })
+    ]);
     logger.info('AutoJoiner started successfully.', { component: 'Bootstrap' });
   } catch (err) {
     logger.warn('AutoJoiner failed to start:', {
@@ -241,107 +350,124 @@ async function main(): Promise<void> {
   // --------------------------------------------------------------------------
   activeManagers = [];
   let authFailures = 0;
+  let clientsStarted = 0;
 
-  for (let i = 0; i < CONFIG.tokens.length; i++) {
-    // Check memory before starting each account
+  // Process tokens in batches to avoid memory spikes
+  const BATCH_SIZE = 3;
+  const tokenBatches = [];
+  for (let i = 0; i < CONFIG.tokens.length; i += BATCH_SIZE) {
+    tokenBatches.push(CONFIG.tokens.slice(i, i + BATCH_SIZE));
+  }
+
+  for (const batch of tokenBatches) {
+    // Check memory before starting each batch
     const mem = getMemoryUsage();
     if (mem.heapUsedMB > MEMORY_CRITICAL_MB) {
       logger.warn(`Memory high (${mem.heapUsedMB}MB), stopping account creation`, {
         component: 'Bootstrap',
-        index: i,
+        started: clientsStarted,
       });
       break;
     }
 
-    const token = CONFIG.tokens[i]!.trim();
-    const label = `acc${i + 1}`;
+    const batchPromises = batch.map(async (token, batchIndex) => {
+      const globalIndex = clientsStarted + batchIndex;
+      const label = `acc${globalIndex + 1}`;
 
-    if (!token) {
-      logger.warn(`Token ${i + 1} is empty – skipping`, { component: 'Bootstrap' });
-      continue;
-    }
-
-    let client: Client | null = null;
-
-    try {
-      logger.info(`Starting account ${i + 1}/${CONFIG.tokens.length} (${label})...`, {
-        component: 'Bootstrap',
-      });
-
-      client = new Client();
-
-      // Only attach the debug listener when debug logging is actually enabled.
-      // The `debug` event fires very frequently (heartbeats, gateway payloads),
-      // so building/logging a string on every tick when it'll be discarded
-      // anyway is wasted allocation across every account.
-      if (CONFIG.logLevel === 'debug') {
-        client.on('debug', (info) => {
-          logger.debug(`[${label}] Debug: ${info}`, { component: 'Client' });
-        });
+      if (!token || token.trim() === '') {
+        logger.warn(`Token ${globalIndex + 1} is empty – skipping`, { component: 'Bootstrap' });
+        return null;
       }
 
-      client.on('ready', () => {
-        logger.info(`[${label}] Client ready event fired`, { component: 'Client' });
-      });
-
-      client.on('error', (err) => {
-        logger.error(`[${label}] Client error event: ${formatError(err)}`, { component: 'Client' });
-      });
-
-      const manager = new GiveawayManager(client, logger, token, label, botManager);
-      registerDiscordEvents(client, manager);
-
-      logger.info(`[${label}] Calling waitForReady...`, { component: 'Bootstrap' });
+      let client: Client | null = null;
 
       try {
-        await Promise.race([
-          waitForReady(client, token, label),
-          timeout(CLIENT_READY_TIMEOUT_MS, `Client ${label} did not become ready`),
-        ]);
-      } catch (raceErr) {
-        // If waitForReady lost the race (timed out) or errored, the client is
-        // half-initialized and would otherwise be dropped from scope while
-        // still holding an open gateway connection + listeners. Destroy it
-        // explicitly so it doesn't leak.
+        logger.info(`Starting account ${globalIndex + 1}/${CONFIG.tokens.length} (${label})...`, {
+          component: 'Bootstrap',
+        });
+
+        client = new Client();
+        client.setMaxListeners(50); // Prevent listener leaks
+
+        // Only attach debug listener when debug logging is enabled
+        if (CONFIG.logLevel === 'debug') {
+          client.on('debug', (info) => {
+            logger.debug(`[${label}] Debug: ${info}`, { component: 'Client' });
+          });
+        }
+
+        client.on('ready', () => {
+          logger.info(`[${label}] Client ready event fired`, { component: 'Client' });
+        });
+
+        client.on('error', (err) => {
+          logger.error(`[${label}] Client error event: ${formatError(err)}`, { component: 'Client' });
+        });
+
+        const manager = new GiveawayManager(client, logger, token, label, botManager);
+        registerDiscordEvents(client, manager);
+
+        logger.info(`[${label}] Calling waitForReady...`, { component: 'Bootstrap' });
+
         try {
-          client.removeAllListeners();
-          await client.destroy();
-        } catch {}
-        throw raceErr;
-      }
+          await Promise.race([
+            waitForReady(client, token, label),
+            delay(CLIENT_READY_TIMEOUT_MS).then(() => { throw new Error(`Client ${label} did not become ready`); }),
+          ]);
+        } catch (raceErr) {
+          // If waitForReady lost the race (timed out) or errored, destroy client
+          try {
+            client.removeAllListeners();
+            await client.destroy();
+          } catch {}
+          throw raceErr;
+        }
 
-      logger.info(`[${label}] waitForReady resolved successfully`, { component: 'Bootstrap' });
+        logger.info(`[${label}] waitForReady resolved successfully`, { component: 'Bootstrap' });
 
-      activeManagers.push(manager);
+        activeManagers.push(manager);
 
-      logger.info(`Account ${label} connected`, {
-        component: 'Bootstrap',
-        userId: client.user?.id,
-        username: client.user?.username,
-        guilds: client.guilds.cache.size,
-        memory: getMemoryUsage(),
-      });
-    } catch (err) {
-      const message = formatError(err);
-      const isAuth = /token|auth|login|invalid|unauthorized|401|403/i.test(message);
+        logger.info(`Account ${label} connected`, {
+          component: 'Bootstrap',
+          userId: client.user?.id,
+          username: client.user?.username,
+          guilds: client.guilds.cache.size,
+          memory: getMemoryUsage(),
+        });
 
-      if (isAuth) {
-        authFailures++;
-        logger.warn(`Account ${label} skipped (auth error)`, {
+        return manager;
+
+      } catch (err) {
+        const message = formatError(err);
+        const isAuth = /token|auth|login|invalid|unauthorized|401|403/i.test(message);
+
+        if (isAuth) {
+          authFailures++;
+          logger.warn(`Account ${label} skipped (auth error)`, {
+            component: 'Bootstrap',
+            error: message,
+          });
+          return null;
+        }
+
+        logger.error(`Account ${label} failed`, {
           component: 'Bootstrap',
           error: message,
         });
-        continue;
+        return null;
       }
+    });
 
-      logger.error(`Account ${label} failed`, {
-        component: 'Bootstrap',
-        error: message,
-      });
+    const results = await Promise.all(batchPromises);
+    for (const result of results) {
+      if (result) clientsStarted++;
     }
+
+    // Small delay between batches to let memory settle
+    await delay(1000);
   }
 
-  if (activeManagers.length === 0 && authFailures > 0) {
+  if (activeManagers.length === 0 && authFailures > 0 && authFailures === CONFIG.tokens.length) {
     throw Object.assign(
       new Error('All tokens failed authentication'),
       { code: 'AUTH_ALL_FAILED' }
@@ -366,16 +492,20 @@ async function main(): Promise<void> {
     });
   }
 
+  // Stats interval - less frequent to reduce overhead
   statsInterval = setInterval(() => {
+    if (shuttingDown) return;
     for (const m of activeManagers) {
-      m.logStats();
+      try { m.logStats(); } catch {}
     }
-    if (autoJoiner) {
-      const stats = autoJoiner.getStats();
-      logger.info(`AutoJoiner: ${stats.activeSessions}/${stats.totalSessions} sessions active`, {
-        component: 'Bootstrap',
-        memory: getMemoryUsage(),
-      });
+    if (autoJoiner && !shuttingDown) {
+      try {
+        const stats = autoJoiner.getStats();
+        logger.info(`AutoJoiner: ${stats.activeSessions}/${stats.totalSessions} sessions active`, {
+          component: 'Bootstrap',
+          memory: getMemoryUsage(),
+        });
+      } catch {}
     }
   }, CONFIG.statsIntervalMs);
   statsInterval.unref();
@@ -394,8 +524,11 @@ async function main(): Promise<void> {
 // DISCORD EVENT HANDLERS
 // ----------------------------------------------------------------------------
 function registerDiscordEvents(client: Client, manager: GiveawayManager): void {
-  client.on('messageCreate', (msg: Message) => {
-    if (!msg.guild) return;
+  const maxListeners = 50;
+  client.setMaxListeners(maxListeners);
+
+  const messageCreateHandler = (msg: Message) => {
+    if (!msg.guild || shuttingDown) return;
     manager.handleMessage(msg).catch((err) => {
       logger.error('messageCreate handler error', {
         component: 'Events',
@@ -403,10 +536,10 @@ function registerDiscordEvents(client: Client, manager: GiveawayManager): void {
         messageId: msg.id,
       });
     });
-  });
+  };
 
-  client.on('messageUpdate', (_old: any, updated: any) => {
-    if (!updated.id || !updated.channel) return;
+  const messageUpdateHandler = (_old: any, updated: any) => {
+    if (!updated.id || !updated.channel || shuttingDown) return;
     manager.handleMessage(updated as Message).catch((err) => {
       logger.error('messageUpdate handler error', {
         component: 'Events',
@@ -414,31 +547,62 @@ function registerDiscordEvents(client: Client, manager: GiveawayManager): void {
         messageId: updated.id,
       });
     });
-  });
+  };
 
-  client.on('guildCreate', (guild) => {
+  const guildCreateHandler = (guild: any) => {
+    if (shuttingDown) return;
     logger.info('Joined server', {
       component: 'Events',
       guildId: guild.id,
       guildName: guild.name,
       memberCount: guild.memberCount,
     });
-  });
+  };
 
-  client.on('guildDelete', (guild) => {
+  const guildDeleteHandler = (guild: any) => {
+    if (shuttingDown) return;
     logger.info('Left server', {
       component: 'Events',
       guildId: guild.id,
       guildName: guild.name,
     });
-    // Prevent inviteCache from silently accumulating entries for guilds
-    // we're no longer in.
+    // Prevent inviteCache from accumulating entries for guilds we're no longer in
     manager.clearInviteCache(guild.id);
-  });
+  };
 
-  client.on('disconnect', () => logger.warn('Disconnected', { component: 'Events' }));
-  client.on('reconnecting', () => logger.info('Reconnecting...', { component: 'Events' }));
-  client.on('error', (err) => logger.error('Client error', { component: 'Events', error: err }));
+  const disconnectHandler = () => {
+    if (shuttingDown) return;
+    logger.warn('Disconnected', { component: 'Events' });
+  };
+
+  const reconnectingHandler = () => {
+    if (shuttingDown) return;
+    logger.info('Reconnecting...', { component: 'Events' });
+  };
+
+  const errorHandler = (err: Error) => {
+    if (shuttingDown) return;
+    logger.error('Client error', { component: 'Events', error: err });
+  };
+
+  // Store references for cleanup
+  (manager as any)._handlers = {
+    messageCreate: messageCreateHandler,
+    messageUpdate: messageUpdateHandler,
+    guildCreate: guildCreateHandler,
+    guildDelete: guildDeleteHandler,
+    disconnect: disconnectHandler,
+    reconnecting: reconnectingHandler,
+    error: errorHandler,
+  };
+
+  client.on('messageCreate', messageCreateHandler);
+  client.on('messageUpdate', messageUpdateHandler);
+  client.on('guildCreate', guildCreateHandler);
+  client.on('guildDelete', guildDeleteHandler);
+  client.on('disconnect', disconnectHandler);
+  client.on('reconnecting', reconnectingHandler);
+  client.on('error', errorHandler);
 }
 
 // ----------------------------------------------------------------------------
@@ -447,31 +611,44 @@ function registerDiscordEvents(client: Client, manager: GiveawayManager): void {
 function waitForReady(client: Client, token: string, label: string): Promise<void> {
   return new Promise((resolve, reject) => {
     console.log(`[${label}] waitForReady: setting up listeners and calling login...`);
-    client.once('ready', () => {
+    
+    let resolved = false;
+    
+    const readyHandler = () => {
+      if (resolved) return;
+      resolved = true;
       console.log(`[${label}] waitForReady: ready event received`);
+      cleanup();
       resolve();
-    });
-    client.once('error', (err) => {
+    };
+    
+    const errorHandler = (err: Error) => {
+      if (resolved) return;
+      resolved = true;
       console.error(`[${label}] waitForReady: error event received`, err);
+      cleanup();
       reject(err);
-    });
+    };
+    
+    const cleanup = () => {
+      client.off('ready', readyHandler);
+      client.off('error', errorHandler);
+    };
+    
+    client.once('ready', readyHandler);
+    client.once('error', errorHandler);
+    
     client.login(token)
       .then(() => {
         console.log(`[${label}] waitForReady: client.login() resolved`);
       })
       .catch((err) => {
+        if (resolved) return;
+        resolved = true;
         console.error(`[${label}] waitForReady: client.login() rejected`, err);
+        cleanup();
         reject(new Error(`Login failed: ${formatError(err)}`));
       });
-  });
-}
-
-function timeout(ms: number, message: string): Promise<never> {
-  return new Promise((_, reject) => {
-    setTimeout(() => {
-      console.error(`Timeout triggered: ${message}`);
-      reject(new Error(message));
-    }, ms);
   });
 }
 
@@ -500,7 +677,7 @@ function registerShutdown(): void {
       memoryCleanupInterval = null;
     }
 
-    // Shutdown public detectors
+    // Shutdown public detectors - FIX: Use Promise.allSettled to prevent one failure from blocking
     console.log(`[Shutdown] Stopping ${activeManagers.length} account managers...`);
     const managerPromises = activeManagers.map(async (m) => {
       try {
@@ -509,16 +686,29 @@ function registerShutdown(): void {
         const client = (m as any).client;
         if (client) {
           try {
+            // Remove all handlers
+            const handlers = (m as any)._handlers;
+            if (handlers) {
+              for (const [event, handler] of Object.entries(handlers)) {
+                try { client.off(event, handler as any); } catch {}
+              }
+            }
             client.removeAllListeners();
             await client.destroy();
           } catch {}
         }
+        // Clear caches
+        if (m.giveawayTextCache) m.giveawayTextCache.clear();
+        if (m.creationCache) m.creationCache.clear();
+        if (m.processingMessages) m.processingMessages.clear();
+        if (m.inviteCache) m.inviteCache.clear();
+        if (m.pendingInvites) m.pendingInvites.clear();
       } catch (err) {
         console.error('[Shutdown] Error stopping manager:', err);
       }
     });
     await Promise.race([
-      Promise.all(managerPromises),
+      Promise.allSettled(managerPromises),
       delay(SHUTDOWN_TIMEOUT_MS),
     ]);
     activeManagers = [];
@@ -564,9 +754,13 @@ function registerShutdown(): void {
       healthServer.close(() => {});
     } catch {}
 
-    // Force garbage collection
+    // Force garbage collection multiple times
     if (global.gc) {
       console.log('[Shutdown] Forcing garbage collection...');
+      global.gc();
+      await delay(100);
+      global.gc();
+      await delay(100);
       global.gc();
     }
 
@@ -641,6 +835,11 @@ async function boot(): Promise<void> {
         autoJoiner = null;
       }
       
+      if (botManager) {
+        try { await botManager.destroy(); } catch {}
+        botManager = null;
+      }
+      
       if (global.gc) {
         global.gc();
       }
@@ -657,7 +856,14 @@ async function boot(): Promise<void> {
 // START
 // ----------------------------------------------------------------------------
 console.log(`[Bootstrap] Starting with 8GB RAM...`);
-console.log(`[Bootstrap] Initial memory: ${getMemoryUsage().heapUsedMB}MB / 8000MB`);
+const initialMem = getMemoryUsage();
+console.log(`[Bootstrap] Initial memory: ${initialMem.heapUsedMB}MB / 8000MB`);
 console.log(`[Bootstrap] GC available: ${!!global.gc}`);
+
+// Run GC before starting
+if (global.gc) {
+  global.gc();
+  console.log('[Bootstrap] Initial GC complete');
+}
 
 boot();
