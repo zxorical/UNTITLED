@@ -1,1 +1,2 @@
-export { AutoJoinManager } from './manager.js';
+import AutoJoinManager from './manager.js';
+export { AutoJoinManager };
