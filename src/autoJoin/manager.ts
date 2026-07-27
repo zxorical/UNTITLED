@@ -531,7 +531,12 @@ export class AutoJoinManager extends EventEmitter {
     
     // Check if message is from a known giveaway bot or has giveaway keywords
     const isKnownBot = this.isKnownGiveawayBot(message);
-    const hasKeyword = this.messageHasKeyword(message);
+    // ✅ FIX: hasKeyword used to match ANY author, so ordinary user chat like
+    // "if I were to win a giveaway" or a bot's unrelated stats message
+    // ("Messages Sent: Today: 8...") got queued as a real giveaway. Real
+    // giveaways are always posted by bots, so require message.author.bot
+    // for the keyword fallback path too (isKnownBot already implies this).
+    const hasKeyword = !!message.author?.bot && this.messageHasKeyword(message);
     
     if (!isKnownBot && !hasKeyword) return;
 
@@ -719,7 +724,7 @@ export class AutoJoinManager extends EventEmitter {
           const messages = await textChannel.messages.fetch({ limit: 10 });
           
           for (const [msgId, message] of messages) {
-            if (this.isKnownGiveawayBot(message) || this.messageHasKeyword(message)) {
+            if (this.isKnownGiveawayBot(message) || (!!message.author?.bot && this.messageHasKeyword(message))) {
               await this.scanMessageForGiveaway(message, session.userId, session.guildId);
               scannedCount++;
             }
@@ -1204,7 +1209,29 @@ export class AutoJoinManager extends EventEmitter {
         // Try the clickButton method first
         const selfbotMsg = message as Message & { clickButton?: (id: string) => Promise<unknown> };
         if (typeof selfbotMsg.clickButton === 'function') {
-          await selfbotMsg.clickButton(button);
+          try {
+            await selfbotMsg.clickButton(button);
+          } catch (clickErr) {
+            // ✅ FIX: the library's own clickButton() sometimes throws
+            // BUTTON_NOT_FOUND even though our own findEntryButton() just
+            // located that exact customId on the same message object — its
+            // internal component search doesn't always match ours (stale
+            // row references after messages.fetch(), etc). Instead of
+            // failing outright, fall back to the raw REST interaction POST,
+            // which only needs the customId string and doesn't depend on
+            // the library's internal component lookup.
+            const errMsg = formatError(clickErr);
+            if (/BUTTON_NOT_FOUND/i.test(errMsg)) {
+              logger.debug(`clickButton() reported BUTTON_NOT_FOUND, falling back to raw interaction POST`, {
+                component: 'AutoJoinManager',
+                userId: session.userId,
+                button
+              });
+              await this.postInteraction(message, button, session);
+            } else {
+              throw clickErr;
+            }
+          }
         } else {
           // Fallback: POST interaction directly
           await this.postInteraction(message, button, session);
