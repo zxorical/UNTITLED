@@ -17,6 +17,7 @@
  * 11. FIX: Force GC after every shutdown
  * 12. FIX: Max listeners warning prevention
  * 13. FIX: Session cleanup on boot retry
+ * 14. FIX: TypeScript type errors - array inference and private property access
  */
 
 import http from 'http';
@@ -354,7 +355,7 @@ async function main(): Promise<void> {
 
   // Process tokens in batches to avoid memory spikes
   const BATCH_SIZE = 3;
-  const tokenBatches = [];
+  const tokenBatches: string[][] = [];
   for (let i = 0; i < CONFIG.tokens.length; i += BATCH_SIZE) {
     tokenBatches.push(CONFIG.tokens.slice(i, i + BATCH_SIZE));
   }
@@ -683,11 +684,12 @@ function registerShutdown(): void {
       try {
         await m.shutdown();
         // Force cleanup of the client
-        const client = (m as any).client;
+        const managerAny = m as any;
+        const client = managerAny.client;
         if (client) {
           try {
             // Remove all handlers
-            const handlers = (m as any)._handlers;
+            const handlers = managerAny._handlers;
             if (handlers) {
               for (const [event, handler] of Object.entries(handlers)) {
                 try { client.off(event, handler as any); } catch {}
@@ -697,12 +699,12 @@ function registerShutdown(): void {
             await client.destroy();
           } catch {}
         }
-        // Clear caches
-        if (m.giveawayTextCache) m.giveawayTextCache.clear();
-        if (m.creationCache) m.creationCache.clear();
-        if (m.processingMessages) m.processingMessages.clear();
-        if (m.inviteCache) m.inviteCache.clear();
-        if (m.pendingInvites) m.pendingInvites.clear();
+        // Clear caches - use any type to access private properties
+        if (managerAny.giveawayTextCache) managerAny.giveawayTextCache.clear();
+        if (managerAny.creationCache) managerAny.creationCache.clear();
+        if (managerAny.processingMessages) managerAny.processingMessages.clear();
+        if (managerAny.inviteCache) managerAny.inviteCache.clear();
+        if (managerAny.pendingInvites) managerAny.pendingInvites.clear();
       } catch (err) {
         console.error('[Shutdown] Error stopping manager:', err);
       }
@@ -821,7 +823,8 @@ async function boot(): Promise<void> {
       for (const m of activeManagers) {
         try {
           await m.shutdown();
-          const client = (m as any).client;
+          const managerAny = m as any;
+          const client = managerAny.client;
           if (client) {
             client.removeAllListeners();
             await client.destroy();
