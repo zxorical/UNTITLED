@@ -84,6 +84,7 @@ interface UserSession {
   heartbeatInterval?: NodeJS.Timeout;
   reconnectAttempts: number;
   maxReconnectAttempts: number;
+  rateLimiter: TokenBucket;
 }
 
 interface SessionStats {
@@ -109,6 +110,9 @@ const MAX_SESSIONS = 5;
 const PROCESSING_CACHE_TTL_MS = 60000; // 1 minute for processing set
 const MAX_RECONNECT_ATTEMPTS = 3;
 const RECONNECT_DELAY_MS = 60000; // 1 minute between reconnects
+const INTERACTION_RETRY_ATTEMPTS = 3;
+const INTERACTION_RETRY_DELAY_MS = 2000;
+const NO_RESPONSE_COOLDOWN_MS = 5000; // Cooldown after "No response" errors
 
 const KNOWN_GIVEAWAY_BOT_IDS: ReadonlySet<string> = new Set([
   '294882584201003009', // GiveawayBot
@@ -240,6 +244,7 @@ export class AutoJoinManager extends EventEmitter {
   private reconnectCheckInterval: NodeJS.Timeout | null = null;
   private isShuttingDown = false;
   private sessionStartPromises: Map<string, Promise<boolean>> = new Map();
+  private noResponseCooldown: Map<string, number> = new Map(); // userId -> cooldown end timestamp
 
   private readonly http = axios.create({
     timeout: 10_000,
@@ -435,6 +440,7 @@ export class AutoJoinManager extends EventEmitter {
         },
         reconnectAttempts: 0,
         maxReconnectAttempts: MAX_RECONNECT_ATTEMPTS,
+        rateLimiter: new TokenBucket(5, 5000), // 5 requests per 5 seconds
       };
 
       this.registerEvents(session);
@@ -516,10 +522,22 @@ export class AutoJoinManager extends EventEmitter {
     session.heartbeatInterval = setInterval(() => {
       if (this.isShuttingDown || !session.isActive) return;
 
-      if (!session.client.isReady()) {
-        logger.warn('Session client not ready, checking reconnect...', {
+      // Check if client is still responsive
+      try {
+        const client = session.client as any;
+        if (!client.isReady()) {
+          throw new Error('Client not ready');
+        }
+        
+        // Check if websocket is still connected
+        if (client.ws?.connection?.readyState !== 1) { // 1 = OPEN
+          throw new Error('WebSocket not open');
+        }
+      } catch (error) {
+        logger.warn('Session health check failed', {
           component: 'AutoJoin',
           userId: session.userId,
+          error: formatError(error),
           attempts: session.reconnectAttempts,
           maxAttempts: session.maxReconnectAttempts
         });
@@ -764,6 +782,7 @@ export class AutoJoinManager extends EventEmitter {
     this.sessions.clear();
     this.processingCache.clear();
     this.recentWins.clear();
+    this.noResponseCooldown.clear();
     
     logger.info('AutoJoin shutdown complete', { component: 'AutoJoin' });
   }
@@ -934,6 +953,7 @@ export class AutoJoinManager extends EventEmitter {
 
     if (!hasSignal) return null;
 
+    // FIX: Pass isKnownBot to tryExtractEntry
     const immediate = this.tryExtractEntry(message, isKnownBot);
     if (immediate) return immediate;
 
@@ -941,6 +961,7 @@ export class AutoJoinManager extends EventEmitter {
       await delay(COMPONENT_RETRY_DELAY_MS);
       try {
         const refreshed = await message.fetch();
+        // FIX: Pass isKnownBot to tryExtractEntry
         const result = this.tryExtractEntry(refreshed, isKnownBot);
         if (result) return result;
       } catch {
@@ -951,21 +972,64 @@ export class AutoJoinManager extends EventEmitter {
     return null;
   }
 
+  // FIX: Use isKnownBot parameter
   private tryExtractEntry(
     message: Message,
     isKnownBot: boolean,
   ): { prize: string; button: GiveawayButton } | null {
+    // FIX: Pass isKnownBot to extractEntryButton
     const button = this.extractEntryButton(message, isKnownBot);
     if (!button) return null;
     return { prize: this.extractPrize(message), button };
   }
 
-  // FIXED: extractEntryButton with better detection
-  private extractEntryButton(message: Message, _isKnownBot: boolean): GiveawayButton | null {
+  // FIX: Use isKnownBot parameter
+  private extractEntryButton(message: Message, isKnownBot: boolean): GiveawayButton | null {
     const msgAny = message as unknown as Record<string, unknown>;
     const components = msgAny['components'] as unknown[] | undefined;
     if (!components?.length) return null;
 
+    // If it's a known bot, we can be more permissive
+    if (isKnownBot) {
+      // For known bots, check for any enabled button that looks like an entry button
+      for (const row of components) {
+        const rowAny = row as Record<string, unknown>;
+        const rowComps = rowAny['components'] as unknown[] | undefined;
+        if (!rowComps?.length) continue;
+
+        for (const comp of rowComps) {
+          const c = comp as Record<string, unknown>;
+          const type = c['type'];
+          if (type !== 2 && type !== 'BUTTON') continue;
+          if (c['style'] === 5) continue;
+          if (c['disabled'] === true) continue;
+
+          const customId = (c['customId'] ?? c['custom_id']) as string | undefined;
+          if (!customId) continue;
+
+          const label = ((c['label'] as string | undefined) ?? '').trim();
+          const lowerLabel = label.toLowerCase();
+
+          // Skip management buttons
+          if (['edit', 'start', 'cancel', 'preview', 'setup'].some(word => lowerLabel.includes(word))) {
+            continue;
+          }
+
+          // For known bots, if it has a custom ID that looks like a giveaway button, return it
+          if (customId.includes('giveaway') || customId.includes('enter') || customId.includes('join')) {
+            return { customId, label: label || customId, disabled: false };
+          }
+
+          // Check against patterns
+          if (ENTRY_BUTTON_PATTERNS.some(re => re.test(label))) {
+            return { customId, label: label || 'Enter', disabled: false };
+          }
+        }
+      }
+      return null;
+    }
+
+    // For unknown bots, be more strict
     // Check if this has draft buttons - if so, only return if there's an entry button too
     let hasDraftButton = false;
     for (const row of components) {
@@ -1061,7 +1125,7 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   // -------------------------------------------------------------------------
-  // Entry Execution (BUTTON ONLY)
+  // Entry Execution (BUTTON ONLY) - FIXED
   // -------------------------------------------------------------------------
 
   private async enterGiveaway(entryId: string, session: UserSession): Promise<void> {
@@ -1085,6 +1149,43 @@ export class AutoJoinManager extends EventEmitter {
       if (attempt > 0) {
         const backoffMs = exponentialBackoff(attempt - 1, CONFIG.retryDelayMs, 30000);
         await delay(backoffMs);
+      }
+
+      // FIX: After 2 failures, try to refresh the button data
+      if (attempt === 2) {
+        logger.debug('Attempting to refresh button data after multiple failures', {
+          userId: session.userId,
+          attempt,
+          entryId
+        });
+        
+        try {
+          const refreshedEntry = await this.refreshButtonData(entry, session);
+          if (refreshedEntry && refreshedEntry.buttonCustomId !== entry.buttonCustomId) {
+            entry.buttonCustomId = refreshedEntry.buttonCustomId;
+            logger.info('Button ID refreshed successfully', {
+              userId: session.userId,
+              newCustomId: entry.buttonCustomId
+            });
+          }
+        } catch (error) {
+          logger.debug('Failed to refresh button data', {
+            userId: session.userId,
+            error: formatError(error)
+          });
+        }
+      }
+
+      // FIX: Check for "No response" cooldown
+      const cooldownEnd = this.noResponseCooldown.get(session.userId) || 0;
+      if (Date.now() < cooldownEnd) {
+        const waitMs = cooldownEnd - Date.now();
+        logger.debug(`Waiting for "No response" cooldown`, {
+          userId: session.userId,
+          waitMs,
+          attempt: attemptNum
+        });
+        await delay(Math.min(waitMs, 5000));
       }
 
       try {
@@ -1125,20 +1226,51 @@ export class AutoJoinManager extends EventEmitter {
         return;
 
       } catch (error) {
-        const lastError = formatError(error);
+        const errorMsg = formatError(error);
+        const isNoResponse = errorMsg.includes('No responsed from Application') || 
+                            errorMsg.includes('No response from Application') ||
+                            errorMsg.includes('Interaction expired') ||
+                            errorMsg.includes('unknown interaction');
+        
+        // FIX: If we get "No response from Application", add a cooldown and retry
+        if (isNoResponse && attempt < maxAttempts - 1) {
+          // FIX: Add cooldown for "No response" errors
+          this.noResponseCooldown.set(session.userId, Date.now() + NO_RESPONSE_COOLDOWN_MS);
+          
+          logger.warn(`AutoJoin: Received "No response" error, will retry with fresh data after cooldown`, {
+            component: 'AutoJoin',
+            userId: session.userId,
+            attempt: attemptNum,
+            entryId,
+            cooldownMs: NO_RESPONSE_COOLDOWN_MS
+          });
+          
+          // FIX: Wait 2 seconds before retry
+          await delay(2000);
+          
+          // Try to refresh the message before next attempt
+          try {
+            await this.refreshButtonData(entry, session);
+          } catch (refreshError) {
+            // Ignore refresh errors
+          }
+          
+          continue;
+        }
+        
         await updateAutoJoinEntryStatus(
           session.userId,
           entry.messageId,
           entry.channelId,
           'attempting',
-          { attempts: attemptNum, lastError }
+          { attempts: attemptNum, lastError: errorMsg }
         );
         
         logger.warn(`AutoJoin: Attempt ${attemptNum}/${maxAttempts} failed`, {
           component: 'AutoJoin',
           userId: session.userId,
           entryId,
-          error: lastError,
+          error: errorMsg,
         });
       }
     }
@@ -1163,88 +1295,318 @@ export class AutoJoinManager extends EventEmitter {
     this.emit('giveawayFailed', { entry, userId: session.userId });
   }
 
+  private async refreshButtonData(entry: GiveawayEntry, session: UserSession): Promise<GiveawayEntry | null> {
+    try {
+      const message = await this.fetchMessage(session.client, entry.channelId, entry.messageId);
+      if (!message) return null;
+      
+      const components = (message as any).components;
+      if (!components?.length) return null;
+      
+      // Try to find any enabled entry button
+      const isKnownBot = this.isKnownGiveawayBot(message);
+      const button = this.findEntryButton(components, isKnownBot);
+      if (button && button.customId !== entry.buttonCustomId) {
+        // Update the entry with new button ID
+        entry.buttonCustomId = button.customId;
+        return entry;
+      }
+      
+      return entry;
+    } catch (error) {
+      logger.debug('Failed to refresh button data', {
+        userId: session.userId,
+        error: formatError(error)
+      });
+      return null;
+    }
+  }
+
+  // FIX: Use isKnownBot parameter
+  private findEntryButton(components: unknown[], isKnownBot: boolean): GiveawayButton | null {
+    for (const row of components) {
+      const rowAny = row as Record<string, unknown>;
+      const rowComps = rowAny['components'] as unknown[] | undefined;
+      if (!rowComps?.length) continue;
+
+      for (const comp of rowComps) {
+        const c = comp as Record<string, unknown>;
+        const type = c['type'];
+        if (type !== 2 && type !== 'BUTTON') continue;
+        if (c['style'] === 5) continue;
+        if (c['disabled'] === true) continue;
+
+        const customId = (c['customId'] ?? c['custom_id']) as string | undefined;
+        if (!customId) continue;
+
+        const label = ((c['label'] as string | undefined) ?? '').trim();
+
+        // For known bots, be more permissive
+        if (isKnownBot) {
+          if (customId.includes('giveaway') || customId.includes('enter') || customId.includes('join')) {
+            return { customId, label: label || customId, disabled: false };
+          }
+        }
+
+        // Check for known giveaway button custom IDs first
+        if (TRUSTED_ENTRY_CUSTOM_IDS.has(customId)) {
+          return { customId, label: label || customId, disabled: false };
+        }
+
+        // Check for number/emoji labels (entry count buttons)
+        if (label.match(/^[\d,]+$/) || label.includes('🎉') || label.includes('🎁')) {
+          return { customId, label: label || 'Enter', disabled: false };
+        }
+
+        // Check against patterns
+        if (ENTRY_BUTTON_PATTERNS.some(re => re.test(label))) {
+          return { customId, label: label || 'Enter', disabled: false };
+        }
+      }
+    }
+    return null;
+  }
+
   private async enterViaButton(entry: GiveawayEntry, session: UserSession): Promise<boolean> {
     if (!entry.buttonCustomId) throw new Error('No buttonCustomId set');
 
     if (CONFIG.buttonDelayMs > 0) await delay(CONFIG.buttonDelayMs);
 
+    // FIX: Always fetch fresh to get current button state
     const message = await this.fetchMessage(session.client, entry.channelId, entry.messageId);
     if (!message) throw new Error(`Message ${entry.messageId} not found`);
 
-    const button = this.findButtonById(message, entry.buttonCustomId);
-    if (!button || button.disabled) {
-      return true; // Skip
+    // FIX: Try multiple button ID variations
+    let button = this.findButtonById(message, entry.buttonCustomId);
+    
+    // If button not found, try to find any entry button
+    if (!button) {
+      const components = (message as any).components;
+      if (components?.length) {
+        const isKnownBot = this.isKnownGiveawayBot(message);
+        const foundButton = this.findEntryButton(components, isKnownBot);
+        if (foundButton) {
+          button = foundButton;
+          // Update the entry with the new button ID
+          entry.buttonCustomId = button.customId;
+          logger.debug('Found alternative button', {
+            userId: session.userId,
+            customId: button.customId
+          });
+        }
+      }
     }
 
-    await this.clickButton(message, button);
+    if (!button) {
+      logger.debug('Button no longer exists', {
+        userId: session.userId,
+        customId: entry.buttonCustomId,
+      });
+      return true; // Skip
+    }
+    
+    if (button.disabled) {
+      logger.debug('Button is now disabled', {
+        userId: session.userId,
+        customId: entry.buttonCustomId,
+      });
+      return true; // Skip - giveaway already ended
+    }
+
+    // Use rate limiter
+    await session.rateLimiter.consume();
+
+    await this.clickButton(message, button, session);
     return false;
   }
 
   // -------------------------------------------------------------------------
-  // Interaction Helpers
+  // Interaction Helpers - FIXED
   // -------------------------------------------------------------------------
 
-  private async clickButton(message: Message, button: GiveawayButton): Promise<void> {
-    const selfbotMsg = message as Message & { clickButton?: (id: string) => Promise<unknown> };
+  private async clickButton(message: Message, button: GiveawayButton, session: UserSession): Promise<void> {
+    // Try the library's built-in method first
+    const selfbotMsg = message as Message & { 
+      clickButton?: (id: string) => Promise<unknown>;
+    };
+    
     if (typeof selfbotMsg.clickButton === 'function') {
-      await selfbotMsg.clickButton(button.customId);
-      return;
+      try {
+        await selfbotMsg.clickButton(button.customId);
+        return;
+      } catch (error) {
+        const errorMsg = formatError(error);
+        // If the library method fails with "No response", try manual approach
+        if (errorMsg.includes('No responsed from Application') || 
+            errorMsg.includes('No response from Application')) {
+          logger.debug('Library clickButton failed, trying manual approach', {
+            userId: session.userId,
+            error: errorMsg
+          });
+          await this.postInteraction(message, button, session);
+          return;
+        }
+        throw error;
+      }
     }
 
-    await this.postInteraction(message, button);
+    // Fallback to manual API call
+    await this.postInteraction(message, button, session);
   }
 
-  // FIXED: postInteraction with correct payload format
-  private async postInteraction(message: Message, button: GiveawayButton): Promise<void> {
+  private async postInteraction(message: Message, button: GiveawayButton, session: UserSession): Promise<void> {
     const clientAny = message.client as unknown as Record<string, unknown>;
-    const sessionId = (clientAny['sessionId'] ?? clientAny['session_id'] ?? Date.now().toString()) as string;
+    
+    // FIX: Get session ID from the client or generate one
+    let sessionId = clientAny['sessionId'] as string | undefined;
+    if (!sessionId) {
+      // Try to get from client internals
+      const client = message.client as any;
+      sessionId = client.sessionId || client.session_id || Date.now().toString();
+    }
+    
     const nonce = `${Date.now()}${Math.random().toString(36).slice(2, 8)}`;
 
-    // FIX: Use correct API endpoint and payload format
+    // Get the application ID from various sources
+    const applicationId = message.author?.id || 
+      (message as any).applicationId || 
+      (message as any).webhookId ||
+      (message as any).interaction?.application_id;
+
+    if (!applicationId) {
+      throw new Error('Could not determine application ID for interaction');
+    }
+
     const payload = {
-      type: 3, // Message Component Interaction
+      type: 3,
       nonce: nonce,
       guild_id: message.guild?.id ?? null,
       channel_id: message.channel.id,
       message_id: message.id,
-      application_id: message.author?.id,
+      application_id: applicationId,
       session_id: sessionId,
-      message_flags: 0, // FIX: Add message_flags
+      message_flags: 0,
       data: {
-        component_type: 2, // Button
+        component_type: 2,
         custom_id: button.customId,
       },
     };
 
     const token = (message.client as any).token as string;
 
-    try {
-      await axios.post('https://discord.com/api/v10/interactions', payload, {
-        headers: {
-          'Authorization': token,
-          'Content-Type': 'application/json',
-        },
-        timeout: 10000,
-      });
-    } catch (error) {
-      const axiosErr = error as { response?: { status?: number; data?: { retry_after?: number } } };
-      const status = axiosErr.response?.status;
+    // Retry logic for "No response" errors
+    for (let attempt = 0; attempt < INTERACTION_RETRY_ATTEMPTS; attempt++) {
+      try {
+        if (attempt > 0) {
+          await delay(INTERACTION_RETRY_DELAY_MS * attempt);
+        }
 
-      if (status === 429) {
-        const retryAfterMs = Math.ceil((axiosErr.response?.data?.retry_after ?? 1) * 1000);
-        await delay(retryAfterMs);
-        await axios.post('https://discord.com/api/v10/interactions', payload, {
+        // FIX: Better headers
+        const response = await axios.post('https://discord.com/api/v10/interactions', payload, {
           headers: {
             'Authorization': token,
             'Content-Type': 'application/json',
+            'Accept': 'application/json',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'X-Discord-Locale': 'en-US',
           },
-          timeout: 10000,
+          timeout: 15000,
         });
-        return;
-      }
 
-      throw error;
+        // Discord returns 204 No Content on success
+        if (response.status === 204) {
+          return;
+        }
+
+        // If we got a response but not 204, it might still be success
+        if (response.status === 200 || response.status === 201) {
+          logger.debug('Interaction successful with status', {
+            userId: session.userId,
+            status: response.status
+          });
+          return;
+        }
+
+        // If we got here, something unexpected happened
+        logger.warn('Unexpected interaction response', {
+          userId: session.userId,
+          status: response.status,
+          data: response.data
+        });
+
+      } catch (error) {
+        const axiosErr = error as { response?: { status?: number; data?: { retry_after?: number; message?: string } } };
+        const status = axiosErr.response?.status;
+        const errorMessage = axiosErr.response?.data?.message;
+
+        // Check for "No response" error
+        if (errorMessage?.includes('No response') || errorMessage?.includes('no response')) {
+          // This is the error we're seeing - try a different approach
+          logger.debug(`Interaction attempt ${attempt + 1} got "No response"`, {
+            userId: session.userId,
+            attempt: attempt + 1
+          });
+
+          if (attempt === INTERACTION_RETRY_ATTEMPTS - 1) {
+            // Last attempt failed with "No response"
+            throw new Error(`No response from Application after ${INTERACTION_RETRY_ATTEMPTS} attempts`);
+          }
+
+          // Try refreshing the interaction data - use a different approach for next attempt
+          if (attempt === 1) {
+            // Instead of webhook (which doesn't exist), try with a fresh session ID
+            const freshNonce = `${Date.now()}${Math.random().toString(36).slice(2, 8)}`;
+            payload.nonce = freshNonce;
+            payload.session_id = `${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+          }
+
+          continue;
+        }
+
+        // Handle rate limiting
+        if (status === 429) {
+          const retryAfterMs = Math.ceil((axiosErr.response?.data?.retry_after ?? 1) * 1000);
+          await delay(retryAfterMs);
+          continue;
+        }
+
+        // Handle token issues
+        if (status === 401 || status === 403) {
+          logger.error('Token appears to be blocked or invalid', {
+            userId: session.userId,
+            status,
+          });
+          await setTokenActive(session.userId, session.guildId, false);
+          throw new Error(`Token ${status === 401 ? 'invalid' : 'blocked'}`);
+        }
+
+        // Handle interaction expiration
+        if (status === 404 || errorMessage?.includes('unknown interaction')) {
+          throw new Error('Interaction expired or button no longer exists');
+        }
+
+        // For other errors, retry
+        if (status === 502 || status === 504 || status === 500) {
+          logger.debug('Discord gateway error, retrying', {
+            userId: session.userId,
+            status,
+            attempt: attempt + 1
+          });
+          
+          if (attempt === INTERACTION_RETRY_ATTEMPTS - 1) {
+            throw error;
+          }
+          continue;
+        }
+
+        // If we got this far and it's not a retryable error, throw
+        if (attempt === INTERACTION_RETRY_ATTEMPTS - 1) {
+          throw error;
+        }
+      }
     }
+
+    throw new Error(`Failed to send interaction after ${INTERACTION_RETRY_ATTEMPTS} attempts`);
   }
 
   private findButtonById(message: Message, customId: string): GiveawayButton | null {
@@ -1541,6 +1903,7 @@ export class AutoJoinManager extends EventEmitter {
         sessions: this.sessions.size,
         processingCache: this.processingCache.size,
         recentWins: this.recentWins.size,
+        noResponseCooldown: this.noResponseCooldown.size,
       });
 
       if (heapUsedMB > 300) {
@@ -1551,6 +1914,7 @@ export class AutoJoinManager extends EventEmitter {
         
         this.processingCache.clear();
         this.recentWins.clear();
+        this.noResponseCooldown.clear();
         
         if (global.gc) {
           global.gc();
