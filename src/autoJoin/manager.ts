@@ -23,9 +23,13 @@
  * 17. ✅ FIX: Added messageUpdate handling for late component arrival
  * 18. ✅ FIX: Added deduplication map for recently scanned messages
  * 19. ✅ FIX: Added proper message handler cleanup on session stop
+ * 20. ✅ FIX: Removed unsupported 'checkUpdate' client option (TS2353)
+ * 21. ✅ FIX: Named, typed messageUpdate handler stored on session so it can
+ *            actually be removed on stop/restart (was leaking listeners
+ *            because the anonymous callback couldn't be referenced for .off())
  */
 
-import { Client, Message, TextChannel, NewsChannel } from 'discord.js-selfbot-v13';
+import { Client, Message, PartialMessage, TextChannel, NewsChannel } from 'discord.js-selfbot-v13';
 import { EventEmitter } from 'events';
 import axios from 'axios';
 import { logger } from '../logger.js';
@@ -164,6 +168,13 @@ interface AutoJoinSession {
   };
   // Store message handler references for cleanup
   messageHandler?: (message: Message) => Promise<void>;
+  // ✅ FIX: correctly typed + stored so it can be removed via .off() later,
+  // instead of the previous anonymous callback that could never be detached
+  // (this was the source of the messageUpdate listener leak on restarts).
+  messageUpdateHandler?: (
+    oldMessage: Message | PartialMessage,
+    newMessage: Message | PartialMessage
+  ) => Promise<void>;
   winHandler?: (message: Message) => Promise<void>;
 }
 
@@ -344,9 +355,10 @@ export class AutoJoinManager extends EventEmitter {
       }
 
       // Create client for this session
-      const client = new Client({
-        checkUpdate: false,
-      });
+      // ✅ FIX: 'checkUpdate' is not part of the typed ClientOptions for
+      // discord.js-selfbot-v13, so it was removed rather than passing an
+      // invalid option through an unsafe cast.
+      const client = new Client();
       
       // ✅ Create message handlers
       const messageHandler = async (message: Message) => {
@@ -355,6 +367,19 @@ export class AutoJoinManager extends EventEmitter {
       
       const winHandler = async (message: Message) => {
         await this.scanMessageForWin(message, userId, guildId);
+      };
+
+      // ✅ FIX: named + typed handler (was an inline anonymous arrow before).
+      // Storing this on the session lets stopSession() actually remove it
+      // with client.off(), instead of leaking a duplicate listener on every
+      // reconnect/restart.
+      const messageUpdateHandler = async (
+        _oldMessage: Message | PartialMessage,
+        newMessage: Message | PartialMessage
+      ) => {
+        if (newMessage) {
+          await messageHandler(newMessage as Message);
+        }
       };
       
       // Set up event handlers
@@ -374,9 +399,7 @@ export class AutoJoinManager extends EventEmitter {
           
           // ✅ Attach message listeners
           client.on('messageCreate', messageHandler);
-          client.on('messageUpdate', (_oldMsg, newMsg) => {
-            if (newMsg) messageHandler(newMsg as Message);
-          });
+          client.on('messageUpdate', messageUpdateHandler);
           
           // ✅ Attach win detection listener
           client.on('messageCreate', winHandler);
@@ -435,6 +458,7 @@ export class AutoJoinManager extends EventEmitter {
           wins: 0,
         },
         messageHandler,
+        messageUpdateHandler,
         winHandler,
       };
 
@@ -730,10 +754,16 @@ export class AutoJoinManager extends EventEmitter {
     
     if (session) {
       try {
-        // ✅ Remove message listeners before destroying
+        // ✅ FIX: remove each listener with the exact reference it was
+        // registered with. Previously 'messageUpdate' was being removed
+        // using session.messageHandler, which never matched the anonymous
+        // function actually registered — so the real listener was never
+        // detached and accumulated on every restart.
         if (session.messageHandler) {
           session.client.off('messageCreate', session.messageHandler);
-          session.client.off('messageUpdate', session.messageHandler);
+        }
+        if (session.messageUpdateHandler) {
+          session.client.off('messageUpdate', session.messageUpdateHandler);
         }
         if (session.winHandler) {
           session.client.off('messageCreate', session.winHandler);
