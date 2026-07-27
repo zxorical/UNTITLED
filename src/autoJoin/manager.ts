@@ -17,6 +17,7 @@
  * 11. ✅ FIX: Use proper detection from autoJoin.ts
  * 12. ✅ FIX: Proper button detection with TRUSTED_ENTRY_CUSTOM_IDS
  * 13. ✅ FIX: Handle GiveawayBoat bare participant count buttons
+ * 14. ✅ FIX: postInteraction uses session.client not this.client
  */
 
 import { Client, Message, TextChannel } from 'discord.js-selfbot-v13';
@@ -842,7 +843,7 @@ export class AutoJoinManager extends EventEmitter {
           await selfbotMsg.clickButton(button);
         } else {
           // Fallback: POST interaction directly
-          await this.postInteraction(message, button);
+          await this.postInteraction(message, button, session);
         }
         
         logger.info(`✅ Entered giveaway`, {
@@ -967,11 +968,11 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   // ============================================================================
-  // Interaction POST - From autoJoin.ts
+  // Interaction POST - From autoJoin.ts (FIXED: uses session.client)
   // ============================================================================
 
-  private async postInteraction(message: Message, customId: string): Promise<void> {
-    const clientAny = this.client as unknown as Record<string, unknown>;
+  private async postInteraction(message: Message, customId: string, session: AutoJoinSession): Promise<void> {
+    const clientAny = session.client as unknown as Record<string, unknown>;
     const sessionId = (clientAny['sessionId'] ?? clientAny['session_id'] ?? Date.now().toString()) as string;
     const nonce = `${Date.now()}${Math.random().toString(36).slice(2, 8)}`;
     const messageAny = message as unknown as Record<string, unknown>;
@@ -996,7 +997,7 @@ export class AutoJoinManager extends EventEmitter {
     };
 
     try {
-      const token = (this.client as any).token;
+      const token = (session.client as any).token;
       await this.http.post('/interactions', payload, {
         headers: {
           'Authorization': token,
@@ -1016,7 +1017,7 @@ export class AutoJoinManager extends EventEmitter {
         await delay(retryAfterMs);
         await this.http.post('/interactions', payload, {
           headers: {
-            'Authorization': (this.client as any).token,
+            'Authorization': (session.client as any).token,
             'Content-Type': 'application/json',
           },
         });
