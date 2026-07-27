@@ -1,6 +1,18 @@
 /**
  * @module tokenManager
  * Token encryption, validation, and session management
+ *
+ * MEMORY FIX:
+ * validateDiscordToken() and startTokenSession() previously created a
+ * discord.js-selfbot-v13 Client and, on a failed login, never called
+ * client.destroy() — the Client (open socket, internal caches, timers)
+ * was simply dropped from scope and leaked. Both are called frequently
+ * (every AutoJoinManager session start/reconnect/retry cycle, every
+ * premium token submission, every boot-time restore), so any token that
+ * was even occasionally flaky would leak a full Client on every failed
+ * attempt. Fixed by always destroying the client in a `finally`/on the
+ * failure path, and by not registering a session in the `sessions` map
+ * unless login actually succeeded.
  */
 
 import crypto from 'crypto';
@@ -44,13 +56,21 @@ export function decryptToken(encrypted: string): string {
 // ============================================================================
 
 export async function validateDiscordToken(token: string): Promise<boolean> {
+  const client = new Client();
   try {
-    const client = new Client();
     await client.login(token);
-    await client.destroy();
     return true;
   } catch {
     return false;
+  } finally {
+    // Always destroy, whether login succeeded or failed — previously
+    // this only ran on the success path, leaking a Client (open socket,
+    // caches, timers) on every failed validation.
+    try {
+      await client.destroy();
+    } catch {
+      // Ignore — client may not have gotten far enough to need cleanup
+    }
   }
 }
 
@@ -69,12 +89,22 @@ interface TokenSession {
 
 const sessions = new Map<string, TokenSession>();
 
-export function startTokenSession(
+/**
+ * Starts a token session. Returns true if login succeeded and the
+ * session was registered, false otherwise.
+ *
+ * IMPORTANT: this is now async and must be awaited by callers. The
+ * previous fire-and-forget version registered the session in `sessions`
+ * unconditionally, before login had even resolved — a failed login left
+ * a permanently orphaned Client sitting in the map forever, since
+ * nothing ever called stopSession() for it.
+ */
+export async function startTokenSession(
   userId: string,
   guildId: string,
   token: string,
   label: string
-): void {
+): Promise<boolean> {
   const sessionKey = `${userId}:${guildId}`;
 
   if (sessions.has(sessionKey)) {
@@ -82,13 +112,22 @@ export function startTokenSession(
   }
 
   const client = new Client();
-  client.login(token).catch((error) => {
+
+  try {
+    await client.login(token);
+  } catch (error) {
     logger.error('Failed to start token session', {
       userId,
       guildId,
       error: String(error),
     });
-  });
+    try {
+      await client.destroy();
+    } catch {
+      // Ignore
+    }
+    return false;
+  }
 
   sessions.set(sessionKey, {
     client,
@@ -100,6 +139,7 @@ export function startTokenSession(
   });
 
   logger.info('Token session started', { userId, guildId, label });
+  return true;
 }
 
 export function stopTokenSession(userId: string, guildId: string): void {
@@ -150,8 +190,13 @@ export async function restoreTokenSessionsFromDatabase(): Promise<number> {
 
       try {
         const decryptedToken = decryptToken(user.token);
-        startTokenSession(user.userId, user.guildId, decryptedToken, user.tokenLabel || 'main');
-        restored++;
+        const success = await startTokenSession(
+          user.userId,
+          user.guildId,
+          decryptedToken,
+          user.tokenLabel || 'main'
+        );
+        if (success) restored++;
       } catch (error) {
         logger.error('Failed to restore token session', {
           userId: user.userId,
