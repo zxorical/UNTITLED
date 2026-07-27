@@ -65,7 +65,7 @@ interface BoosterPremium {
 
 // AutoJoin Entry - stored in MongoDB to save memory
 interface AutoJoinEntry {
-  _id: string; // entryId (channelId:messageId)
+  _id: string; // entryId (userId:channelId:messageId)
   userId: string;
   messageId: string;
   channelId: string;
@@ -153,11 +153,6 @@ async function connect(): Promise<void> {
       await autoJoinEntriesCol.createIndex(
         { expiresAt: 1 },
         { expireAfterSeconds: 0 }
-      );
-      // Compound index for lookups
-      await autoJoinEntriesCol.createIndex(
-        { userId: 1, messageId: 1, channelId: 1 },
-        { unique: true }
       );
       // Index for cleaning up old entries
       await autoJoinEntriesCol.createIndex({ detectedAt: -1 });
@@ -889,6 +884,7 @@ export async function setTokenActive(
 
 // ---------------------------------------------------------------------------
 // AutoJoin Entries - MongoDB storage for giveaway entries
+// FIXED: Include userId in _id to prevent duplicate key errors
 // ---------------------------------------------------------------------------
 
 export async function getAutoJoinEntriesCollection(): Promise<Collection<AutoJoinEntry>> {
@@ -898,9 +894,10 @@ export async function getAutoJoinEntriesCollection(): Promise<Collection<AutoJoi
 
 export async function saveAutoJoinEntry(entry: Omit<AutoJoinEntry, '_id'>): Promise<void> {
   await ensureConnected();
+  // FIX: Include userId in _id to prevent duplicate key errors
   const entryWithId: AutoJoinEntry = {
     ...entry,
-    _id: `${entry.channelId}:${entry.messageId}`,
+    _id: `${entry.userId}:${entry.channelId}:${entry.messageId}`,
   };
   await autoJoinEntriesCol.insertOne(entryWithId);
 }
@@ -911,8 +908,8 @@ export async function getAutoJoinEntry(
   channelId: string
 ): Promise<AutoJoinEntry | null> {
   await ensureConnected();
-  const entryId = `${channelId}:${messageId}`;
-  return autoJoinEntriesCol.findOne({ _id: entryId, userId });
+  const entryId = `${userId}:${channelId}:${messageId}`;
+  return autoJoinEntriesCol.findOne({ _id: entryId });
 }
 
 export async function updateAutoJoinEntryStatus(
@@ -923,9 +920,9 @@ export async function updateAutoJoinEntryStatus(
   updates?: Partial<Omit<AutoJoinEntry, '_id' | 'userId' | 'messageId' | 'channelId'>>
 ): Promise<void> {
   await ensureConnected();
-  const entryId = `${channelId}:${messageId}`;
+  const entryId = `${userId}:${channelId}:${messageId}`;
   await autoJoinEntriesCol.updateOne(
-    { _id: entryId, userId },
+    { _id: entryId },
     { $set: { status, ...updates } }
   );
 }
@@ -936,8 +933,8 @@ export async function deleteAutoJoinEntry(
   channelId: string
 ): Promise<void> {
   await ensureConnected();
-  const entryId = `${channelId}:${messageId}`;
-  await autoJoinEntriesCol.deleteOne({ _id: entryId, userId });
+  const entryId = `${userId}:${channelId}:${messageId}`;
+  await autoJoinEntriesCol.deleteOne({ _id: entryId });
 }
 
 export async function cleanupAutoJoinEntries(userId: string): Promise<number> {
