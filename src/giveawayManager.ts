@@ -16,8 +16,8 @@
 import { Client, Message, TextChannel } from 'discord.js-selfbot-v13';
 import { EventEmitter } from 'events';
 import { CONFIG } from './config.js';
-import { AppLogger } from './logger.js';
-import { delay, formatError } from './utils.js';
+import { logger } from './logger.js';  // ✅ ADD THIS
+import { delay, formatError } from './utils.js';  // ✅ ADD THIS
 import { GiveawayData } from './types.js';
 import {
   insertGiveaway,
