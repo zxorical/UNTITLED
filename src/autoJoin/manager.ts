@@ -3,18 +3,16 @@
  * 
  * Premium AutoJoiner - PRODUCTION GRADE - MEMORY SAFE
  * 
- * FIXED:
- * - Session start timeout handling
- * - Proper client cleanup on failure
- * - Better error logging
- * - Retry logic with exponential backoff
- * - Session key now includes guildId to prevent conflicts
- * - Token validation without leaking clients
- * - Session error tracking and throttling
- * - Fixed missing methods that were cut off
+ * Based on the working autoJoin.ts detection logic with:
+ * - Multi-session support
+ * - Premium user management
+ * - MongoDB persistence
+ * - Queue system with retries
+ * - Win detection
+ * - Webhook notifications
  */
 
-import { Client, Message, TextChannel, ClientOptions, Options, NewsChannel, PartialMessage } from 'discord.js-selfbot-v13';
+import { Client, Message, TextChannel, ClientOptions, Options, PartialMessage } from 'discord.js-selfbot-v13';
 import { EventEmitter } from 'events';
 import axios, { AxiosInstance } from 'axios';
 import http from 'http';
@@ -28,7 +26,6 @@ import {
   truncate,
   sanitizeForLog,
   formatTimestamp,
-  hasGiveawayKeyword,
 } from '../utils.js';
 import {
   incrementTokenEntries,
@@ -224,31 +221,109 @@ interface AccountStats {
 }
 
 // ---------------------------------------------------------------------------
-// Constants - 8GB RAM Optimized
+// Constants - Based on working autoJoin.ts
 // ---------------------------------------------------------------------------
 
-const PATTERNS = {
-  ENTRY_BUTTON: /\b(enter|join|participate|raffle|sweepstakes|submit|claim|sign\s*up|go)\b|🎉|🎁|🏆|^\d[\d,]*$/i,
-  BLOCKED_BUTTON: /\b(leave|quit|exit|unenter|withdraw|remove\s+entry|cancel\s+(entry|giveaway)|end\s+giveaway)\b/i,
-  BLOCKED_CONTENT: /\b(already\s+entered|already\s+(?:in|participating)|already\s+joined|leave\s+giveaway)\b/i,
-  WIN: /(?:congratulations?|you(?:(?:'ve|\s+have)\s+won| won\s| are|'re)|winner|has\s+won|won\s+(?:the\s+)?giveaway|won\s+(?:a\s+)?(?:prize|raffle))/i,
-  TIMESTAMP: /<t:(\d{10,13})(?::[a-zA-Z])?>/,
-  DRAFT_BUTTON: /\b(start|edit|cancel|preview|setup)\b/i,
-  GIVEAWAY_KEYWORD: /\bgiveaway\b|\braffle\b|\bsweepstakes\b|\bwin\b|\bprize\b/i,
-  CROSSPOST_REFERENCE: /https:\/\/discord\.com\/channels\/(\d+)\/(\d+)\/(\d+)/,
-} as const;
-
+/**
+ * Known giveaway bot Snowflake IDs.
+ * Used for ENTRY detection only (bypasses the keyword requirement when
+ * scanning for a clickable button). Win detection deliberately does NOT
+ * require the author to be in this list.
+ */
 const KNOWN_GIVEAWAY_BOT_IDS: ReadonlySet<string> = new Set([
-  '294882584201003009', '739448630517039104', '515195524879237130',
-  '235148962103951360', '282859044593598464', '270904126974590976',
-  '508391840525975553', '530082442967646230',
+  '294882584201003009', // GiveawayBot
+  '739448630517039104', // GiveawayBoat
+  '515195524879237130',
+  '235148962103951360',
+  '282859044593598464',
+  '270904126974590976',
+  '508391840525975553',
+  '530082442967646230',
 ]);
 
+/**
+ * customIds that are always giveaway entry buttons regardless of their label.
+ * GiveawayBoat uses customId "giveaway_message" with a bare participant
+ * count as the label (e.g. "815", "1,292") — no text like "Enter" appears.
+ */
 const TRUSTED_ENTRY_CUSTOM_IDS: ReadonlySet<string> = new Set([
-  'giveaway_message', 'giveaway-enter', 'enter_giveaway',
-  'giveaway_enter', 'join_giveaway', 'giveaway-join',
-  'giveaway_participate', 'participate_giveaway', 'enter', 'participants',
+  'giveaway_message',   // GiveawayBoat — participant count button
+  'giveaway-enter',
+  'enter_giveaway',
+  'giveaway_enter',
+  'join_giveaway',
+  'giveaway-join',
+  'giveaway_participate',
+  'participate_giveaway',
+  'enter',
+  'participants',
 ]);
+
+/**
+ * Regex patterns for button labels that must NEVER be clicked.
+ * GiveawayBoat sends "Leave Giveaway" on its confirmation ephemeral.
+ */
+const BLOCKED_BUTTON_LABELS: ReadonlyArray<RegExp> = [
+  /\bleave\b/i,
+  /\bquit\b/i,
+  /\bexit\b/i,
+  /\bunenter\b/i,
+  /\bwithdraw\b/i,
+  /remove\s+entry/i,
+  /cancel\s+entry/i,
+  /cancel\s+giveaway/i,
+  /end\s+giveaway/i,
+];
+
+/**
+ * Button labels that identify a giveaway ENTRY button.
+ * A button whose label matches ANY of these (and is not blocked) is clickable.
+ * Also accepts bare numbers — GiveawayBoat shows the participant count as
+ * the button label (e.g. "815", "1,292").
+ */
+const ENTRY_BUTTON_PATTERNS: ReadonlyArray<RegExp> = [
+  /\benter\b/i,
+  /\bjoin\b/i,
+  /\bparticipate\b/i,
+  /\braffle\b/i,
+  /\bsweepstakes\b/i,
+  /\bsubmit\b/i,
+  /count\s+me\s+in/i,
+  /\bgiveaway\b/i,
+  /🎉/,
+  /🎁/,
+  /🏆/,
+  /^\d[\d,]*$/,   // bare participant count — GiveawayBoat style (e.g. "815", "1,292")
+];
+
+/**
+ * If ANY of these patterns match the message's plain-text content the entire
+ * message is rejected for ENTRY — even from known bots.
+ */
+const BLOCKED_MESSAGE_CONTENT: ReadonlyArray<RegExp> = [
+  /already\s+entered\s+this\s+giveaway/i,
+  /you(?:'ve|\s+have)\s+already\s+entered/i,
+  /you\s+are\s+already\s+(?:in|entered|participating)/i,
+  /you(?:'ve|\s+have)\s+already\s+(?:joined|joined\s+this)/i,
+  /leave\s+giveaway/i,
+];
+
+/**
+ * Win notification patterns.
+ * Checked against the FULL combined text of a message.
+ */
+const WIN_PATTERNS: ReadonlyArray<RegExp> = [
+  /congratulations?[^.!?\n]{0,60}(?:you|won)/i,
+  /you(?:'ve|\s+have)\s+won/i,
+  /you\s+won\s/i,
+  /you\s+are\s+(?:a\s+)?(?:the\s+)?winner/i,
+  /\bwinner[s]?\b/i,
+  /has\s+won\s+(?:the\s+)?giveaway/i,
+  /won\s+the\s+giveaway/i,
+  /won\s+(?:a\s+)?(?:the\s+)?(?:prize|raffle|giveaway)/i,
+  /🎉\s*congrat/i,
+  /🏆\s*(?:congrat|winner|you)/i,
+];
 
 // Detection stages
 const DETECTION_STAGES = {
@@ -260,10 +335,10 @@ const DETECTION_STAGES = {
   EXPENSIVE_PROFILE_MATCH: 5,
 } as const;
 
-// Confidence thresholds
-const CONFIDENCE_HIGH = 0.8;
-const CONFIDENCE_MEDIUM = 0.5;
-const CONFIDENCE_LOW = 0.3;
+// Confidence thresholds - INCREASED to reduce false positives
+const CONFIDENCE_HIGH = 0.9;
+const CONFIDENCE_MEDIUM = 0.75;
+const CONFIDENCE_LOW = 0.6;  // Was 0.3 - much higher threshold
 
 // Queue limits
 const MAX_QUEUE_SIZE = 1000;
@@ -323,7 +398,6 @@ const METRICS_SAMPLE_SIZE = 100;
 // Session login timeouts
 const LOGIN_TIMEOUT_MS = 15000;
 const READY_TIMEOUT_MS = 10000;
-const SESSION_START_TIMEOUT_MS = 30000;
 
 // ---------------------------------------------------------------------------
 // LRU Cache Implementation
@@ -1075,7 +1149,7 @@ class WatchlistManager {
 }
 
 // ---------------------------------------------------------------------------
-// Multi-Stage Detection Engine
+// Detection Engine - Based on working autoJoin.ts
 // ---------------------------------------------------------------------------
 
 class DetectionEngine {
@@ -1114,89 +1188,104 @@ class DetectionEngine {
     let totalConfidence = 0;
     let stageCount = 0;
 
-    // Stage 1: Cheap keyword scan
-    const keywordScore = this.cheapKeywordScan(message);
-    if (keywordScore > 0) {
-      totalConfidence += keywordScore;
-      stageCount++;
-      reasons.push(`Keyword match: ${keywordScore.toFixed(2)}`);
+    // Stage 1: Check blocked content first (from working autoJoin.ts)
+    const rawContent = message.content ?? '';
+    if (BLOCKED_MESSAGE_CONTENT.some(re => re.test(rawContent))) {
+      return { isGiveaway: false, confidence: 0, reasons: ['Blocked content'], button: undefined, prize: undefined };
     }
 
-    // Stage 2: Cheap bot ID match
-    const botMatch = this.cheapBotIdMatch(message);
-    if (botMatch) {
-      totalConfidence += 0.4;
+    // Stage 2: Check for known bot or keyword
+    const isKnownBot = this.cheapBotIdMatch(message);
+    const hasKeyword = this.messageHasKeyword(message);
+    const hasSignal = isKnownBot || hasKeyword;
+
+    if (!hasSignal) {
+      return { isGiveaway: false, confidence: 0, reasons: ['No signal'], button: undefined, prize: undefined };
+    }
+
+    // Stage 3: Try to extract entry button immediately
+    let button = this.extractEntryButton(message, isKnownBot);
+    if (button) {
+      totalConfidence += 0.8;
+      stageCount++;
+      reasons.push('Entry button found');
+    }
+
+    // Stage 4: Keyword scoring
+    if (hasKeyword) {
+      totalConfidence += 0.3;
+      stageCount++;
+      reasons.push('Keyword match');
+    }
+
+    // Stage 5: Bot ID match
+    if (isKnownBot) {
+      totalConfidence += 0.2;
       stageCount++;
       reasons.push(`Known bot: ${message.author?.username}`);
     }
 
-    if (totalConfidence > 0 || stageCount > 0) {
-      // Stage 3: Expensive button analysis
-      const buttonResult = await this.expensiveButtonAnalysis(message, correlationId);
-      if (buttonResult.score > 0) {
-        totalConfidence += buttonResult.score;
-        stageCount++;
-        reasons.push(...buttonResult.reasons);
-      }
-
-      // Stage 4: Expensive embed parsing
+    // Stage 6: Embed analysis
+    if (message.embeds?.length) {
       const embedResult = this.expensiveEmbedParsing(message);
       if (embedResult.score > 0) {
         totalConfidence += embedResult.score;
         stageCount++;
         reasons.push(...embedResult.reasons);
       }
-
-      // Stage 5: Expensive profile match
-      if (botMatch && message.author?.id) {
-        const profileResult = this.expensiveProfileMatch(message);
-        if (profileResult.score > 0) {
-          totalConfidence += profileResult.score;
-          stageCount++;
-          reasons.push(...profileResult.reasons);
-        }
-      }
     }
 
-    const finalConfidence = stageCount > 0 ? totalConfidence / Math.max(stageCount, 1) : 0;
-    const isGiveaway = finalConfidence >= CONFIDENCE_LOW;
-
-    let button: GiveawayButton | undefined;
-    if (isGiveaway) {
-      button = this.extractEntryButton(message);
-    }
-
-    return {
-      isGiveaway,
-      confidence: Math.min(finalConfidence, 1.0),
-      reasons,
-      button,
-      prize: isGiveaway ? this.extractPrize(message) : undefined,
-      profile: message.author?.id ? this.profiles.get(message.author.id) : undefined,
-    };
-  }
-
-  private cheapKeywordScan(message: Message): number {
-    let score = 0;
-    const content = message.content || '';
-    
-    if (PATTERNS.GIVEAWAY_KEYWORD.test(content)) {
-      score += 0.2;
-    }
-
-    if (message.embeds?.length) {
-      for (const embed of message.embeds) {
-        const embedText = [embed.title, embed.description, embed.footer?.text]
-          .filter(Boolean)
-          .join(' ');
-        if (PATTERNS.GIVEAWAY_KEYWORD.test(embedText)) {
-          score += 0.3;
+    // If no button found, try to fetch with retry (from working autoJoin.ts)
+    if (!button) {
+      for (let i = 0; i < COMPONENT_RETRY_ATTEMPTS; i++) {
+        await delay(COMPONENT_RETRY_DELAY_MS);
+        try {
+          const refreshed = await message.fetch();
+          button = this.extractEntryButton(refreshed, isKnownBot);
+          if (button) {
+            totalConfidence += 0.3;
+            stageCount++;
+            reasons.push('Entry button found after retry');
+            break;
+          }
+        } catch {
           break;
         }
       }
     }
 
-    return Math.min(score, 0.5);
+    // If still no button and no strong signal, reject
+    if (!button && !isKnownBot) {
+      return { 
+        isGiveaway: false, 
+        confidence: 0, 
+        reasons: ['No entry button found'], 
+        button: undefined, 
+        prize: undefined 
+      };
+    }
+
+    const finalConfidence = stageCount > 0 ? Math.min(totalConfidence / Math.max(stageCount, 1), 1.0) : 0;
+    
+    // Only detect if confidence is above threshold
+    if (finalConfidence < CONFIDENCE_LOW) {
+      return { 
+        isGiveaway: false, 
+        confidence: finalConfidence, 
+        reasons: [...reasons, `Confidence below threshold (${finalConfidence.toFixed(2)} < ${CONFIDENCE_LOW})`],
+        button: undefined, 
+        prize: undefined 
+      };
+    }
+
+    return {
+      isGiveaway: true,
+      confidence: finalConfidence,
+      reasons,
+      button,
+      prize: button ? this.extractPrize(message) : 'Unknown Prize',
+      profile: message.author?.id ? this.profiles.get(message.author.id) : undefined,
+    };
   }
 
   private cheapBotIdMatch(message: Message): boolean {
@@ -1204,53 +1293,61 @@ class DetectionEngine {
               KNOWN_GIVEAWAY_BOT_IDS.has(message.author.id));
   }
 
-  private async expensiveButtonAnalysis(
-    message: Message, 
-    correlationId: string
-  ): Promise<{ score: number; reasons: string[] }> {
-    const reasons: string[] = [];
-    let score = 0;
+  private messageHasKeyword(message: Message): boolean {
+    const texts = [
+      message.content ?? '',
+      ...message.embeds.flatMap(e => [
+        e.title ?? '',
+        e.description ?? '',
+        e.footer?.text ?? '',
+        ...(e.fields ?? []).flatMap(f => [f.name, f.value]),
+      ]),
+    ];
+    const giveawayWords = ['giveaway', 'raffle', 'sweepstakes', 'win', 'prize'];
+    return texts.some(t => giveawayWords.some(word => t.toLowerCase().includes(word)));
+  }
 
-    try {
-      if (!(message as any).components?.length) {
-        await delay(COMPONENT_RETRY_DELAY_MS);
-        try { await message.fetch(); } catch {}
-      }
+  private extractEntryButton(message: Message, isKnownBot: boolean): GiveawayButton | undefined {
+    const msgAny = message as unknown as Record<string, unknown>;
+    const components = msgAny['components'] as unknown[] | undefined;
+    if (!components?.length) return undefined;
 
-      const components = (message as any).components;
-      if (!components?.length) return { score: 0, reasons: [] };
+    for (const row of components) {
+      const rowAny = row as Record<string, unknown>;
+      const rowComps = rowAny['components'] as unknown[] | undefined;
+      if (!rowComps) continue;
 
-      for (const row of components) {
-        const rowComps = row?.components;
-        if (!rowComps?.length) continue;
+      for (const comp of rowComps) {
+        const c = comp as Record<string, unknown>;
+        
+        const type = c['type'];
+        if (type !== 2 && type !== 'BUTTON') continue;
+        if (c['style'] === 5) continue; // link button
+        if (c['disabled'] === true) continue;
 
-        for (const comp of rowComps) {
-          if (comp.type !== 2 || comp.style === 5) continue;
+        const customId = (c['customId'] ?? c['custom_id']) as string | undefined;
+        if (!customId) continue;
 
-          const customId = comp.customId || comp.custom_id;
-          const label = (comp.label || '').toLowerCase();
+        const label = ((c['label'] as string | undefined) ?? '').trim();
 
-          if (customId && TRUSTED_ENTRY_CUSTOM_IDS.has(customId)) {
-            score += 0.3;
-            reasons.push(`Trusted button ID: ${customId}`);
-          }
+        // Skip blocked buttons
+        if (BLOCKED_BUTTON_LABELS.some(re => re.test(label))) {
+          continue;
+        }
 
-          if (PATTERNS.ENTRY_BUTTON.test(label)) {
-            score += 0.2;
-            reasons.push(`Entry button: ${label}`);
-          }
+        // Check trusted custom IDs first
+        if (TRUSTED_ENTRY_CUSTOM_IDS.has(customId)) {
+          return { customId, label: label || customId, disabled: false };
+        }
 
-          if (PATTERNS.BLOCKED_BUTTON.test(label)) {
-            score -= 0.1;
-            reasons.push(`Blocked button: ${label}`);
-          }
+        // Check label patterns
+        if (ENTRY_BUTTON_PATTERNS.some(re => re.test(label))) {
+          return { customId, label: label || 'Enter', disabled: false };
         }
       }
-    } catch (error) {
-      // Button analysis failed
     }
 
-    return { score: Math.max(0, Math.min(score, 0.5)), reasons };
+    return undefined;
   }
 
   private expensiveEmbedParsing(message: Message): { score: number; reasons: string[] } {
@@ -1262,7 +1359,7 @@ class DetectionEngine {
     const embed = message.embeds[0];
     
     if (embed.description) {
-      const timestampMatch = embed.description.match(PATTERNS.TIMESTAMP);
+      const timestampMatch = embed.description.match(/<t:(\d{10,13})(?::[a-zA-Z])?>/);
       if (timestampMatch) {
         score += 0.3;
         reasons.push('Countdown timer found');
@@ -1283,61 +1380,6 @@ class DetectionEngine {
     }
 
     return { score: Math.min(score, 0.5), reasons };
-  }
-
-  private expensiveProfileMatch(message: Message): { score: number; reasons: string[] } {
-    const reasons: string[] = [];
-    let score = 0;
-
-    const profile = message.author?.id ? this.profiles.get(message.author.id) : undefined;
-    if (!profile) return { score: 0, reasons: [] };
-
-    const content = (message.content || '').toLowerCase();
-    const embedText = message.embeds?.map(e => 
-      [e.title, e.description, e.footer?.text].filter(Boolean).join(' ')
-    ).join(' ') || '';
-
-    for (const pattern of profile.patterns.buttonPatterns) {
-      if (content.includes(pattern) || embedText.includes(pattern)) {
-        score += 0.1;
-        reasons.push(`Profile pattern match: ${pattern}`);
-      }
-    }
-
-    const accuracy = profile.detectionCount > 0 
-      ? profile.truePositives / profile.detectionCount 
-      : 0.9;
-
-    score *= accuracy;
-
-    return { score: Math.min(score, 0.5), reasons };
-  }
-
-  private extractEntryButton(message: Message): GiveawayButton | undefined {
-    const components = (message as any).components;
-    if (!components?.length) return undefined;
-
-    for (const row of components) {
-      const rowComps = row?.components;
-      if (!rowComps?.length) continue;
-
-      for (const comp of rowComps) {
-        if (comp.type !== 2 || comp.style === 5 || comp.disabled) continue;
-
-        const customId = comp.customId || comp.custom_id;
-        const label = comp.label || '';
-
-        if (customId && TRUSTED_ENTRY_CUSTOM_IDS.has(customId)) {
-          return { customId, label, disabled: false };
-        }
-
-        if (PATTERNS.ENTRY_BUTTON.test(label)) {
-          return { customId: customId || label, label, disabled: false };
-        }
-      }
-    }
-
-    return undefined;
   }
 
   private extractPrize(message: Message): string {
@@ -1409,7 +1451,7 @@ class DetectionEngine {
 // ---------------------------------------------------------------------------
 
 export class AutoJoinManager extends EventEmitter {
-  // Sessions - key now includes guildId to prevent conflicts
+  // Sessions - key includes guildId
   private sessions: Map<string, UserSession> = new Map();
   private sessionsByUserId: Map<string, UserSession> = new Map();
   
@@ -1419,6 +1461,7 @@ export class AutoJoinManager extends EventEmitter {
   private recentWins: LRUCache<string, number>;
   private noResponseCooldown: LRUCache<string, number>;
   private crosspostCache: LRUCache<string, string>;
+  private globalProcessedMessages: LRUCache<string, number>; // Cross-session dedup
   
   // Enhanced systems
   private correlationTracker: CorrelationTracker;
@@ -1479,6 +1522,7 @@ export class AutoJoinManager extends EventEmitter {
     this.recentWins = new LRUCache<string, number>(CACHE_MAX_WINS, WIN_DEDUP_TTL_MS);
     this.noResponseCooldown = new LRUCache<string, number>(CACHE_MAX_COOLDOWN);
     this.crosspostCache = new LRUCache<string, string>(CACHE_CROSSPOST, 3600000);
+    this.globalProcessedMessages = new LRUCache<string, number>(CACHE_PROCESSED_MESSAGES, 300000);
     
     // Initialize enhanced systems
     this.correlationTracker = new CorrelationTracker();
@@ -1630,6 +1674,7 @@ export class AutoJoinManager extends EventEmitter {
     this.recentWins.clear();
     this.noResponseCooldown.clear();
     this.crosspostCache.clear();
+    this.globalProcessedMessages.clear();
     this.tokenManager.clearAll();
     
     if (this.sessionStartPromises.size > 10) {
@@ -1746,7 +1791,6 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   async startSession(userId: string, guildId: string): Promise<boolean> {
-    // Session key now includes guildId to prevent conflicts
     const sessionKey = this.makeSessionKey(userId, guildId);
     
     if (this.sessions.has(sessionKey)) return true;
@@ -1764,11 +1808,10 @@ export class AutoJoinManager extends EventEmitter {
       return this.sessionStartPromises.get(sessionKey)!;
     }
 
-    // Check if this session has been failing repeatedly
     const errorHistory = this.sessionStartErrors.get(sessionKey);
     if (errorHistory) {
       const now = Date.now();
-      if (errorHistory.count >= 5 && now - errorHistory.lastAttempt < 600000) { // 5 failures in 10 minutes
+      if (errorHistory.count >= 5 && now - errorHistory.lastAttempt < 600000) {
         this.asyncLogger.warn('Session start throttled due to repeated failures', {
           userId,
           guildId,
@@ -1777,7 +1820,6 @@ export class AutoJoinManager extends EventEmitter {
         });
         return false;
       }
-      // Reset if it's been a while
       if (now - errorHistory.lastAttempt > 600000) {
         this.sessionStartErrors.delete(sessionKey);
       }
@@ -1789,10 +1831,8 @@ export class AutoJoinManager extends EventEmitter {
     try {
       const result = await startPromise;
       if (result) {
-        // Success - clear error history
         this.sessionStartErrors.delete(sessionKey);
       } else {
-        // Track failure
         const history = this.sessionStartErrors.get(sessionKey) || { count: 0, lastError: '', lastAttempt: 0 };
         history.count++;
         history.lastError = 'Session start returned false';
@@ -1801,7 +1841,6 @@ export class AutoJoinManager extends EventEmitter {
       }
       return result;
     } catch (error) {
-      // Track failure with error
       const history = this.sessionStartErrors.get(sessionKey) || { count: 0, lastError: '', lastAttempt: 0 };
       history.count++;
       history.lastError = formatError(error);
@@ -1814,7 +1853,6 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   private async _startSessionInternal(userId: string, guildId: string): Promise<boolean> {
-    // Session key now includes guildId
     const sessionKey = this.makeSessionKey(userId, guildId);
 
     try {
@@ -1835,7 +1873,6 @@ export class AutoJoinManager extends EventEmitter {
         return false;
       }
 
-      // Validate token before creating session - this prevents leaking clients on invalid tokens
       const isValid = await this.validateToken(decryptedToken);
       if (!isValid) {
         this.asyncLogger.warn('Token validation failed', { userId, guildId });
@@ -1859,6 +1896,17 @@ export class AutoJoinManager extends EventEmitter {
           VoiceStateManager: 0,
           StageInstanceManager: 0,
         }),
+        // Fix deprecation warning - use sweepers
+        sweepers: {
+          messages: {
+            interval: 3600,
+            lifetime: 1800,
+          },
+          threads: {
+            interval: 3600,
+            lifetime: 1800,
+          },
+        },
       };
 
       const client = new Client(clientOptions);
@@ -1887,7 +1935,6 @@ export class AutoJoinManager extends EventEmitter {
 
       this.registerEvents(session);
       
-      // Login with timeout and proper error handling
       try {
         await Promise.race([
           this.loginWithTimeout(client, decryptedToken),
@@ -1901,7 +1948,6 @@ export class AutoJoinManager extends EventEmitter {
         return false;
       }
 
-      // Wait for ready with timeout
       try {
         await Promise.race([
           this.waitForReady(client),
@@ -1928,15 +1974,12 @@ export class AutoJoinManager extends EventEmitter {
         return false;
       }
 
-      // Store session with guild-specific key
       this.sessions.set(sessionKey, session);
       this.sessionsByUserId.set(`${userId}:${guildId}`, session);
       this.startHeartbeat(session);
       
       await setTokenActive(userId, guildId, true);
       await updateTokenLastUsed(userId, guildId);
-
-      // Load watchlist for this user
       await this.watchlistManager.loadKeywords(userId);
 
       this.asyncLogger.info('✅ AutoJoin session started', {
@@ -1965,10 +2008,6 @@ export class AutoJoinManager extends EventEmitter {
     }
   }
 
-  /**
-   * Validate token without leaking client - CRITICAL FIX
-   * This prevents client instances from being leaked on failed logins
-   */
   private async validateToken(token: string): Promise<boolean> {
     const client = new Client();
     try {
@@ -1976,20 +2015,13 @@ export class AutoJoinManager extends EventEmitter {
         client.login(token),
         delay(10000).then(() => { throw new Error('Login timeout'); })
       ]);
-      // Check if client is ready
-      if (client.isReady()) {
-        return true;
-      }
-      return false;
+      return client.isReady();
     } catch {
       return false;
     } finally {
-      // ALWAYS destroy the client to prevent memory leaks
       try {
         await client.destroy();
-      } catch {
-        // Ignore errors during cleanup
-      }
+      } catch {}
     }
   }
 
@@ -2061,12 +2093,10 @@ export class AutoJoinManager extends EventEmitter {
           
           session.destroyed = true;
           
-          // Remove old session
           const oldKey = this.makeSessionKey(session.userId, session.guildId);
           this.sessions.delete(oldKey);
           this.sessionsByUserId.delete(`${session.userId}:${session.guildId}`);
           
-          // Attempt to reconnect with backoff
           const backoffMs = exponentialBackoff(session.reconnectAttempts - 1, 5000, 60000);
           setTimeout(() => {
             this._startSessionInternal(session.userId, session.guildId)
@@ -2254,12 +2284,11 @@ export class AutoJoinManager extends EventEmitter {
         if (!this.checkMemory()) break;
         const sessionKey = this.makeSessionKey(user.userId, user.guildId);
         if (!this.sessions.has(sessionKey)) {
-          // Check if we've been failing this session too much
           const errorHistory = this.sessionStartErrors.get(sessionKey);
           if (errorHistory && errorHistory.count >= 5) {
             const now = Date.now();
-            if (now - errorHistory.lastAttempt < 300000) { // 5 minutes
-              continue; // Skip if too many recent failures
+            if (now - errorHistory.lastAttempt < 300000) {
+              continue;
             }
           }
           await this.startSession(user.userId, user.guildId);
@@ -2276,7 +2305,7 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   // -------------------------------------------------------------------------
-  // Event Handlers
+  // Event Handlers - Based on working autoJoin.ts
   // -------------------------------------------------------------------------
 
   private registerEvents(session: UserSession): void {
@@ -2289,13 +2318,19 @@ export class AutoJoinManager extends EventEmitter {
         this.metrics.totalMessagesProcessed++;
         session.lastHealthCheck = Date.now();
         
+        // Handle DM wins first
         if (!message.guild) {
           await this.handleDmWin(message, userId);
           return;
         }
+        
+        // Skip own messages
         if (message.author?.id === client.user?.id) return;
         
+        // Handle guild wins
         await this.handleWin(message, userId);
+        
+        // Handle giveaway detection
         await this.handleMessage(message, session);
       } catch (error) {
         this.asyncLogger.error('Message handler error', { userId, error: formatError(error) });
@@ -2334,7 +2369,7 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   // -------------------------------------------------------------------------
-  // Message Handling with structured tracing
+  // Message Handling - Based on working autoJoin.ts
   // -------------------------------------------------------------------------
 
   private async handleMessage(message: Message, session: UserSession): Promise<void> {
@@ -2344,6 +2379,13 @@ export class AutoJoinManager extends EventEmitter {
     }
 
     const entryId = this.makeEntryId(session, message);
+
+    // Check global cross-session dedup first
+    const globalKey = `${message.guild?.id}:${message.channel.id}:${message.id}`;
+    if (this.globalProcessedMessages.has(globalKey)) {
+      this.metrics.cacheHits++;
+      return;
+    }
 
     if (this.processedMessages.has(entryId)) {
       this.metrics.cacheHits++;
@@ -2356,6 +2398,9 @@ export class AutoJoinManager extends EventEmitter {
     }
     
     this.metrics.cacheMisses++;
+
+    // Set global dedup immediately
+    this.globalProcessedMessages.set(globalKey, Date.now());
 
     const crosspostId = this.extractCrosspostId(message);
     if (crosspostId && this.crosspostCache.has(crosspostId)) {
@@ -2375,6 +2420,8 @@ export class AutoJoinManager extends EventEmitter {
     this.correlationTracker.startStage(correlationId, 'detection');
 
     const startTime = Date.now();
+    
+    // Check if already in database
     const existing = await getAutoJoinEntry(session.userId, message.id, message.channel.id);
     this.metrics.dbQueries++;
     
@@ -2388,6 +2435,7 @@ export class AutoJoinManager extends EventEmitter {
     this.correlationTracker.startStage(correlationId, 'processing');
 
     try {
+      // Use the detection engine (based on working autoJoin.ts)
       const detected = await this.detectionEngine.detect(message, correlationId);
       this.correlationTracker.endStage(correlationId, 'detection', {
         isGiveaway: detected.isGiveaway,
@@ -2405,6 +2453,7 @@ export class AutoJoinManager extends EventEmitter {
       const detectionTime = Date.now() - startTime;
       this.metrics.recordDetectionTime(detectionTime);
 
+      // Watchlist matches
       const watchlistMatches = this.watchlistManager.matchKeyword(
         message.content + ' ' + 
         message.embeds?.map(e => e.title + ' ' + e.description).join(' ') || ''
@@ -2580,7 +2629,7 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   // -------------------------------------------------------------------------
-  // Enter Giveaway with structured tracing
+  // Enter Giveaway - Based on working autoJoin.ts
   // -------------------------------------------------------------------------
 
   private async enterGiveaway(entryId: string, session: UserSession): Promise<void> {
@@ -2747,7 +2796,7 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   // -------------------------------------------------------------------------
-  // Button Interaction Methods
+  // Button Interaction Methods - Based on working autoJoin.ts
   // -------------------------------------------------------------------------
 
   private async refreshButtonData(entry: GiveawayEntry, session: UserSession): Promise<GiveawayEntry | null> {
@@ -2786,6 +2835,11 @@ export class AutoJoinManager extends EventEmitter {
 
         const label = ((c['label'] as string | undefined) ?? '').trim();
 
+        // Skip blocked buttons
+        if (BLOCKED_BUTTON_LABELS.some(re => re.test(label))) {
+          continue;
+        }
+
         if (isKnownBot) {
           if (customId.includes('giveaway') || customId.includes('enter') || customId.includes('join')) {
             return { customId, label: label || customId, disabled: false };
@@ -2796,7 +2850,7 @@ export class AutoJoinManager extends EventEmitter {
           return { customId, label: label || customId, disabled: false };
         }
 
-        if (PATTERNS.ENTRY_BUTTON.test(label)) {
+        if (ENTRY_BUTTON_PATTERNS.some(re => re.test(label))) {
           return { customId, label: label || 'Enter', disabled: false };
         }
       }
@@ -2996,7 +3050,7 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   // -------------------------------------------------------------------------
-  // Win Detection
+  // Win Detection - Based on working autoJoin.ts
   // -------------------------------------------------------------------------
 
   private async handleWin(message: Message, userId: string): Promise<void> {
@@ -3010,7 +3064,7 @@ export class AutoJoinManager extends EventEmitter {
     if (!mentionedInUsers && !mentionedInContent) return;
 
     const allText = this.extractAllText(message);
-    if (!PATTERNS.WIN.test(allText)) return;
+    if (!WIN_PATTERNS.some(re => re.test(allText))) return;
 
     const dedupKey = `${message.channel.id}:${message.author?.id ?? 'unknown'}`;
     if (this.recentWins.get(dedupKey) !== undefined) return;
@@ -3045,7 +3099,7 @@ export class AutoJoinManager extends EventEmitter {
     if (message.guild) return;
 
     const allText = this.extractAllText(message);
-    if (!PATTERNS.WIN.test(allText)) return;
+    if (!WIN_PATTERNS.some(re => re.test(allText))) return;
 
     const session = this.findSessionByUserId(userId);
     if (session) {
@@ -3305,7 +3359,7 @@ export class AutoJoinManager extends EventEmitter {
   // -------------------------------------------------------------------------
 
   private extractCrosspostId(message: Message): string | undefined {
-    const match = (message.content || '').match(PATTERNS.CROSSPOST_REFERENCE);
+    const match = (message.content || '').match(/https:\/\/discord\.com\/channels\/(\d+)\/(\d+)\/(\d+)/);
     if (match) {
       return `${match[1]}:${match[2]}:${match[3]}`;
     }
@@ -3316,10 +3370,6 @@ export class AutoJoinManager extends EventEmitter {
     }
     
     return undefined;
-  }
-
-  private isKnownGiveawayBot(message: Message): boolean {
-    return !!(message.author?.bot && message.author.id && KNOWN_GIVEAWAY_BOT_IDS.has(message.author.id));
   }
 
   private extractPrize(message: Message): string {
@@ -3344,7 +3394,7 @@ export class AutoJoinManager extends EventEmitter {
 
   private extractEndTimestamp(message: Message): number | undefined {
     const allText = this.extractAllText(message);
-    const match = allText.match(PATTERNS.TIMESTAMP);
+    const match = allText.match(/<t:(\d{10,13})(?::[a-zA-Z])?>/);
     if (!match?.[1]) return undefined;
     const raw = parseInt(match[1], 10);
     const tsMs = raw < 1e12 ? raw * 1000 : raw;
@@ -3374,7 +3424,6 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   private findSessionByUserId(userId: string): UserSession | null {
-    // Find session by userId (any guild)
     for (const [key, session] of this.sessions) {
       if (session.userId === userId) {
         return session;
@@ -3451,6 +3500,7 @@ export class AutoJoinManager extends EventEmitter {
         this.recentWins.clean(),
         this.noResponseCooldown.clean(),
         this.crosspostCache.clean(),
+        this.globalProcessedMessages.clean(),
       ].reduce((a, b) => a + b, 0);
       
       if (cleaned > 0) {
@@ -3492,7 +3542,7 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   // -------------------------------------------------------------------------
-  // Stats and Health (already defined above)
+  // Stats and Health
   // -------------------------------------------------------------------------
 
   getStats() {
@@ -3534,6 +3584,7 @@ export class AutoJoinManager extends EventEmitter {
         noResponseCooldown: this.noResponseCooldown.size,
         tokenCache: this.tokenManager.getCacheStats(),
         crosspostCache: this.crosspostCache.size,
+        globalProcessed: this.globalProcessedMessages.size,
       },
       memory: {
         heapUsedMB: mem.heapUsedMB,
@@ -3554,7 +3605,6 @@ export class AutoJoinManager extends EventEmitter {
       sessionStartPromises: this.sessionStartPromises.size,
       uptime: Math.round((Date.now() - metrics.startTime) / 1000 / 60),
       
-      // Enhanced monitoring
       queue: this.joinQueue.getStats(),
       detection: this.detectionEngine.getStats(),
       watchlist: this.watchlistManager.getStats(),
@@ -3670,6 +3720,7 @@ export class AutoJoinManager extends EventEmitter {
     this.recentWins.clear();
     this.noResponseCooldown.clear();
     this.crosspostCache.clear();
+    this.globalProcessedMessages.clear();
     this.tokenManager.clearAll();
     this.sessionStartPromises.clear();
     this.guildStats.clear();
