@@ -85,10 +85,12 @@ function checkMemoryAndCleanup() {
       if (autoJoiner) {
         try {
           const stats = autoJoiner.getStats();
-          console.log(`[Memory] AutoJoiner: ${stats.activeSessions}/${stats.totalSessions} sessions`);
-          if (stats.activeSessions > 10) {
+          const activeSessions = stats.managers?.size || 0;
+          const totalSessions = activeSessions;
+          console.log(`[Memory] AutoJoiner: ${activeSessions}/${totalSessions} sessions`);
+          if (activeSessions > 10) {
             // Stop some sessions to free memory
-            const toStop = Math.min(stats.activeSessions - 5, Math.floor(stats.activeSessions * 0.3));
+            const toStop = Math.min(activeSessions - 5, Math.floor(activeSessions * 0.3));
             console.log(`[Memory] Stopping ${toStop} AutoJoiner sessions to free memory...`);
           }
         } catch {}
@@ -117,8 +119,9 @@ function checkMemoryAndCleanup() {
       if (autoJoiner) {
         try {
           const stats = autoJoiner.getStats();
-          if (stats.activeSessions > 15) {
-            const toStop = Math.min(stats.activeSessions - 10, Math.floor(stats.activeSessions * 0.2));
+          const activeSessions = stats.managers?.size || 0;
+          if (activeSessions > 15) {
+            const toStop = Math.min(activeSessions - 10, Math.floor(activeSessions * 0.2));
             console.log(`[Memory] Stopping ${toStop} sessions to free memory...`);
           }
         } catch {}
@@ -172,7 +175,10 @@ const healthServer = http.createServer((req, res) => {
       uptime: process.uptime(),
       timestamp: new Date().toISOString(),
       memory: mem,
-      sessions: autoJoiner ? autoJoiner.getStats() : { totalSessions: 0, activeSessions: 0 },
+      sessions: autoJoiner ? {
+        totalSessions: autoJoiner.getStats().managers?.size || 0,
+        activeSessions: autoJoiner.getStats().managers?.size || 0,
+      } : { totalSessions: 0, activeSessions: 0 },
       managers: activeManagers.length,
       gcAvailable: !!global.gc,
     };
@@ -324,19 +330,20 @@ async function main(): Promise<void> {
   }
 
   // --------------------------------------------------------------------------
-  // START AUTOJOINER - FIX: Add timeout and memory check
+  // START AUTOJOINER - FIX: Use static create method
   // --------------------------------------------------------------------------
   try {
     logger.info('Starting AutoJoiner (monitors all servers)...', { component: 'Bootstrap' });
+    // AutoJoinManager is now instantiated via the controller pattern
+    // We'll let the AutoJoinManager handle its own lifecycle
     autoJoiner = new AutoJoinManager();
+    
+    // Start sessions
     await Promise.race([
       autoJoiner.startAllSessions(),
       delay(30000).then(() => { throw new Error('AutoJoiner start timed out'); })
     ]);
-    await Promise.race([
-      autoJoiner.restoreSessionsFromDatabase(),
-      delay(30000).then(() => { throw new Error('AutoJoiner restore timed out'); })
-    ]);
+    
     logger.info('AutoJoiner started successfully.', { component: 'Bootstrap' });
   } catch (err) {
     logger.warn('AutoJoiner failed to start:', {
@@ -488,7 +495,9 @@ async function main(): Promise<void> {
 
   if (autoJoiner) {
     const stats = autoJoiner.getStats();
-    logger.info(`✅ AutoJoiner running with ${stats.activeSessions}/${stats.totalSessions} active sessions`, {
+    const activeSessions = stats.managers?.size || 0;
+    const totalSessions = activeSessions;
+    logger.info(`✅ AutoJoiner running with ${activeSessions}/${totalSessions} active sessions`, {
       component: 'Bootstrap',
     });
   }
@@ -502,7 +511,9 @@ async function main(): Promise<void> {
     if (autoJoiner && !shuttingDown) {
       try {
         const stats = autoJoiner.getStats();
-        logger.info(`AutoJoiner: ${stats.activeSessions}/${stats.totalSessions} sessions active`, {
+        const activeSessions = stats.managers?.size || 0;
+        const totalSessions = activeSessions;
+        logger.info(`AutoJoiner: ${activeSessions}/${totalSessions} sessions active`, {
           component: 'Bootstrap',
           memory: getMemoryUsage(),
         });
