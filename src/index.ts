@@ -289,7 +289,7 @@ async function main(): Promise<void> {
   }
 
   // --------------------------------------------------------------------------
-  // START AUTOJOINER - USING ORIGINAL WORKING VERSION
+  // START AUTOJOINER
   // --------------------------------------------------------------------------
   try {
     logger.info('Starting AutoJoiner (monitors all servers)...', { component: 'Bootstrap' });
