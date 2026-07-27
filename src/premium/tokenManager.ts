@@ -11,6 +11,7 @@
  * 6. Concurrent restore prevention
  * 7. Active session tracking with cleanup
  * 8. Debug logging for session lifecycle
+ * 9. Fixed client.once type error with 'as any'
  */
 
 import crypto from 'crypto';
@@ -148,7 +149,8 @@ export async function startTokenSession(
         resolve();
       } else {
         const timeout = setTimeout(() => resolve(), 5000);
-        client.once('ready', () => {
+        // FIXED: Added 'as any' to fix TypeScript error
+        client.once('ready' as any, () => {
           clearTimeout(timeout);
           resolve();
         });
