@@ -25,7 +25,7 @@
  * 35. Worker stall detection and auto-recovery
  */
 
-import { Client, Message, TextChannel, ClientOptions, Options, NewsChannel } from 'discord.js-selfbot-v13';
+import { Client, Message, TextChannel, ClientOptions, Options, NewsChannel, PartialMessage } from 'discord.js-selfbot-v13';
 import { EventEmitter } from 'events';
 import axios, { AxiosInstance } from 'axios';
 import http from 'http';
@@ -94,6 +94,35 @@ interface GiveawayEntry {
   crosspostSource?: string;
 }
 
+// Extended AutoJoinEntry type matching database structure
+interface AutoJoinEntry {
+  _id: string;
+  userId: string;
+  messageId: string;
+  channelId: string;
+  guildId: string;
+  authorId: string;
+  guildName: string;
+  channelName: string;
+  prize: string;
+  buttonCustomId?: string;
+  detectedAt: number;
+  endsAt?: number;
+  status: 'pending' | 'queued' | 'attempting' | 'success' | 'failed' | 'skipped' | 'dead_letter';
+  attempts: number;
+  lastAttemptAt?: number;
+  lastError?: string;
+  expiresAt: number;
+  correlationId?: string;
+  detectionConfidence?: number;
+  detectionReasons?: string[];
+  crosspostSource?: string;
+  queuePosition?: number;
+  entryTimeMs?: number;
+  archived?: boolean;
+  archivedAt?: number;
+}
+
 interface GiveawayButton {
   customId: string;
   label: string;
@@ -114,7 +143,7 @@ interface UserSession {
   rateLimiter: TokenBucket;
   listeners: {
     messageCreate?: (message: Message) => void;
-    messageUpdate?: (old: Message, updated: Message) => void;
+    messageUpdate?: (oldMessage: Message | PartialMessage, newMessage: Message | PartialMessage) => void;
     error?: (error: Error) => void;
     disconnect?: () => void;
   };
@@ -1455,7 +1484,7 @@ export class AutoJoinManager extends EventEmitter {
     this.processingCache = new LRUCache<string, number>(CACHE_MAX_PROCESSING, PROCESSING_CACHE_TTL_MS);
     this.recentWins = new LRUCache<string, number>(CACHE_MAX_WINS, WIN_DEDUP_TTL_MS);
     this.noResponseCooldown = new LRUCache<string, number>(CACHE_MAX_COOLDOWN);
-    this.crosspostCache = new LRUCache<string, number>(CACHE_CROSSPOST, 3600000);
+    this.crosspostCache = new LRUCache<string, string>(CACHE_CROSSPOST, 3600000);
     
     // Initialize enhanced systems
     this.correlationTracker = new CorrelationTracker();
@@ -1909,7 +1938,6 @@ export class AutoJoinManager extends EventEmitter {
         if (session.reconnectAttempts < session.maxReconnectAttempts) {
           session.reconnectAttempts++;
           
-          // Track reconnect count
           const count = (this.reconnectCount.get(session.userId) || 0) + 1;
           this.reconnectCount.set(session.userId, count);
           
@@ -2330,13 +2358,13 @@ export class AutoJoinManager extends EventEmitter {
       }
     };
 
-    const messageUpdateHandler = async (_old: Message, updated: Message) => {
+    const messageUpdateHandler = async (_old: Message | PartialMessage, updated: Message | PartialMessage) => {
       if (this.isShuttingDown || !session.isActive || session.destroyed) return;
       try {
         // Process edited messages as potentially new giveaways
-        const entryId = this.makeEntryId(session, updated);
+        const entryId = this.makeEntryId(session, updated as Message);
         if (!this.processedMessages.has(entryId)) {
-          await this.handleMessage(updated, session);
+          await this.handleMessage(updated as Message, session);
         }
       } catch (error) {
         this.asyncLogger.error('Message update handler error', { userId, error: formatError(error) });
@@ -2479,7 +2507,7 @@ export class AutoJoinManager extends EventEmitter {
         crosspostSource: this.extractCrosspostId(message),
       };
 
-      await saveAutoJoinEntry(entryData);
+      await saveAutoJoinEntry(entryData as Omit<AutoJoinEntry, '_id'>);
       this.metrics.dbQueries++;
       
       this.detectionConfidenceBuffer.push({
@@ -2588,7 +2616,7 @@ export class AutoJoinManager extends EventEmitter {
       if (item.endsAt && Date.now() > item.endsAt) {
         this.joinQueue.cancelGiveaway(item.messageId, item.channelId);
         await updateAutoJoinEntryStatus(userId, item.messageId, item.channelId, 'skipped', {
-          reason: 'giveaway_ended',
+          lastError: 'giveaway_ended',
         });
         this.correlationTracker.completeTrace(correlationId, 'completed');
         item = this.joinQueue.dequeue(guildId);
@@ -2648,7 +2676,7 @@ export class AutoJoinManager extends EventEmitter {
 
       if (attempt === 2) {
         try {
-          const refreshedEntry = await this.refreshButtonData(entry, session);
+          const refreshedEntry = await this.refreshButtonData(entry as GiveawayEntry, session);
           if (refreshedEntry && refreshedEntry.buttonCustomId !== entry.buttonCustomId) {
             entry.buttonCustomId = refreshedEntry.buttonCustomId;
           }
@@ -2661,7 +2689,7 @@ export class AutoJoinManager extends EventEmitter {
       }
 
       try {
-        const skipped = await this.enterViaButton(entry, session);
+        const skipped = await this.enterViaButton(entry as GiveawayEntry, session);
         if (skipped) {
           await updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'skipped', {});
           this.metrics.dbQueries++;
@@ -2678,7 +2706,6 @@ export class AutoJoinManager extends EventEmitter {
 
         await updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'success', { 
           attempts: attemptNum,
-          entryTimeMs: entryTime,
         });
         this.metrics.dbQueries++;
         await incrementTokenEntries(session.userId, session.guildId);
@@ -2696,8 +2723,8 @@ export class AutoJoinManager extends EventEmitter {
           timestamp: Date.now(),
         });
 
-        this.updateGuildStats(entry.guildId, entry.guildName, 'entered', entry.detectionConfidence);
-        this.updateAccountStats(session.userId, 'entered', entry.detectionConfidence);
+        this.updateGuildStats(entry.guildId, entry.guildName, 'entered', entry.detectionConfidence || 0);
+        this.updateAccountStats(session.userId, 'entered', entry.detectionConfidence || 0);
 
         this.correlationTracker.completeTrace(correlationId, 'completed');
 
@@ -2722,7 +2749,7 @@ export class AutoJoinManager extends EventEmitter {
         if (isNoResponse && attempt < maxAttempts - 1) {
           this.noResponseCooldown.set(session.userId, Date.now() + NO_RESPONSE_COOLDOWN_MS);
           await delay(2000);
-          try { await this.refreshButtonData(entry, session); } catch {}
+          try { await this.refreshButtonData(entry as GiveawayEntry, session); } catch {}
           continue;
         }
 
