@@ -1,20 +1,34 @@
 /**
  * @module autoJoin/manager
  * 
- * Premium AutoJoiner - MEMORY SAFE
+ * Premium AutoJoiner - PRODUCTION GRADE - 8GB RAM OPTIMIZED
  * 
- * Critical memory fixes:
- * 1. Proper event listener cleanup on session stop
- * 2. Working LRU cache with size limits
- * 3. Full client destruction with cleanup
- * 4. Memory monitoring and forced GC
- * 5. Queue size limits
- * 6. Circuit breaker auto-reset
+ * Features:
+ * 1. Auto-join giveaways using user-provided tokens
+ * 2. Button-only entry (no reaction support)
+ * 3. Win detection with webhook notifications
+ * 4. LRU caches for memory management
+ * 5. Async non-blocking logger
+ * 6. Circuit breaker for API protection
+ * 7. Connection pooling for HTTP
+ * 8. O(1) session lookups
+ * 9. Memory monitoring with auto-cleanup
+ * 10. Event listener cleanup
+ * 11. Rate limiting per session
+ * 12. Auto-reconnect with backoff
+ * 13. Worker-based scaling
+ * 14. Redis-ready architecture
+ * 15. Health check endpoints
+ * 16. Metrics collection
+ * 17. Graceful shutdown
+ * 18. Session persistence
+ * 19. Duplicate detection
+ * 20. Smart button detection
  */
 
 import { Client, Message, TextChannel, ClientOptions } from 'discord.js-selfbot-v13';
 import { EventEmitter } from 'events';
-import axios from 'axios';
+import axios, { AxiosInstance } from 'axios';
 import http from 'http';
 import https from 'https';
 import { logger } from '../logger.js';
@@ -85,7 +99,6 @@ interface UserSession {
   reconnectAttempts: number;
   maxReconnectAttempts: number;
   rateLimiter: TokenBucket;
-  // Event listener references for cleanup
   listeners: {
     messageCreate?: (message: Message) => void;
     messageUpdate?: (old: any, updated: any) => void;
@@ -102,8 +115,31 @@ interface SessionStats {
   lastEntryAt?: number;
 }
 
+interface ManagerMetrics {
+  totalMessagesProcessed: number;
+  totalGiveawaysDetected: number;
+  totalEntriesAttempted: number;
+  totalEntriesSucceeded: number;
+  totalEntriesFailed: number;
+  totalWinsDetected: number;
+  averageDetectionTime: number;
+  averageEntryTime: number;
+  apiCalls: number;
+  apiErrors: number;
+  cacheHits: number;
+  cacheMisses: number;
+  dbQueries: number;
+  memoryUsage: {
+    heapUsed: number;
+    heapTotal: number;
+    rss: number;
+  };
+  startTime: number;
+  lastStatsReset: number;
+}
+
 // ---------------------------------------------------------------------------
-// Constants
+// Constants - 8GB RAM Optimized
 // ---------------------------------------------------------------------------
 
 const PATTERNS = {
@@ -114,12 +150,19 @@ const PATTERNS = {
   TIMESTAMP: /<t:(\d{10,13})(?::[a-zA-Z])?>/,
   DRAFT_BUTTON: /\b(start|edit|cancel|preview|setup)\b/i,
   GIVEAWAY_KEYWORD: /\bgiveaway\b|\braffle\b|\bsweepstakes\b|\bwin\b|\bprize\b/i,
+  INVITE: /(?:https?:\/\/)?(?:discord\.gg|discord\.com\/invite)\/([a-zA-Z0-9-]{2,20})/i,
+  MESSAGE_URL: /https?:\/\/discord\.com\/channels\/(\d+)\/(\d+)\/(\d+)/i,
 } as const;
 
 const KNOWN_GIVEAWAY_BOT_IDS: ReadonlySet<string> = new Set([
-  '294882584201003009', '739448630517039104', '515195524879237130',
-  '235148962103951360', '282859044593598464', '270904126974590976',
-  '508391840525975553', '530082442967646230',
+  '294882584201003009', // GiveawayBot
+  '739448630517039104', // GiveawayBoat
+  '515195524879237130',
+  '235148962103951360',
+  '282859044593598464',
+  '270904126974590976',
+  '508391840525975553',
+  '530082442967646230', // Giveaway Boat
 ]);
 
 const TRUSTED_ENTRY_CUSTOM_IDS: ReadonlySet<string> = new Set([
@@ -129,7 +172,7 @@ const TRUSTED_ENTRY_CUSTOM_IDS: ReadonlySet<string> = new Set([
 ]);
 
 // ---------------------------------------------------------------------------
-// Constants - Memory-safe values
+// Constants - 8GB RAM Optimized Values
 // ---------------------------------------------------------------------------
 
 const ENTRY_TTL_MS = 2 * 60 * 60 * 1000;
@@ -138,7 +181,7 @@ const COMPONENT_RETRY_DELAY_MS = 300;
 const COMPONENT_RETRY_ATTEMPTS = 3;
 const SESSION_REFRESH_INTERVAL_MS = 300_000;
 const HEARTBEAT_INTERVAL_MS = 120_000;
-const MAX_SESSIONS_PER_WORKER = 10;
+const MAX_SESSIONS_PER_WORKER = 25;
 const PROCESSING_CACHE_TTL_MS = 60000;
 const MAX_RECONNECT_ATTEMPTS = 3;
 const RECONNECT_DELAY_MS = 60000;
@@ -146,27 +189,36 @@ const INTERACTION_RETRY_ATTEMPTS = 3;
 const INTERACTION_RETRY_DELAY_MS = 2000;
 const NO_RESPONSE_COOLDOWN_MS = 5000;
 
-// SMALLER cache sizes to prevent memory growth
-const CACHE_PROCESSED_MESSAGES = 500;  // Reduced from 1000
-const CACHE_MAX_PROCESSING = 100;      // Reduced from 200
-const CACHE_MAX_WINS = 25;             // Reduced from 50
-const CACHE_MAX_COOLDOWN = 10;         // Reduced from 20
-const CACHE_MAX_TOKEN = 5;             // Reduced from 10
+// 8GB RAM Cache sizes
+const CACHE_PROCESSED_MESSAGES = 2000;
+const CACHE_MAX_PROCESSING = 500;
+const CACHE_MAX_WINS = 100;
+const CACHE_MAX_COOLDOWN = 50;
+const CACHE_MAX_TOKEN = 20;
 
+// Memory thresholds (8GB)
+const MEMORY_WARNING_THRESHOLD_MB = 350;
+const MEMORY_CRITICAL_THRESHOLD_MB = 500;
+const MEMORY_MAX_THRESHOLD_MB = 700;
+
+// Queue limits
+const MAX_LOG_QUEUE_SIZE = 500;
+const MAX_SESSION_START_PROMISES = 30;
+
+// HTTP pool (8GB)
+const HTTP_MAX_SOCKETS = 15;
+const HTTP_MAX_FREE_SOCKETS = 8;
+
+// Circuit breaker
 const CIRCUIT_BREAKER_THRESHOLD = 10;
 const CIRCUIT_BREAKER_TIMEOUT_MS = 30000;
 const CIRCUIT_BREAKER_HALF_OPEN_ATTEMPTS = 3;
 
-// Memory thresholds
-const MEMORY_WARNING_THRESHOLD_MB = 2500;
-const MEMORY_CRITICAL_THRESHOLD_MB = 4500;
-
-// Queue limits
-const MAX_LOG_QUEUE_SIZE = 200;
-const MAX_SESSION_START_PROMISES = 20;
+// Metrics
+const METRICS_SAMPLE_SIZE = 100;
 
 // ---------------------------------------------------------------------------
-// LRU Cache Implementation - MEMORY SAFE
+// LRU Cache Implementation
 // ---------------------------------------------------------------------------
 
 class LRUCache<K, V> {
@@ -187,16 +239,15 @@ class LRUCache<K, V> {
       this.cache.delete(key);
       return undefined;
     }
-    // Move to end (most recently used)
     this.cache.delete(key);
     this.cache.set(key, entry);
     return entry.value;
   }
 
   set(key: K, value: V): void {
-    // Enforce max size - remove oldest entries
-    if (this.cache.size >= this.maxSize) {
-      // Delete 20% of oldest entries at once (more efficient)
+    if (this.cache.has(key)) {
+      this.cache.delete(key);
+    } else if (this.cache.size >= this.maxSize) {
       const toDelete = Math.ceil(this.maxSize * 0.2);
       let count = 0;
       for (const k of this.cache.keys()) {
@@ -224,7 +275,6 @@ class LRUCache<K, V> {
     return this.cache.has(key);
   }
 
-  // Clean expired entries
   clean(): number {
     if (this.ttl === 0) return 0;
     const now = Date.now();
@@ -237,10 +287,26 @@ class LRUCache<K, V> {
     }
     return removed;
   }
+
+  entries(): IterableIterator<[K, V]> {
+    const entries: [K, V][] = [];
+    for (const [key, entry] of this.cache) {
+      entries.push([key, entry.value]);
+    }
+    return entries[Symbol.iterator]();
+  }
+
+  toJSON(): Record<string, any> {
+    const obj: Record<string, any> = {};
+    for (const [key, entry] of this.cache) {
+      obj[String(key)] = entry.value;
+    }
+    return obj;
+  }
 }
 
 // ---------------------------------------------------------------------------
-// Async Logger Queue - MEMORY SAFE
+// Async Logger Queue
 // ---------------------------------------------------------------------------
 
 class AsyncLogger {
@@ -248,6 +314,7 @@ class AsyncLogger {
   private processing = false;
   private interval: NodeJS.Timeout | null = null;
   private droppedCount = 0;
+  private totalLogged = 0;
 
   constructor() {
     this.interval = setInterval(() => this.flush(), 1000);
@@ -271,13 +338,12 @@ class AsyncLogger {
   }
 
   private enqueue(level: string, msg: string, meta?: Record<string, unknown>): void {
-    // Prevent queue from growing indefinitely
     if (this.queue.length >= MAX_LOG_QUEUE_SIZE) {
       this.droppedCount++;
-      // Drop oldest when queue is full
       this.queue.shift();
     }
     this.queue.push({ level, msg, meta });
+    this.totalLogged++;
     if (this.queue.length > 50) this.flush();
   }
 
@@ -285,7 +351,7 @@ class AsyncLogger {
     if (this.processing || this.queue.length === 0) return;
     this.processing = true;
 
-    const batch = this.queue.splice(0, 25); // Smaller batch size
+    const batch = this.queue.splice(0, 25);
     for (const item of batch) {
       try {
         switch (item.level) {
@@ -311,13 +377,13 @@ class AsyncLogger {
     this.flush();
   }
 
-  getStats(): { queueSize: number; droppedCount: number } {
-    return { queueSize: this.queue.length, droppedCount: this.droppedCount };
+  getStats(): { queueSize: number; droppedCount: number; totalLogged: number } {
+    return { queueSize: this.queue.length, droppedCount: this.droppedCount, totalLogged: this.totalLogged };
   }
 }
 
 // ---------------------------------------------------------------------------
-// Circuit Breaker - MEMORY SAFE
+// Circuit Breaker
 // ---------------------------------------------------------------------------
 
 class CircuitBreaker {
@@ -326,6 +392,8 @@ class CircuitBreaker {
   private openUntil = 0;
   private halfOpenAttempts = 0;
   private lastFailureTime = 0;
+  private totalFailures = 0;
+  private totalSuccesses = 0;
 
   constructor(
     private readonly threshold = CIRCUIT_BREAKER_THRESHOLD,
@@ -334,7 +402,7 @@ class CircuitBreaker {
   ) {}
 
   async execute<T>(fn: () => Promise<T>): Promise<T> {
-    // Auto-reset if failures haven't happened recently
+    // Auto-decay failures
     if (this.failures > 0 && Date.now() - this.lastFailureTime > 60000) {
       this.failures = Math.max(0, this.failures - 1);
     }
@@ -351,6 +419,7 @@ class CircuitBreaker {
 
     try {
       const result = await fn();
+      this.totalSuccesses++;
       if (this.state === 'half-open') {
         this.halfOpenAttempts++;
         if (this.halfOpenAttempts >= this.halfOpenMaxAttempts) {
@@ -363,6 +432,7 @@ class CircuitBreaker {
       return result;
     } catch (error) {
       this.failures++;
+      this.totalFailures++;
       this.lastFailureTime = Date.now();
       if (this.failures >= this.threshold) {
         this.state = 'open';
@@ -388,10 +458,19 @@ class CircuitBreaker {
   getState(): string {
     return this.state;
   }
+
+  getStats(): { failures: number; totalFailures: number; totalSuccesses: number; state: string } {
+    return {
+      failures: this.failures,
+      totalFailures: this.totalFailures,
+      totalSuccesses: this.totalSuccesses,
+      state: this.state,
+    };
+  }
 }
 
 // ---------------------------------------------------------------------------
-// Token Manager - MEMORY SAFE
+// Token Manager
 // ---------------------------------------------------------------------------
 
 class TokenManager {
@@ -414,15 +493,21 @@ class TokenManager {
   clearAll(): void {
     this.decryptedCache.clear();
   }
+
+  getCacheStats(): { size: number; maxSize: number } {
+    return { size: this.decryptedCache.size, maxSize: CACHE_MAX_TOKEN };
+  }
 }
 
 // ---------------------------------------------------------------------------
-// Token Bucket (Rate Limiter)
+// Token Bucket
 // ---------------------------------------------------------------------------
 
 class TokenBucket {
   private tokens: number;
   private lastRefill: number;
+  private totalConsumed = 0;
+  private totalWaits = 0;
 
   constructor(
     private readonly maxTokens: number,
@@ -435,11 +520,13 @@ class TokenBucket {
   async consume(): Promise<void> {
     this.refill();
     if (this.tokens <= 0) {
+      this.totalWaits++;
       const waitMs = this.refillIntervalMs - (Date.now() - this.lastRefill);
       await delay(Math.max(waitMs, 50));
       this.refill();
     }
     this.tokens = Math.max(0, this.tokens - 1);
+    this.totalConsumed++;
   }
 
   private refill(): void {
@@ -451,125 +538,218 @@ class TokenBucket {
       this.lastRefill = now;
     }
   }
+
+  getStats(): { tokens: number; maxTokens: number; totalConsumed: number; totalWaits: number } {
+    return {
+      tokens: this.tokens,
+      maxTokens: this.maxTokens,
+      totalConsumed: this.totalConsumed,
+      totalWaits: this.totalWaits,
+    };
+  }
 }
 
 // ---------------------------------------------------------------------------
-// AutoJoinManager - MEMORY SAFE
+// Metrics Collector
+// ---------------------------------------------------------------------------
+
+class MetricsCollector {
+  private detectionTimes: number[] = [];
+  private entryTimes: number[] = [];
+  private apiLatencies: number[] = [];
+  
+  public totalMessagesProcessed = 0;
+  public totalGiveawaysDetected = 0;
+  public totalEntriesAttempted = 0;
+  public totalEntriesSucceeded = 0;
+  public totalEntriesFailed = 0;
+  public totalWinsDetected = 0;
+  public apiCalls = 0;
+  public apiErrors = 0;
+  public cacheHits = 0;
+  public cacheMisses = 0;
+  public dbQueries = 0;
+  public startTime = Date.now();
+  public lastStatsReset = Date.now();
+
+  recordDetectionTime(ms: number): void {
+    this.detectionTimes.push(ms);
+    if (this.detectionTimes.length > METRICS_SAMPLE_SIZE) {
+      this.detectionTimes.shift();
+    }
+  }
+
+  recordEntryTime(ms: number): void {
+    this.entryTimes.push(ms);
+    if (this.entryTimes.length > METRICS_SAMPLE_SIZE) {
+      this.entryTimes.shift();
+    }
+  }
+
+  recordApiLatency(ms: number): void {
+    this.apiLatencies.push(ms);
+    if (this.apiLatencies.length > METRICS_SAMPLE_SIZE) {
+      this.apiLatencies.shift();
+    }
+  }
+
+  getAverageDetectionTime(): number {
+    if (this.detectionTimes.length === 0) return 0;
+    return Math.round(this.detectionTimes.reduce((a, b) => a + b, 0) / this.detectionTimes.length);
+  }
+
+  getAverageEntryTime(): number {
+    if (this.entryTimes.length === 0) return 0;
+    return Math.round(this.entryTimes.reduce((a, b) => a + b, 0) / this.entryTimes.length);
+  }
+
+  getAverageApiLatency(): number {
+    if (this.apiLatencies.length === 0) return 0;
+    return Math.round(this.apiLatencies.reduce((a, b) => a + b, 0) / this.apiLatencies.length);
+  }
+
+  getMetrics(): ManagerMetrics {
+    const mem = process.memoryUsage();
+    return {
+      totalMessagesProcessed: this.totalMessagesProcessed,
+      totalGiveawaysDetected: this.totalGiveawaysDetected,
+      totalEntriesAttempted: this.totalEntriesAttempted,
+      totalEntriesSucceeded: this.totalEntriesSucceeded,
+      totalEntriesFailed: this.totalEntriesFailed,
+      totalWinsDetected: this.totalWinsDetected,
+      averageDetectionTime: this.getAverageDetectionTime(),
+      averageEntryTime: this.getAverageEntryTime(),
+      apiCalls: this.apiCalls,
+      apiErrors: this.apiErrors,
+      cacheHits: this.cacheHits,
+      cacheMisses: this.cacheMisses,
+      dbQueries: this.dbQueries,
+      memoryUsage: {
+        heapUsed: Math.round(mem.heapUsed / 1024 / 1024),
+        heapTotal: Math.round(mem.heapTotal / 1024 / 1024),
+        rss: Math.round(mem.rss / 1024 / 1024),
+      },
+      startTime: this.startTime,
+      lastStatsReset: this.lastStatsReset,
+    };
+  }
+
+  reset(): void {
+    this.detectionTimes = [];
+    this.entryTimes = [];
+    this.apiLatencies = [];
+    this.totalMessagesProcessed = 0;
+    this.totalGiveawaysDetected = 0;
+    this.totalEntriesAttempted = 0;
+    this.totalEntriesSucceeded = 0;
+    this.totalEntriesFailed = 0;
+    this.totalWinsDetected = 0;
+    this.apiCalls = 0;
+    this.apiErrors = 0;
+    this.cacheHits = 0;
+    this.cacheMisses = 0;
+    this.dbQueries = 0;
+    this.lastStatsReset = Date.now();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// AutoJoinManager - Main Class
 // ---------------------------------------------------------------------------
 
 export class AutoJoinManager extends EventEmitter {
+  // Sessions
   private sessions: Map<string, UserSession> = new Map();
   private sessionsByUserId: Map<string, UserSession> = new Map();
   
+  // Caches
   private processedMessages: LRUCache<string, number>;
   private processingCache: LRUCache<string, number>;
   private recentWins: LRUCache<string, number>;
   private noResponseCooldown: LRUCache<string, number>;
   
+  // Managers
   private tokenManager: TokenManager;
   private asyncLogger: AsyncLogger;
   private apiCircuitBreaker: CircuitBreaker;
+  private metrics: MetricsCollector;
   
+  // Intervals
   private refreshInterval: NodeJS.Timeout | null = null;
   private cleanupInterval: NodeJS.Timeout | null = null;
   private memoryCheckInterval: NodeJS.Timeout | null = null;
   private reconnectCheckInterval: NodeJS.Timeout | null = null;
   private cacheCleanInterval: NodeJS.Timeout | null = null;
+  private metricsInterval: NodeJS.Timeout | null = null;
   
+  // State
   private isShuttingDown = false;
   private sessionStartPromises: Map<string, Promise<boolean>> = new Map();
   private workerId: string;
   private memoryWarningLogged = false;
+  private healthStatus: 'healthy' | 'warning' | 'critical' = 'healthy';
 
-  private readonly http = axios.create({
-    timeout: 10_000,
-    httpAgent: new http.Agent({
-      keepAlive: true,
-      keepAliveMsecs: 1000,
-      maxSockets: 5,
-      maxFreeSockets: 2,
-    }),
-    httpsAgent: new https.Agent({
-      keepAlive: true,
-      keepAliveMsecs: 1000,
-      maxSockets: 5,
-      maxFreeSockets: 2,
-    }),
-  });
+  // HTTP client with connection pooling
+  private readonly http: AxiosInstance;
 
   constructor(workerId: string = 'main') {
     super();
     this.workerId = workerId;
     
+    // Initialize caches
     this.processedMessages = new LRUCache<string, number>(CACHE_PROCESSED_MESSAGES, 300000);
     this.processingCache = new LRUCache<string, number>(CACHE_MAX_PROCESSING, PROCESSING_CACHE_TTL_MS);
     this.recentWins = new LRUCache<string, number>(CACHE_MAX_WINS, WIN_DEDUP_TTL_MS);
     this.noResponseCooldown = new LRUCache<string, number>(CACHE_MAX_COOLDOWN);
     
+    // Initialize managers
     this.tokenManager = new TokenManager();
     this.asyncLogger = new AsyncLogger();
     this.apiCircuitBreaker = new CircuitBreaker();
+    this.metrics = new MetricsCollector();
 
+    // HTTP client with connection pooling
+    this.http = axios.create({
+      timeout: 10_000,
+      httpAgent: new http.Agent({
+        keepAlive: true,
+        keepAliveMsecs: 1000,
+        maxSockets: HTTP_MAX_SOCKETS,
+        maxFreeSockets: HTTP_MAX_FREE_SOCKETS,
+        scheduling: 'lifo',
+      }),
+      httpsAgent: new https.Agent({
+        keepAlive: true,
+        keepAliveMsecs: 1000,
+        maxSockets: HTTP_MAX_SOCKETS,
+        maxFreeSockets: HTTP_MAX_FREE_SOCKETS,
+        scheduling: 'lifo',
+      }),
+    });
+
+    // Start intervals
     this.startSessionRefresher();
     this.startCleanupInterval();
     this.startMemoryCheck();
     this.startReconnectChecker();
     this.startCacheCleaner();
+    this.startMetricsInterval();
+
+    this.asyncLogger.info('🚀 AutoJoinManager initialized', {
+      worker: this.workerId,
+      cacheSizes: {
+        processedMessages: CACHE_PROCESSED_MESSAGES,
+        processing: CACHE_MAX_PROCESSING,
+        wins: CACHE_MAX_WINS,
+        cooldown: CACHE_MAX_COOLDOWN,
+      },
+      memory: this.getMemoryUsage(),
+    });
   }
 
   // -------------------------------------------------------------------------
-  // Public API
+  // Memory Management
   // -------------------------------------------------------------------------
-
-  async startAllSessions(): Promise<void> {
-    // Check memory before starting
-    if (!this.checkMemory()) {
-      this.asyncLogger.warn('Memory too high, skipping session start', { 
-        worker: this.workerId,
-        memory: this.getMemoryUsage(),
-      });
-      return;
-    }
-
-    this.asyncLogger.info(`Starting AutoJoin sessions (worker: ${this.workerId})...`);
-
-    try {
-      const allPremiumUsers = await this.getAllPremiumUsersAcrossAllGuilds();
-      const validUsers = allPremiumUsers.filter(u => u.token);
-      
-      const usersToStart = validUsers.slice(0, MAX_SESSIONS_PER_WORKER);
-
-      let started = 0;
-      let failed = 0;
-      for (const user of usersToStart) {
-        // Check memory before each session start
-        if (!this.checkMemory()) {
-          this.asyncLogger.warn('Memory threshold reached, stopping session start', {
-            worker: this.workerId,
-            started,
-            failed,
-          });
-          break;
-        }
-        
-        const success = await this.startSession(user.userId, user.guildId);
-        if (success) started++;
-        else failed++;
-        await delay(2000);
-      }
-
-      this.asyncLogger.info(`AutoJoin sessions started: ${started} active (${failed} failed)`, {
-        worker: this.workerId,
-        sessions: this.sessions.size,
-        memory: this.getMemoryUsage(),
-      });
-    } catch (error) {
-      this.asyncLogger.error('Failed to start AutoJoin sessions', {
-        worker: this.workerId,
-        error: formatError(error),
-      });
-    }
-  }
 
   private getMemoryUsage(): { heapUsedMB: number; heapTotalMB: number; rssMB: number } {
     const mem = process.memoryUsage();
@@ -583,26 +763,47 @@ export class AutoJoinManager extends EventEmitter {
   private checkMemory(): boolean {
     const mem = this.getMemoryUsage();
     
-    // Critical - force cleanup
-    if (mem.heapUsedMB > MEMORY_CRITICAL_THRESHOLD_MB) {
-      this.asyncLogger.error('CRITICAL: Memory threshold exceeded, forcing cleanup', {
+    // Update health status
+    if (mem.heapUsedMB > MEMORY_MAX_THRESHOLD_MB) {
+      this.healthStatus = 'critical';
+    } else if (mem.heapUsedMB > MEMORY_CRITICAL_THRESHOLD_MB) {
+      this.healthStatus = 'warning';
+    } else {
+      this.healthStatus = 'healthy';
+    }
+    
+    // Critical - force cleanup and restart
+    if (mem.heapUsedMB > MEMORY_MAX_THRESHOLD_MB) {
+      this.asyncLogger.error('🚨 CRITICAL: Memory exceeded limit', {
         worker: this.workerId,
         ...mem,
+        threshold: MEMORY_MAX_THRESHOLD_MB,
       });
       this.forceCleanup();
+      this.emit('memoryCritical', { ...mem, worker: this.workerId });
       return false;
     }
     
-    // Warning - log and reduce operations
+    // Critical threshold - aggressive cleanup
+    if (mem.heapUsedMB > MEMORY_CRITICAL_THRESHOLD_MB) {
+      this.asyncLogger.warn('⚠️ Memory critical, aggressive cleanup', {
+        worker: this.workerId,
+        ...mem,
+      });
+      this.aggressiveCleanup();
+      return true;
+    }
+    
+    // Warning threshold - normal cleanup
     if (mem.heapUsedMB > MEMORY_WARNING_THRESHOLD_MB) {
       if (!this.memoryWarningLogged) {
-        this.asyncLogger.warn('Memory warning threshold reached', {
+        this.asyncLogger.warn('⚠️ Memory warning threshold reached', {
           worker: this.workerId,
           ...mem,
         });
         this.memoryWarningLogged = true;
       }
-      // Reduce cache sizes temporarily
+      // Clean caches
       this.processedMessages.clean();
       this.processingCache.clean();
       this.recentWins.clean();
@@ -614,21 +815,113 @@ export class AutoJoinManager extends EventEmitter {
     return true;
   }
 
-  private forceCleanup(): void {
+  private aggressiveCleanup(): void {
     this.processedMessages.clear();
     this.processingCache.clear();
     this.recentWins.clear();
     this.noResponseCooldown.clear();
     this.tokenManager.clearAll();
     
-    // Clear session start promises that are stuck
-    if (this.sessionStartPromises.size > MAX_SESSION_START_PROMISES) {
+    if (this.sessionStartPromises.size > 10) {
       this.sessionStartPromises.clear();
     }
     
-    // Force garbage collection if available
+    // Force GC
     if (global.gc) {
       global.gc();
+    }
+    
+    const mem = this.getMemoryUsage();
+    this.asyncLogger.info('🧹 Aggressive cleanup complete', {
+      worker: this.workerId,
+      ...mem,
+    });
+  }
+
+  private forceCleanup(): void {
+    this.aggressiveCleanup();
+    
+    // Stop some sessions to free memory
+    const mem = this.getMemoryUsage();
+    if (mem.heapUsedMB > MEMORY_CRITICAL_THRESHOLD_MB && this.sessions.size > 1) {
+      const toStop = Math.floor(this.sessions.size * 0.3);
+      let stopped = 0;
+      for (const [key, session] of this.sessions) {
+        if (stopped >= toStop) break;
+        if (this.sessions.size <= 1) break;
+        this.stopSession(session.userId, session.guildId);
+        stopped++;
+      }
+      this.asyncLogger.warn(`Stopped ${stopped} sessions to free memory`, {
+        worker: this.workerId,
+        remaining: this.sessions.size,
+      });
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Public API
+  // -------------------------------------------------------------------------
+
+  async startAllSessions(): Promise<void> {
+    if (!this.checkMemory()) {
+      this.asyncLogger.warn('Memory too high, skipping session start', {
+        worker: this.workerId,
+        memory: this.getMemoryUsage(),
+      });
+      return;
+    }
+
+    this.asyncLogger.info(`🚀 Starting AutoJoin sessions (worker: ${this.workerId})...`);
+
+    try {
+      const allPremiumUsers = await this.getAllPremiumUsersAcrossAllGuilds();
+      const validUsers = allPremiumUsers.filter(u => u.token);
+      
+      const usersToStart = validUsers.slice(0, MAX_SESSIONS_PER_WORKER);
+
+      // Start sessions in parallel with concurrency limit
+      const concurrencyLimit = 3;
+      let started = 0;
+      let failed = 0;
+      
+      for (let i = 0; i < usersToStart.length; i += concurrencyLimit) {
+        const batch = usersToStart.slice(i, i + concurrencyLimit);
+        
+        if (!this.checkMemory()) {
+          this.asyncLogger.warn('Memory threshold reached, stopping session start', {
+            worker: this.workerId,
+            started,
+            failed,
+          });
+          break;
+        }
+        
+        const results = await Promise.allSettled(
+          batch.map(user => this.startSession(user.userId, user.guildId))
+        );
+        
+        for (const result of results) {
+          if (result.status === 'fulfilled' && result.value) {
+            started++;
+          } else {
+            failed++;
+          }
+        }
+        
+        await delay(1000);
+      }
+
+      this.asyncLogger.info(`✅ AutoJoin sessions started: ${started} active (${failed} failed)`, {
+        worker: this.workerId,
+        sessions: this.sessions.size,
+        memory: this.getMemoryUsage(),
+      });
+    } catch (error) {
+      this.asyncLogger.error('Failed to start AutoJoin sessions', {
+        worker: this.workerId,
+        error: formatError(error),
+      });
     }
   }
 
@@ -656,7 +949,6 @@ export class AutoJoinManager extends EventEmitter {
       return false;
     }
 
-    // Limit concurrent start promises
     if (this.sessionStartPromises.size >= MAX_SESSION_START_PROMISES) {
       this.asyncLogger.warn('Too many pending session starts', { userId });
       return false;
@@ -701,6 +993,7 @@ export class AutoJoinManager extends EventEmitter {
         return false;
       }
 
+      // ClientOptions for discord.js-selfbot-v13
       const clientOptions: ClientOptions = {
         messageCacheLifetime: 60,
         messageSweepInterval: 300,
@@ -709,21 +1002,6 @@ export class AutoJoinManager extends EventEmitter {
         retryLimit: 3,
         allowedMentions: { parse: [] },
         partials: [],
-        intents: [
-          1 << 0, 1 << 1, 1 << 9, 1 << 10, 1 << 12, 1 << 13, 1 << 14, 1 << 15
-        ],
-        makeCache: (manager: any) => {
-          if (manager.name === 'MessageManager') {
-            return manager.collection;
-          }
-          return null;
-        },
-        sweepers: {
-          messages: {
-            interval: 300,
-            lifetime: 60,
-          },
-        },
       };
 
       const client = new Client(clientOptions);
@@ -821,8 +1099,11 @@ export class AutoJoinManager extends EventEmitter {
       } catch (error) {
         if (session.reconnectAttempts < session.maxReconnectAttempts) {
           session.reconnectAttempts++;
+          this.asyncLogger.debug('Attempting reconnect', {
+            userId: session.userId,
+            attempt: session.reconnectAttempts,
+          });
           (session.client as any).destroy();
-          // Clean up old listeners before reconnecting
           this.cleanupSessionListeners(session);
           this._startSessionInternal(session.userId, session.guildId)
             .then(success => {
@@ -830,6 +1111,9 @@ export class AutoJoinManager extends EventEmitter {
             })
             .catch(() => {});
         } else {
+          this.asyncLogger.error('Max reconnect attempts reached, stopping session', {
+            userId: session.userId,
+          });
           session.isActive = false;
           this.stopSession(session.userId, session.guildId);
         }
@@ -847,7 +1131,7 @@ export class AutoJoinManager extends EventEmitter {
       return;
     }
 
-    this.asyncLogger.info('Restoring AutoJoin sessions from database...', { worker: this.workerId });
+    this.asyncLogger.info('🔄 Restoring AutoJoin sessions from database...', { worker: this.workerId });
     
     try {
       const allPremiumUsers = await this.getAllPremiumUsersAcrossAllGuilds();
@@ -864,7 +1148,7 @@ export class AutoJoinManager extends EventEmitter {
         await delay(500);
       }
       
-      this.asyncLogger.info(`Restored ${restored} AutoJoin sessions (${failed} failed, ${skipped} skipped)`, {
+      this.asyncLogger.info(`✅ Restored ${restored} AutoJoin sessions (${failed} failed, ${skipped} skipped)`, {
         worker: this.workerId,
         total: this.sessions.size,
         memory: this.getMemoryUsage(),
@@ -882,29 +1166,25 @@ export class AutoJoinManager extends EventEmitter {
     try {
       session.isActive = false;
       
-      // Clear heartbeat
       if (session.heartbeatInterval) {
         clearInterval(session.heartbeatInterval);
         session.heartbeatInterval = undefined;
       }
       
-      // Clean up event listeners
       this.cleanupSessionListeners(session);
       
-      // Destroy client
       await Promise.race([
         (session.client as any).destroy(),
         delay(5000),
       ]);
       
-      // Remove from maps
       this.sessions.delete(sessionKey);
       this.sessionsByUserId.delete(userId);
       this.tokenManager.clearCache(userId, guildId);
       
       await setTokenActive(userId, guildId, false);
       
-      this.asyncLogger.info('AutoJoin session stopped', { 
+      this.asyncLogger.info('⏹️ AutoJoin session stopped', { 
         userId, 
         guildId,
         memory: this.getMemoryUsage(),
@@ -1002,28 +1282,83 @@ export class AutoJoinManager extends EventEmitter {
   getStats() {
     const stats = new Map<string, SessionStats>();
     let active = 0;
+    let totalDetected = 0;
+    let totalEntered = 0;
+    let totalWins = 0;
+    
     for (const [key, session] of this.sessions) {
       if (session.isActive) active++;
       stats.set(key, { ...session.stats });
+      totalDetected += session.stats.detected;
+      totalEntered += session.stats.entered;
+      totalWins += session.stats.wins;
     }
+    
+    const mem = this.getMemoryUsage();
+    const metrics = this.metrics.getMetrics();
+    
     return {
       totalSessions: this.sessions.size,
       activeSessions: active,
+      totalDetected,
+      totalEntered,
+      totalWins,
       sessionStats: stats,
       worker: this.workerId,
+      healthStatus: this.healthStatus,
       circuitBreakerState: this.apiCircuitBreaker.getState(),
-      cacheSize: this.processedMessages.size,
-      memory: this.getMemoryUsage(),
+      caches: {
+        processedMessages: this.processedMessages.size,
+        processing: this.processingCache.size,
+        recentWins: this.recentWins.size,
+        noResponseCooldown: this.noResponseCooldown.size,
+        tokenCache: this.tokenManager.getCacheStats(),
+      },
+      memory: {
+        heapUsedMB: mem.heapUsedMB,
+        heapTotalMB: mem.heapTotalMB,
+        rssMB: mem.rssMB,
+        percentageUsed: Math.round((mem.heapUsedMB / 8000) * 100),
+      },
+      metrics: {
+        averageDetectionTime: metrics.averageDetectionTime,
+        averageEntryTime: metrics.averageEntryTime,
+        apiCalls: metrics.apiCalls,
+        apiErrors: metrics.apiErrors,
+        cacheHits: metrics.cacheHits,
+        cacheMisses: metrics.cacheMisses,
+        dbQueries: metrics.dbQueries,
+      },
       logStats: this.asyncLogger.getStats(),
+      sessionStartPromises: this.sessionStartPromises.size,
+      uptime: Math.round((Date.now() - metrics.startTime) / 1000 / 60), // minutes
+    };
+  }
+
+  getHealth(): { status: string; details: any } {
+    const stats = this.getStats();
+    return {
+      status: this.healthStatus,
+      details: {
+        sessions: stats.activeSessions,
+        memory: stats.memory,
+        circuitBreaker: stats.circuitBreakerState,
+        uptime: stats.uptime,
+      },
     };
   }
 
   async shutdown(): Promise<void> {
     this.isShuttingDown = true;
 
+    this.asyncLogger.info('🛑 Shutting down AutoJoinManager...', {
+      worker: this.workerId,
+      sessions: this.sessions.size,
+    });
+
     // Clear all intervals
     [this.refreshInterval, this.cleanupInterval, this.memoryCheckInterval, 
-     this.reconnectCheckInterval, this.cacheCleanInterval]
+     this.reconnectCheckInterval, this.cacheCleanInterval, this.metricsInterval]
       .forEach(interval => {
         if (interval) { clearInterval(interval); }
       });
@@ -1047,29 +1382,29 @@ export class AutoJoinManager extends EventEmitter {
     
     this.asyncLogger.shutdown();
     
-    // Force GC
     if (global.gc) {
       global.gc();
     }
     
-    this.asyncLogger.info('AutoJoin shutdown complete', { 
+    this.asyncLogger.info('✅ AutoJoin shutdown complete', { 
       worker: this.workerId,
       memory: this.getMemoryUsage(),
     });
   }
 
   // -------------------------------------------------------------------------
-  // Event Handlers - MEMORY SAFE
+  // Event Handlers
   // -------------------------------------------------------------------------
 
   private registerEvents(session: UserSession): void {
     const { client, userId, guildId } = session;
 
-    // Create bound handlers so we can remove them later
     const messageCreateHandler = async (message: Message) => {
       if (this.isShuttingDown || !session.isActive) return;
       
       try {
+        this.metrics.totalMessagesProcessed++;
+        
         if (!message.guild) {
           await this.handleDmWin(message, userId);
           return;
@@ -1100,13 +1435,11 @@ export class AutoJoinManager extends EventEmitter {
       this.asyncLogger.warn('Client disconnected, will attempt reconnect', { userId });
     };
 
-    // Store listeners for cleanup
     session.listeners.messageCreate = messageCreateHandler;
     session.listeners.messageUpdate = messageUpdateHandler;
     session.listeners.error = errorHandler;
     session.listeners.disconnect = disconnectHandler;
 
-    // Register listeners
     client.on('messageCreate', messageCreateHandler);
     client.on('messageUpdate', messageUpdateHandler);
     client.on('error', errorHandler);
@@ -1114,7 +1447,7 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   // -------------------------------------------------------------------------
-  // Message Handling - MEMORY SAFE
+  // Message Handling
   // -------------------------------------------------------------------------
 
   private async handleMessage(message: Message, session: UserSession): Promise<void> {
@@ -1126,10 +1459,18 @@ export class AutoJoinManager extends EventEmitter {
     const entryId = this.makeEntryId(session, message);
 
     // Check caches
-    if (this.processedMessages.has(entryId)) return;
-    if (this.processingCache.get(entryId) !== undefined) return;
+    if (this.processedMessages.has(entryId)) {
+      this.metrics.cacheHits++;
+      return;
+    }
+    
+    if (this.processingCache.get(entryId) !== undefined) {
+      this.metrics.cacheHits++;
+      return;
+    }
+    
+    this.metrics.cacheMisses++;
 
-    // Check DB - but with memory check
     if (!this.checkMemory()) {
       this.asyncLogger.debug('Memory too high, skipping message processing', {
         userId: session.userId,
@@ -1138,7 +1479,10 @@ export class AutoJoinManager extends EventEmitter {
       return;
     }
 
+    const startTime = Date.now();
     const existing = await getAutoJoinEntry(session.userId, message.id, message.channel.id);
+    this.metrics.dbQueries++;
+    
     if (existing) {
       this.processedMessages.set(entryId, Date.now());
       if (existing.status === 'pending' || existing.status === 'attempting') {
@@ -1156,6 +1500,10 @@ export class AutoJoinManager extends EventEmitter {
         this.processingCache.delete(entryId);
         return;
       }
+
+      this.metrics.totalGiveawaysDetected++;
+      const detectionTime = Date.now() - startTime;
+      this.metrics.recordDetectionTime(detectionTime);
 
       const entryData: Omit<GiveawayEntry, '_id'> = {
         userId: session.userId,
@@ -1175,15 +1523,17 @@ export class AutoJoinManager extends EventEmitter {
       };
 
       await saveAutoJoinEntry(entryData);
+      this.metrics.dbQueries++;
       this.processedMessages.set(entryId, Date.now());
 
       session.stats.detected++;
 
-      this.asyncLogger.debug('AutoJoin: Giveaway detected', {
+      this.asyncLogger.debug('🎯 AutoJoin: Giveaway detected', {
         userId: session.userId,
         prize: truncate(entryData.prize, 60),
         guild: entryData.guildName,
         worker: this.workerId,
+        detectionTime: `${detectionTime}ms`,
       });
 
       await this.enterGiveaway(entryId, session);
@@ -1201,7 +1551,7 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   // -------------------------------------------------------------------------
-  // Giveaway Detection - (same as before, kept minimal for memory)
+  // Giveaway Detection
   // -------------------------------------------------------------------------
 
   private async detectGiveaway(message: Message): Promise<{ prize: string; button: GiveawayButton } | null> {
@@ -1244,30 +1594,476 @@ export class AutoJoinManager extends EventEmitter {
     const components = msgAny['components'] as unknown[] | undefined;
     if (!components?.length) return null;
 
-    // ... (rest of extraction logic - same as before)
+    if (isKnownBot) {
+      for (const row of components) {
+        const rowAny = row as Record<string, unknown>;
+        const rowComps = rowAny['components'] as unknown[] | undefined;
+        if (!rowComps?.length) continue;
+
+        for (const comp of rowComps) {
+          const c = comp as Record<string, unknown>;
+          if (c['type'] !== 2 && c['type'] !== 'BUTTON') continue;
+          if (c['style'] === 5 || c['disabled'] === true) continue;
+
+          const customId = (c['customId'] ?? c['custom_id']) as string | undefined;
+          if (!customId) continue;
+
+          const label = ((c['label'] as string | undefined) ?? '').trim();
+          
+          if (PATTERNS.DRAFT_BUTTON.test(label)) continue;
+
+          if (customId.includes('giveaway') || customId.includes('enter') || customId.includes('join')) {
+            return { customId, label: label || customId, disabled: false };
+          }
+
+          if (PATTERNS.ENTRY_BUTTON.test(label)) {
+            return { customId, label: label || 'Enter', disabled: false };
+          }
+        }
+      }
+      return null;
+    }
+
+    // Unknown bot - strict
+    let hasDraftButton = false;
+    for (const row of components) {
+      const rowAny = row as Record<string, unknown>;
+      const rowComps = rowAny['components'] as unknown[] | undefined;
+      if (!rowComps) continue;
+      for (const comp of rowComps) {
+        const c = comp as Record<string, unknown>;
+        if (c['type'] !== 2 && c['type'] !== 'BUTTON') continue;
+        const label = ((c['label'] as string | undefined) ?? '').toLowerCase();
+        if (PATTERNS.DRAFT_BUTTON.test(label)) {
+          hasDraftButton = true;
+          break;
+        }
+      }
+      if (hasDraftButton) break;
+    }
+
+    if (hasDraftButton) {
+      let hasEntry = false;
+      for (const row of components) {
+        const rowAny = row as Record<string, unknown>;
+        const rowComps = rowAny['components'] as unknown[] | undefined;
+        if (!rowComps) continue;
+        for (const comp of rowComps) {
+          const c = comp as Record<string, unknown>;
+          if (c['type'] !== 2 && c['type'] !== 'BUTTON') continue;
+          if (c['style'] === 5 || c['disabled'] === true) continue;
+          
+          const customId = (c['customId'] ?? c['custom_id']) as string | undefined;
+          const label = ((c['label'] as string | undefined) ?? '').trim();
+          
+          if (customId && TRUSTED_ENTRY_CUSTOM_IDS.has(customId)) {
+            hasEntry = true;
+            break;
+          }
+          if (PATTERNS.ENTRY_BUTTON.test(label)) {
+            hasEntry = true;
+            break;
+          }
+        }
+        if (hasEntry) break;
+      }
+      if (!hasEntry) return null;
+    }
+
+    for (const row of components) {
+      const rowAny = row as Record<string, unknown>;
+      const rowComps = rowAny['components'] as unknown[] | undefined;
+      if (!rowComps?.length) continue;
+
+      for (const comp of rowComps) {
+        const c = comp as Record<string, unknown>;
+        if (c['type'] !== 2 && c['type'] !== 'BUTTON') continue;
+        if (c['style'] === 5 || c['disabled'] === true) continue;
+
+        const customId = (c['customId'] ?? c['custom_id']) as string | undefined;
+        if (!customId) continue;
+
+        const label = ((c['label'] as string | undefined) ?? '').trim();
+
+        if (PATTERNS.DRAFT_BUTTON.test(label)) continue;
+
+        if (TRUSTED_ENTRY_CUSTOM_IDS.has(customId)) {
+          return { customId, label: label || customId, disabled: false };
+        }
+
+        if (PATTERNS.ENTRY_BUTTON.test(label)) {
+          return { customId, label: label || 'Enter', disabled: false };
+        }
+      }
+    }
 
     return null;
   }
 
   // -------------------------------------------------------------------------
-  // Entry Execution - (same as before, kept minimal for memory)
+  // Entry Execution
   // -------------------------------------------------------------------------
 
   private async enterGiveaway(entryId: string, session: UserSession): Promise<void> {
-    // ... (same as before)
+    const parts = entryId.split(':');
+    const userId = parts[0];
+    const channelId = parts[1];
+    const messageId = parts.slice(2).join(':');
+    
+    const entry = await getAutoJoinEntry(session.userId, messageId, channelId);
+    this.metrics.dbQueries++;
+    if (!entry) return;
+
+    await updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'attempting', {});
+    this.metrics.dbQueries++;
+
+    const maxAttempts = CONFIG.maxRetries + 1;
+    let entryStartTime = Date.now();
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      const attemptNum = attempt + 1;
+      this.metrics.totalEntriesAttempted++;
+      
+      if (attempt > 0) {
+        const backoffMs = exponentialBackoff(attempt - 1, CONFIG.retryDelayMs, 30000);
+        await delay(backoffMs);
+      }
+
+      if (attempt === 2) {
+        try {
+          const refreshedEntry = await this.refreshButtonData(entry, session);
+          if (refreshedEntry && refreshedEntry.buttonCustomId !== entry.buttonCustomId) {
+            entry.buttonCustomId = refreshedEntry.buttonCustomId;
+          }
+        } catch {}
+      }
+
+      const cooldownEnd = this.noResponseCooldown.get(session.userId) || 0;
+      if (Date.now() < cooldownEnd) {
+        await delay(Math.min(cooldownEnd - Date.now(), 5000));
+      }
+
+      try {
+        const skipped = await this.enterViaButton(entry, session);
+        if (skipped) {
+          await updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'skipped', {});
+          this.metrics.dbQueries++;
+          return;
+        }
+
+        const entryTime = Date.now() - entryStartTime;
+        this.metrics.recordEntryTime(entryTime);
+        
+        session.stats.entered++;
+        session.stats.lastEntryAt = Date.now();
+        this.metrics.totalEntriesSucceeded++;
+
+        await updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'success', { attempts: attemptNum });
+        this.metrics.dbQueries++;
+        await incrementTokenEntries(session.userId, session.guildId);
+        await updateTokenLastUsed(session.userId, session.guildId);
+
+        this.asyncLogger.info('✅ AutoJoin: Entered giveaway', {
+          userId: session.userId,
+          prize: truncate(entry.prize, 60),
+          attempts: attemptNum,
+          guild: entry.guildName,
+          worker: this.workerId,
+          time: `${entryTime}ms`,
+        });
+
+        this.emit('giveawayEntered', { entry, userId: session.userId });
+        return;
+
+      } catch (error) {
+        const errorMsg = formatError(error);
+        const isNoResponse = errorMsg.includes('No responsed from Application') || 
+                            errorMsg.includes('No response from Application');
+
+        if (isNoResponse && attempt < maxAttempts - 1) {
+          this.noResponseCooldown.set(session.userId, Date.now() + NO_RESPONSE_COOLDOWN_MS);
+          await delay(2000);
+          try { await this.refreshButtonData(entry, session); } catch {}
+          continue;
+        }
+
+        await updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'attempting', { 
+          attempts: attemptNum, 
+          lastError: errorMsg 
+        });
+        this.metrics.dbQueries++;
+        
+        this.asyncLogger.warn(`AutoJoin: Attempt ${attemptNum}/${maxAttempts} failed`, {
+          userId: session.userId,
+          entryId,
+          error: errorMsg,
+          worker: this.workerId,
+        });
+      }
+    }
+
+    await updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'failed', {});
+    this.metrics.dbQueries++;
+    session.stats.failed++;
+    this.metrics.totalEntriesFailed++;
+
+    this.asyncLogger.error('❌ AutoJoin: All retries exhausted', {
+      userId: session.userId,
+      prize: truncate(entry.prize, 60),
+      attempts: entry.attempts,
+      worker: this.workerId,
+    });
+
+    this.emit('giveawayFailed', { entry, userId: session.userId });
+  }
+
+  private async refreshButtonData(entry: GiveawayEntry, session: UserSession): Promise<GiveawayEntry | null> {
+    try {
+      const message = await this.fetchMessage(session.client, entry.channelId, entry.messageId);
+      if (!message) return null;
+      
+      const components = (message as any).components;
+      if (!components?.length) return null;
+      
+      const isKnownBot = this.isKnownGiveawayBot(message);
+      const button = this.findEntryButton(components, isKnownBot);
+      if (button && button.customId !== entry.buttonCustomId) {
+        entry.buttonCustomId = button.customId;
+        return entry;
+      }
+      return entry;
+    } catch {
+      return null;
+    }
+  }
+
+  private findEntryButton(components: unknown[], isKnownBot: boolean): GiveawayButton | null {
+    for (const row of components) {
+      const rowAny = row as Record<string, unknown>;
+      const rowComps = rowAny['components'] as unknown[] | undefined;
+      if (!rowComps?.length) continue;
+
+      for (const comp of rowComps) {
+        const c = comp as Record<string, unknown>;
+        if (c['type'] !== 2 && c['type'] !== 'BUTTON') continue;
+        if (c['style'] === 5 || c['disabled'] === true) continue;
+
+        const customId = (c['customId'] ?? c['custom_id']) as string | undefined;
+        if (!customId) continue;
+
+        const label = ((c['label'] as string | undefined) ?? '').trim();
+
+        if (isKnownBot) {
+          if (customId.includes('giveaway') || customId.includes('enter') || customId.includes('join')) {
+            return { customId, label: label || customId, disabled: false };
+          }
+        }
+
+        if (TRUSTED_ENTRY_CUSTOM_IDS.has(customId)) {
+          return { customId, label: label || customId, disabled: false };
+        }
+
+        if (PATTERNS.ENTRY_BUTTON.test(label)) {
+          return { customId, label: label || 'Enter', disabled: false };
+        }
+      }
+    }
+    return null;
   }
 
   private async enterViaButton(entry: GiveawayEntry, session: UserSession): Promise<boolean> {
-    // ... (same as before)
+    if (!entry.buttonCustomId) throw new Error('No buttonCustomId set');
+
+    if (CONFIG.buttonDelayMs > 0) await delay(CONFIG.buttonDelayMs);
+
+    const message = await this.fetchMessage(session.client, entry.channelId, entry.messageId);
+    if (!message) throw new Error(`Message ${entry.messageId} not found`);
+
+    let button = this.findButtonById(message, entry.buttonCustomId);
+    
+    if (!button) {
+      const components = (message as any).components;
+      if (components?.length) {
+        const isKnownBot = this.isKnownGiveawayBot(message);
+        const foundButton = this.findEntryButton(components, isKnownBot);
+        if (foundButton) {
+          button = foundButton;
+          entry.buttonCustomId = button.customId;
+        }
+      }
+    }
+
+    if (!button || button.disabled) {
+      return true;
+    }
+
+    await session.rateLimiter.consume();
+    await this.clickButton(message, button, session);
     return false;
   }
 
+  // -------------------------------------------------------------------------
+  // Interaction Helpers
+  // -------------------------------------------------------------------------
+
   private async clickButton(message: Message, button: GiveawayButton, session: UserSession): Promise<void> {
-    // ... (same as before)
+    const selfbotMsg = message as Message & { clickButton?: (id: string) => Promise<unknown> };
+    
+    if (typeof selfbotMsg.clickButton === 'function') {
+      try {
+        await selfbotMsg.clickButton(button.customId);
+        return;
+      } catch (error) {
+        const errorMsg = formatError(error);
+        if (errorMsg.includes('No responsed from Application') || 
+            errorMsg.includes('No response from Application')) {
+          await this.postInteraction(message, button, session);
+          return;
+        }
+        throw error;
+      }
+    }
+
+    await this.postInteraction(message, button, session);
   }
 
   private async postInteraction(message: Message, button: GiveawayButton, session: UserSession): Promise<void> {
-    // ... (same as before)
+    if (this.apiCircuitBreaker.isOpen()) {
+      throw new Error(`Circuit breaker is open (${this.apiCircuitBreaker.getState()})`);
+    }
+
+    await this.apiCircuitBreaker.execute(async () => {
+      const clientAny = message.client as unknown as Record<string, unknown>;
+      
+      let sessionId = clientAny['sessionId'] as string | undefined;
+      if (!sessionId) {
+        const client = message.client as any;
+        sessionId = client.sessionId || client.session_id || Date.now().toString();
+      }
+      
+      const nonce = `${Date.now()}${Math.random().toString(36).slice(2, 8)}`;
+      const applicationId = message.author?.id || 
+        (message as any).applicationId || 
+        (message as any).webhookId ||
+        (message as any).interaction?.application_id;
+
+      if (!applicationId) {
+        throw new Error('Could not determine application ID for interaction');
+      }
+
+      const payload = {
+        type: 3,
+        nonce,
+        guild_id: message.guild?.id ?? null,
+        channel_id: message.channel.id,
+        message_id: message.id,
+        application_id: applicationId,
+        session_id: sessionId,
+        message_flags: 0,
+        data: {
+          component_type: 2,
+          custom_id: button.customId,
+        },
+      };
+
+      const token = (message.client as any).token as string;
+
+      for (let attempt = 0; attempt < INTERACTION_RETRY_ATTEMPTS; attempt++) {
+        try {
+          if (attempt > 0) await delay(INTERACTION_RETRY_DELAY_MS * attempt);
+
+          const startTime = Date.now();
+          const response = await this.http.post('https://discord.com/api/v10/interactions', payload, {
+            headers: {
+              'Authorization': token,
+              'Content-Type': 'application/json',
+              'Accept': 'application/json',
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+              'X-Discord-Locale': 'en-US',
+            },
+            timeout: 15000,
+          });
+          
+          this.metrics.apiCalls++;
+          this.metrics.recordApiLatency(Date.now() - startTime);
+
+          if (response.status === 204 || response.status === 200 || response.status === 201) {
+            return;
+          }
+
+        } catch (error) {
+          this.metrics.apiCalls++;
+          this.metrics.apiErrors++;
+          
+          const axiosErr = error as { response?: { status?: number; data?: { retry_after?: number; message?: string } } };
+          const status = axiosErr.response?.status;
+          const errorMessage = axiosErr.response?.data?.message;
+
+          if (errorMessage?.includes('No response') || errorMessage?.includes('no response')) {
+            if (attempt === INTERACTION_RETRY_ATTEMPTS - 1) {
+              throw new Error(`No response from Application after ${INTERACTION_RETRY_ATTEMPTS} attempts`);
+            }
+            if (attempt === 1) {
+              payload.nonce = `${Date.now()}${Math.random().toString(36).slice(2, 8)}`;
+              payload.session_id = `${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+            }
+            continue;
+          }
+
+          if (status === 429) {
+            const retryAfterMs = Math.ceil((axiosErr.response?.data?.retry_after ?? 1) * 1000);
+            await delay(retryAfterMs);
+            continue;
+          }
+
+          if (status === 401 || status === 403) {
+            this.asyncLogger.error('Token appears to be blocked or invalid', { 
+              userId: session.userId, 
+              status 
+            });
+            await setTokenActive(session.userId, session.guildId, false);
+            throw new Error(`Token ${status === 401 ? 'invalid' : 'blocked'}`);
+          }
+
+          if (status === 404 || errorMessage?.includes('unknown interaction')) {
+            throw new Error('Interaction expired or button no longer exists');
+          }
+
+          if (status === 502 || status === 504 || status === 500) {
+            if (attempt === INTERACTION_RETRY_ATTEMPTS - 1) throw error;
+            continue;
+          }
+
+          if (attempt === INTERACTION_RETRY_ATTEMPTS - 1) throw error;
+        }
+      }
+
+      throw new Error(`Failed to send interaction after ${INTERACTION_RETRY_ATTEMPTS} attempts`);
+    });
+  }
+
+  private findButtonById(message: Message, customId: string): GiveawayButton | null {
+    const msgAny = message as unknown as Record<string, unknown>;
+    const components = msgAny['components'] as unknown[] | undefined;
+    if (!components) return null;
+
+    for (const row of components) {
+      const rowAny = row as Record<string, unknown>;
+      const rowComps = rowAny['components'] as unknown[] | undefined;
+      if (!rowComps) continue;
+
+      for (const comp of rowComps) {
+        const c = comp as Record<string, unknown>;
+        const id = (c['customId'] ?? c['custom_id']) as string | undefined;
+        if (id !== customId) continue;
+        return {
+          customId: id,
+          label: ((c['label'] as string | undefined) ?? ''),
+          disabled: (c['disabled'] as boolean | undefined) ?? false,
+        };
+      }
+    }
+    return null;
   }
 
   // -------------------------------------------------------------------------
@@ -1275,11 +2071,65 @@ export class AutoJoinManager extends EventEmitter {
   // -------------------------------------------------------------------------
 
   private async handleWin(message: Message, userId: string): Promise<void> {
-    // ... (same as before)
+    if (!message.guild || !message.author?.bot) return;
+
+    const myId = message.client.user?.id;
+    if (!myId) return;
+
+    const mentionedInUsers = message.mentions?.users?.has(myId) ?? false;
+    const mentionedInContent = (message.content ?? '').includes(myId);
+    if (!mentionedInUsers && !mentionedInContent) return;
+
+    const allText = this.extractAllText(message);
+    if (!PATTERNS.WIN.test(allText)) return;
+
+    const dedupKey = `${message.channel.id}:${message.author?.id ?? 'unknown'}`;
+    if (this.recentWins.get(dedupKey) !== undefined) return;
+    this.recentWins.set(dedupKey, Date.now());
+
+    const session = this.findSessionByUserId(userId);
+    if (session) session.stats.wins++;
+    this.metrics.totalWinsDetected++;
+
+    await incrementTokenWins(userId, session?.guildId || '');
+
+    const prize = this.extractPrize(message);
+    const sourceName = `#${(message.channel as { name?: string }).name ?? message.channel.id} in ${message.guild.name}`;
+
+    this.asyncLogger.info('🏆 AutoJoin: WIN DETECTED!', {
+      userId,
+      prize,
+      source: sourceName,
+      guild: message.guild.name,
+      worker: this.workerId,
+    });
+
+    await this.sendWinWebhook(message, prize, sourceName, userId);
+    this.emit('giveawayWon', { message, prize, userId });
   }
 
   private async handleDmWin(message: Message, userId: string): Promise<void> {
-    // ... (same as before)
+    if (message.guild) return;
+
+    const allText = this.extractAllText(message);
+    if (!PATTERNS.WIN.test(allText)) return;
+
+    const session = this.findSessionByUserId(userId);
+    if (session) session.stats.wins++;
+    this.metrics.totalWinsDetected++;
+
+    await incrementTokenWins(userId, session?.guildId || '');
+
+    const prize = this.extractPrize(message);
+
+    this.asyncLogger.info('🏆 AutoJoin: WIN DETECTED (DM)!', { 
+      userId, 
+      prize,
+      worker: this.workerId,
+    });
+
+    await this.sendWinWebhook(message, prize, 'Direct Message', userId);
+    this.emit('giveawayWon', { message, prize, userId, source: 'dm' });
   }
 
   // -------------------------------------------------------------------------
@@ -1287,7 +2137,44 @@ export class AutoJoinManager extends EventEmitter {
   // -------------------------------------------------------------------------
 
   private async sendWinWebhook(message: Message, prize: string, sourceName: string, userId: string): Promise<void> {
-    // ... (same as before)
+    const session = this.findSessionByUserId(userId);
+    const guildId = session?.guildId || '';
+
+    let url: string | null = null;
+    try {
+      url = await getUserWebhook(userId, guildId);
+    } catch {}
+
+    if (!url) url = CONFIG.winWebhookUrl || CONFIG.webhookUrl || null;
+    if (!url) return;
+
+    const guildName = message.guild?.name ?? 'Direct Message';
+    const jumpUrl = message.guild
+      ? `https://discord.com/channels/${message.guild.id}/${message.channel.id}/${message.id}`
+      : null;
+
+    try {
+      await this.http.post(url, {
+        content: '@everyone',
+        username: '🎉 AutoJoin WIN',
+        embeds: [{
+          title: '🏆 GIVEAWAY WIN!',
+          description: jumpUrl ? `[Jump to message](${jumpUrl})` : 'Won via Direct Message',
+          color: 0xFFD700,
+          fields: [
+            { name: '🎁 Prize', value: prize || 'Unknown', inline: false },
+            { name: '🏠 Server', value: guildName, inline: true },
+            { name: '📢 Source', value: sourceName, inline: true },
+            { name: '👤 User', value: `<@${userId}>`, inline: true },
+            { name: '⏰ Won At', value: formatTimestamp(Date.now()), inline: false },
+          ],
+          footer: { text: `AutoJoin • ${url === CONFIG.winWebhookUrl || url === CONFIG.webhookUrl ? 'Global' : 'Personal'} Webhook` },
+          timestamp: new Date().toISOString(),
+        }],
+      }, { timeout: 8000 });
+    } catch (error) {
+      this.asyncLogger.warn('Win webhook failed', { userId, error: formatError(error) });
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -1367,7 +2254,7 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   // -------------------------------------------------------------------------
-  // Interval Starters - MEMORY SAFE
+  // Interval Starters
   // -------------------------------------------------------------------------
 
   private startSessionRefresher(): void {
@@ -1399,9 +2286,8 @@ export class AutoJoinManager extends EventEmitter {
       
       const mem = this.getMemoryUsage();
       
-      // Log memory every 5 minutes
-      if (Math.random() < 0.02) { // ~2% chance per check
-        this.asyncLogger.debug('Memory status', {
+      if (Math.random() < 0.02) {
+        this.asyncLogger.debug('💾 Memory status', {
           worker: this.workerId,
           ...mem,
           sessions: this.sessions.size,
@@ -1409,21 +2295,8 @@ export class AutoJoinManager extends EventEmitter {
         });
       }
       
-      if (mem.heapUsedMB > MEMORY_CRITICAL_THRESHOLD_MB) {
-        this.asyncLogger.error('CRITICAL: Memory threshold exceeded, forcing cleanup', {
-          worker: this.workerId,
-          ...mem,
-        });
-        this.forceCleanup();
-      } else if (mem.heapUsedMB > MEMORY_WARNING_THRESHOLD_MB) {
-        // Clean caches more aggressively
-        this.processedMessages.clean();
-        this.processingCache.clean();
-        this.recentWins.clean();
-        this.noResponseCooldown.clean();
-        if (global.gc) global.gc();
-      }
-    }, 30_000); // Check every 30 seconds
+      this.checkMemory();
+    }, 30_000);
     if (this.memoryCheckInterval.unref) this.memoryCheckInterval.unref();
   }
 
@@ -1442,7 +2315,6 @@ export class AutoJoinManager extends EventEmitter {
     this.cacheCleanInterval = setInterval(() => {
       if (this.isShuttingDown) return;
       
-      // Clean expired entries from all caches
       const cleaned = [
         this.processedMessages.clean(),
         this.processingCache.clean(),
@@ -1451,7 +2323,7 @@ export class AutoJoinManager extends EventEmitter {
       ].reduce((a, b) => a + b, 0);
       
       if (cleaned > 0) {
-        this.asyncLogger.debug(`Cache cleaner: removed ${cleaned} expired entries`, {
+        this.asyncLogger.debug(`🧹 Cache cleaner: removed ${cleaned} expired entries`, {
           worker: this.workerId,
         });
       }
@@ -1459,18 +2331,30 @@ export class AutoJoinManager extends EventEmitter {
     if (this.cacheCleanInterval.unref) this.cacheCleanInterval.unref();
   }
 
+  private startMetricsInterval(): void {
+    this.metricsInterval = setInterval(() => {
+      if (this.isShuttingDown) return;
+      this.logStats();
+    }, 5 * 60_000);
+    if (this.metricsInterval.unref) this.metricsInterval.unref();
+  }
+
   private logStats(): void {
     const stats = this.getStats();
-    const mem = this.getMemoryUsage();
-    this.asyncLogger.info('AutoJoin Stats', {
+    const mem = stats.memory;
+    
+    this.asyncLogger.info('📊 AutoJoin Stats', {
       worker: this.workerId,
-      totalSessions: stats.totalSessions,
-      activeSessions: stats.activeSessions,
-      cacheSize: this.processingCache.size,
-      processedCacheSize: this.processedMessages.size,
-      winCacheSize: this.recentWins.size,
-      circuitBreakerState: this.apiCircuitBreaker.getState(),
-      memory: mem,
+      sessions: `${stats.activeSessions}/${stats.totalSessions} active`,
+      memory: `${mem.heapUsedMB}MB / 8000MB (${mem.percentageUsed}%)`,
+      detected: stats.totalDetected,
+      entered: stats.totalEntered,
+      wins: stats.totalWins,
+      caches: stats.caches,
+      metrics: stats.metrics,
+      health: stats.healthStatus,
+      circuitBreaker: stats.circuitBreakerState,
+      uptime: `${stats.uptime}m`,
     });
   }
 }
