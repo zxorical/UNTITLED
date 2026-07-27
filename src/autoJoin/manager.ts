@@ -118,6 +118,7 @@ const KNOWN_GIVEAWAY_BOT_IDS: ReadonlySet<string> = new Set([
   '282859044593598464',
   '270904126974590976',
   '508391840525975553',
+  '530082442967646230', // Giveaway Boat (the one in your logs)
 ]);
 
 const TRUSTED_ENTRY_CUSTOM_IDS: ReadonlySet<string> = new Set([
@@ -127,6 +128,10 @@ const TRUSTED_ENTRY_CUSTOM_IDS: ReadonlySet<string> = new Set([
   'giveaway_enter',
   'join_giveaway',
   'giveaway-join',
+  'giveaway_participate',
+  'participate_giveaway',
+  'enter',
+  'participants',
 ]);
 
 const BLOCKED_BUTTON_LABELS: ReadonlyArray<RegExp> = [
@@ -152,6 +157,15 @@ const ENTRY_BUTTON_PATTERNS: ReadonlyArray<RegExp> = [
   /🎁/,
   /🏆/,
   /^\d[\d,]*$/,
+  /\bclick\s+to\s+enter\b/i,
+  /\benter\s+now\b/i,
+  /\bjoin\s+now\b/i,
+  /\bentry\b/i,
+  /i\s+want\s+to\s+win/i,
+  /sign\s+up/i,
+  /claim\s+entry/i,
+  /get\s+my\s+entry/i,
+  /\bgo\b/i,
 ];
 
 const BLOCKED_MESSAGE_CONTENT: ReadonlyArray<RegExp> = [
@@ -825,7 +839,8 @@ export class AutoJoinManager extends EventEmitter {
       return;
     }
 
-    const entryId = this.makeEntryId(message);
+    // FIX: Include userId in entryId
+    const entryId = this.makeEntryId(session, message);
 
     // Check processing cache (in-memory, short-lived)
     if (this.processingCache.has(entryId)) {
@@ -945,19 +960,68 @@ export class AutoJoinManager extends EventEmitter {
     return { prize: this.extractPrize(message), button };
   }
 
+  // FIXED: extractEntryButton with better detection
   private extractEntryButton(message: Message, _isKnownBot: boolean): GiveawayButton | null {
     const msgAny = message as unknown as Record<string, unknown>;
     const components = msgAny['components'] as unknown[] | undefined;
     if (!components?.length) return null;
 
+    // Check if this has draft buttons - if so, only return if there's an entry button too
+    let hasDraftButton = false;
     for (const row of components) {
       const rowAny = row as Record<string, unknown>;
       const rowComps = rowAny['components'] as unknown[] | undefined;
       if (!rowComps) continue;
+      for (const comp of rowComps) {
+        const c = comp as Record<string, unknown>;
+        const type = c['type'];
+        if (type !== 2 && type !== 'BUTTON') continue;
+        const label = ((c['label'] as string | undefined) ?? '').toLowerCase();
+        if (['start', 'edit', 'cancel', 'preview', 'setup'].includes(label)) {
+          hasDraftButton = true;
+          break;
+        }
+      }
+      if (hasDraftButton) break;
+    }
+
+    if (hasDraftButton) {
+      let hasEntry = false;
+      for (const row of components) {
+        const rowAny = row as Record<string, unknown>;
+        const rowComps = rowAny['components'] as unknown[] | undefined;
+        if (!rowComps) continue;
+        for (const comp of rowComps) {
+          const c = comp as Record<string, unknown>;
+          const type = c['type'];
+          if (type !== 2 && type !== 'BUTTON') continue;
+          if (c['style'] === 5) continue;
+          if (c['disabled'] === true) continue;
+          
+          const customId = (c['customId'] ?? c['custom_id']) as string | undefined;
+          const label = ((c['label'] as string | undefined) ?? '').trim();
+          
+          // Check for giveaway_message custom_id (the bot in your logs uses this)
+          if (customId === 'giveaway_message' || customId === 'giveaway-enter' || customId === 'enter_giveaway') {
+            hasEntry = true;
+            break;
+          }
+          if (TRUSTED_ENTRY_CUSTOM_IDS.has(customId || '')) hasEntry = true;
+          if (ENTRY_BUTTON_PATTERNS.some(re => re.test(label))) hasEntry = true;
+        }
+        if (hasEntry) break;
+      }
+      if (!hasEntry) return null;
+    }
+
+    // Search for entry button
+    for (const row of components) {
+      const rowAny = row as Record<string, unknown>;
+      const rowComps = rowAny['components'] as unknown[] | undefined;
+      if (!rowComps?.length) continue;
 
       for (const comp of rowComps) {
         const c = comp as Record<string, unknown>;
-
         const type = c['type'];
         if (type !== 2 && type !== 'BUTTON') continue;
         if (c['style'] === 5) continue;
@@ -967,15 +1031,26 @@ export class AutoJoinManager extends EventEmitter {
         if (!customId) continue;
 
         const label = ((c['label'] as string | undefined) ?? '').trim();
+        const lowerLabel = label.toLowerCase();
 
-        if (BLOCKED_BUTTON_LABELS.some(re => re.test(label))) {
+        // Skip management buttons
+        if (lowerLabel.includes('edit') || lowerLabel.includes('start') || 
+            lowerLabel.includes('cancel') || lowerLabel.includes('preview') || 
+            lowerLabel.includes('setup')) {
           continue;
         }
 
+        // Check for known giveaway button custom IDs first
         if (TRUSTED_ENTRY_CUSTOM_IDS.has(customId)) {
           return { customId, label: label || customId, disabled: false };
         }
 
+        // Check for number/emoji labels (entry count buttons)
+        if (label.match(/^[\d,]+$/) || label.includes('🎉') || label.includes('🎁')) {
+          return { customId, label: label || 'Enter', disabled: false };
+        }
+
+        // Check against patterns
         if (ENTRY_BUTTON_PATTERNS.some(re => re.test(label))) {
           return { customId, label: label || 'Enter', disabled: false };
         }
@@ -990,9 +1065,11 @@ export class AutoJoinManager extends EventEmitter {
   // -------------------------------------------------------------------------
 
   private async enterGiveaway(entryId: string, session: UserSession): Promise<void> {
+    // FIX: Parse entryId with userId included
     const parts = entryId.split(':');
-    const channelId = parts[0];
-    const messageId = parts.slice(1).join(':');
+    const userId = parts[0];
+    const channelId = parts[1];
+    const messageId = parts.slice(2).join(':');
     
     const entry = await getAutoJoinEntry(session.userId, messageId, channelId);
     
@@ -1117,20 +1194,26 @@ export class AutoJoinManager extends EventEmitter {
     await this.postInteraction(message, button);
   }
 
+  // FIXED: postInteraction with correct payload format
   private async postInteraction(message: Message, button: GiveawayButton): Promise<void> {
     const clientAny = message.client as unknown as Record<string, unknown>;
     const sessionId = (clientAny['sessionId'] ?? clientAny['session_id'] ?? Date.now().toString()) as string;
     const nonce = `${Date.now()}${Math.random().toString(36).slice(2, 8)}`;
 
+    // FIX: Use correct API endpoint and payload format
     const payload = {
-      type: 3,
-      nonce,
+      type: 3, // Message Component Interaction
+      nonce: nonce,
       guild_id: message.guild?.id ?? null,
       channel_id: message.channel.id,
       message_id: message.id,
       application_id: message.author?.id,
       session_id: sessionId,
-      data: { component_type: 2, custom_id: button.customId },
+      message_flags: 0, // FIX: Add message_flags
+      data: {
+        component_type: 2, // Button
+        custom_id: button.customId,
+      },
     };
 
     const token = (message.client as any).token as string;
@@ -1394,8 +1477,9 @@ export class AutoJoinManager extends EventEmitter {
     }
   }
 
-  private makeEntryId(message: Message): string {
-    return `${message.channel.id}:${message.id}`;
+  // FIX: Include userId in entryId
+  private makeEntryId(session: UserSession, message: Message): string {
+    return `${session.userId}:${message.channel.id}:${message.id}`;
   }
 
   private makeSessionKey(userId: string): string {
