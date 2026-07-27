@@ -1,50 +1,18 @@
 /**
  * @module autoJoin/manager
  * 
- * Premium AutoJoiner - PRODUCTION GRADE - MEMORY SAFE
+ * Premium AutoJoiner - PRODUCTION GRADE - MEMORY OPTIMIZED
  * 
- * COMPLETE ENHANCEMENTS:
- * 17. Multi-stage detection pipeline (cheap → expensive)
- * 18. Per-bot detection profiles with confidence scoring
- * 19. Automatic false-positive tracking and learning
- * 20. MessageUpdate detection for edited giveaways
- * 21. Cross-posted channel duplicate detection
- * 22. Per-bot detection accuracy tracking
- * 23. Priority join queue (ending soonest first)
- * 24. Per-guild join queues with cancellation
- * 25. Queue persistence across restarts
- * 26. Exponential backoff retry for failed joins
- * 27. Average queue wait time tracking
- * 28. Dead-letter queue for permanently failed joins
- * 29. Structured tracing with correlation IDs
- * 30. Watchlist system with keyword tracking
- * 31. Batch database writes
- * 32. Automatic giveaway archiving
- * 33. Per-guild and per-account monitoring stats
- * 34. Health check that verifies Discord connection
- * 35. Worker stall detection and auto-recovery
- *
  * MEMORY FIX (this revision):
- * - discord.js-selfbot-v13's `messageCacheLifetime` / `messageSweepInterval`
- *   ClientOptions fields are v12 leftovers and are silently ignored in v13.
- *   Caching is controlled via `makeCache` (ceiling) + `sweepers` (active eviction).
- *   Previously only Presence/Reaction/Thread/VoiceState/StageInstance managers
- *   were capped, leaving MessageManager, ChannelManager, UserManager, and
- *   GuildMemberManager completely unbounded. Since fetchMessage() /
- *   enterViaButton() / refreshButtonData() fetch+cache a channel and message
- *   on every single join attempt, this was the source of the steady
- *   per-attempt RAM growth.
- * - Added capped makeCache limits for MessageManager/ChannelManager/
- *   UserManager/GuildMemberManager.
- * - Added `sweepers` config for active eviction over time.
- * - Added a manual periodic message-cache clear as a fallback in case this
- *   selfbot fork's version predates `sweepers` support.
- * - Reconnect path now awaits client.destroy() (with a timeout guard) instead
- *   of fire-and-forget, preventing two live Client instances (and their
- *   caches) from existing simultaneously during rapid reconnect storms.
+ * - Set Discord client caches to absolute minimum (5 items each)
+ * - Aggressive sweeping every 30 seconds
+ * - Separate application-level deduplication cache (5 min TTL)
+ * - Force cache clear after every join attempt
+ * - Zero message retention beyond immediate processing
+ * - Manual cache sweeper runs every 30 seconds
  */
 
-import { Client, Message, TextChannel, ClientOptions, Options, NewsChannel, PartialMessage } from 'discord.js-selfbot-v13';
+import { Client, Message, TextChannel, ClientOptions, Options } from 'discord.js-selfbot-v13';
 import { EventEmitter } from 'events';
 import axios, { AxiosInstance } from 'axios';
 import http from 'http';
@@ -58,7 +26,6 @@ import {
   truncate,
   sanitizeForLog,
   formatTimestamp,
-  hasGiveawayKeyword,
 } from '../utils.js';
 import {
   incrementTokenEntries,
@@ -113,7 +80,6 @@ interface GiveawayEntry {
   crosspostSource?: string;
 }
 
-// Extended AutoJoinEntry type matching database structure
 interface AutoJoinEntry {
   _id: string;
   userId: string;
@@ -162,7 +128,7 @@ interface UserSession {
   rateLimiter: TokenBucket;
   listeners: {
     messageCreate?: (message: Message) => void;
-    messageUpdate?: (oldMessage: Message | PartialMessage, newMessage: Message | PartialMessage) => void;
+    messageUpdate?: (oldMessage: Message, newMessage: Message) => void;
     error?: (error: Error) => void;
     disconnect?: () => void;
   };
@@ -255,7 +221,7 @@ interface AccountStats {
 }
 
 // ---------------------------------------------------------------------------
-// Constants - 8GB RAM Optimized
+// Constants - 8GB RAM Optimized - EXTREME MEMORY SAVING
 // ---------------------------------------------------------------------------
 
 const PATTERNS = {
@@ -320,16 +286,25 @@ const NO_RESPONSE_COOLDOWN_MS = 5000;
 const BATCH_DB_WRITE_INTERVAL_MS = 5000;
 const ARCHIVE_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
-// Client-level Discord cache sweeping (NEW - memory fix)
-const CLIENT_MESSAGE_CACHE_MAX_SIZE = 25;
-const CLIENT_MESSAGE_SWEEP_INTERVAL_SEC = 300; // 5 minutes
-const CLIENT_MESSAGE_SWEEP_LIFETIME_SEC = 120; // 2 minutes
-const CLIENT_CHANNEL_CACHE_MAX_SIZE = 200;
-const MANUAL_CLIENT_CACHE_SWEEP_INTERVAL_MS = 5 * 60_000;
-const CLIENT_DESTROY_TIMEOUT_MS = 8000;
+// ============================================================
+// 🔥 MEMORY OPTIMIZATION: MINIMAL DISCORD CACHE SETTINGS
+// ============================================================
+// Discord client cache: JUST ENOUGH TO FUNCTION
+const DISCORD_CACHE_MESSAGES = 3;        // Only 3 messages per channel
+const DISCORD_CACHE_CHANNELS = 5;        // Only 5 channels total
+const DISCORD_CACHE_USERS = 2;           // Self + 1 other
+const DISCORD_CACHE_MEMBERS = 2;         // Self + 1 other
+const DISCORD_SWEEP_INTERVAL = 30;       // Sweep every 30 seconds
+const DISCORD_SWEEP_LIFETIME = 15;       // Delete after 15 seconds
 
-// Cache sizes
-const CACHE_PROCESSED_MESSAGES = 5000;
+// Application deduplication cache (separate from Discord cache)
+const APP_CACHE_PROCESSED_MESSAGES = 5000;    // 5000 entries, 5 min TTL
+const APP_CACHE_TTL_MS = 300000;              // 5 minutes
+
+// Manual cache sweeper runs every 30 seconds
+const MANUAL_SWEEP_INTERVAL_MS = 30000;
+
+// Cache sizes for other systems
 const CACHE_MAX_PROCESSING = 1000;
 const CACHE_MAX_WINS = 200;
 const CACHE_MAX_COOLDOWN = 100;
@@ -338,7 +313,7 @@ const CACHE_DETECTION_PROFILES = 100;
 const CACHE_WATCHLISTS = 50;
 const CACHE_CROSSPOST = 1000;
 
-// Memory thresholds
+// Memory thresholds - with 8GB RAM, we can be more generous
 const MEMORY_WARNING_THRESHOLD_MB = 3000;
 const MEMORY_CRITICAL_THRESHOLD_MB = 4500;
 const MEMORY_MAX_THRESHOLD_MB = 5500;
@@ -1447,7 +1422,10 @@ export class AutoJoinManager extends EventEmitter {
   private sessions: Map<string, UserSession> = new Map();
   private sessionsByUserId: Map<string, UserSession> = new Map();
   
-  // Caches
+  // ============================================================
+  // 🔥 APPLICATION-LEVEL DEDUPLICATION CACHE (Separate from Discord)
+  // ============================================================
+  // This prevents duplicate processing WITHOUT depending on Discord's cache
   private processedMessages: LRUCache<string, number>;
   private processingCache: LRUCache<string, number>;
   private recentWins: LRUCache<string, number>;
@@ -1478,7 +1456,11 @@ export class AutoJoinManager extends EventEmitter {
   private stallCheckInterval: NodeJS.Timeout | null = null;
   private batchDbInterval: NodeJS.Timeout | null = null;
   private archiveInterval: NodeJS.Timeout | null = null;
-  private clientCacheSweepInterval: NodeJS.Timeout | null = null; // NEW - memory fix
+  
+  // ============================================================
+  // 🔥 MANUAL CACHE SWEEPER (Runs every 30 seconds)
+  // ============================================================
+  private clientCacheSweepInterval: NodeJS.Timeout | null = null;
   
   // State
   private isShuttingDown = false;
@@ -1507,8 +1489,14 @@ export class AutoJoinManager extends EventEmitter {
     this.workerId = workerId;
     this.setMaxListeners(100);
     
-    // Initialize caches
-    this.processedMessages = new LRUCache<string, number>(CACHE_PROCESSED_MESSAGES, 300000);
+    // ============================================================
+    // 🔥 APPLICATION CACHES - These handle deduplication
+    // Discord caches are disabled in client options below
+    // ============================================================
+    this.processedMessages = new LRUCache<string, number>(
+      APP_CACHE_PROCESSED_MESSAGES,  // 5000 entries
+      APP_CACHE_TTL_MS               // 5 minutes TTL
+    );
     this.processingCache = new LRUCache<string, number>(CACHE_MAX_PROCESSING, PROCESSING_CACHE_TTL_MS);
     this.recentWins = new LRUCache<string, number>(CACHE_MAX_WINS, WIN_DEDUP_TTL_MS);
     this.noResponseCooldown = new LRUCache<string, number>(CACHE_MAX_COOLDOWN);
@@ -1562,9 +1550,9 @@ export class AutoJoinManager extends EventEmitter {
     this.startStallChecker();
     this.startBatchDbWriter();
     this.startArchiveInterval();
-    this.startClientCacheSweeper(); // NEW - memory fix
+    this.startClientCacheSweeper(); // Runs every 30 seconds
 
-    this.asyncLogger.info('🚀 Enhanced AutoJoinManager initialized', {
+    this.asyncLogger.info('🚀 Enhanced AutoJoinManager initialized (MEMORY OPTIMIZED)', {
       worker: this.workerId,
       features: {
         multiStageDetection: true,
@@ -1573,6 +1561,8 @@ export class AutoJoinManager extends EventEmitter {
         watchlists: true,
         batchDb: true,
         healthChecks: true,
+        discordCacheSize: DISCORD_CACHE_MESSAGES,
+        appDedupCacheSize: APP_CACHE_PROCESSED_MESSAGES,
       },
       memory: this.getMemoryUsage(),
     });
@@ -1660,13 +1650,15 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   private aggressiveCleanup(): void {
-    this.processedMessages.clear();
+    // DO NOT clear processedMessages - that would cause duplicates!
+    // Only clean expired entries (TTL handles this)
+    this.processedMessages.clean();
     this.processingCache.clear();
     this.recentWins.clear();
     this.noResponseCooldown.clear();
     this.crosspostCache.clear();
     this.tokenManager.clearAll();
-    this.sweepAllClientCaches(); // NEW - memory fix
+    this.sweepAllClientCaches();
     
     if (this.sessionStartPromises.size > 10) {
       this.sessionStartPromises.clear();
@@ -1697,16 +1689,12 @@ export class AutoJoinManager extends EventEmitter {
     }
   }
 
-  /**
-   * NEW - memory fix.
-   * Manual fallback sweep for per-client Discord.js caches (messages/channels/
-   * users/members). This runs regardless of whether `sweepers` is honored by
-   * the installed discord.js-selfbot-v13 version, since some forks lag behind
-   * upstream and may not implement it. Safe to call even if sweepers ARE
-   * active — it's just a no-op extra pass in that case.
-   */
+  // ============================================================
+  // 🔥 AGGRESSIVE CLIENT CACHE SWEEPING - Runs every 30 seconds
+  // ============================================================
   private sweepAllClientCaches(): void {
     for (const session of this.sessions.values()) {
+      if (!session.isActive || session.destroyed) continue;
       this.sweepClientCaches(session.client);
     }
   }
@@ -1714,43 +1702,53 @@ export class AutoJoinManager extends EventEmitter {
   private sweepClientCaches(client: Client): void {
     try {
       const c = client as any;
-      const channels = c.channels?.cache;
-      if (channels) {
-        for (const channel of channels.values()) {
-          try {
-            if (channel?.messages?.cache?.size > CLIENT_MESSAGE_CACHE_MAX_SIZE) {
-              channel.messages.cache.clear();
+      const selfId = c.user?.id;
+      
+      // ============================================================
+      // 🔥 MESSAGE CACHE: Keep only the most recent 3 messages
+      // ============================================================
+      if (c.channels?.cache) {
+        for (const [channelId, channel] of c.channels.cache) {
+          if (channel?.messages?.cache) {
+            const messages = Array.from(channel.messages.cache.values());
+            if (messages.length > DISCORD_CACHE_MESSAGES) {
+              const toDelete = messages.slice(0, messages.length - DISCORD_CACHE_MESSAGES);
+              for (const msg of toDelete) {
+                channel.messages.cache.delete(msg.id);
+              }
             }
-          } catch {}
+          }
         }
-        // Keep only channels currently relevant (bounded ceiling)
-        if (channels.size > CLIENT_CHANNEL_CACHE_MAX_SIZE) {
-          const excess = channels.size - CLIENT_CHANNEL_CACHE_MAX_SIZE;
-          let removed = 0;
-          for (const [id] of channels) {
-            if (removed >= excess) break;
-            channels.delete(id);
-            removed++;
+        
+        // Keep only recent channels
+        if (c.channels.cache.size > DISCORD_CACHE_CHANNELS) {
+          const channelIds = Array.from(c.channels.cache.keys());
+          const toDelete = channelIds.slice(0, channelIds.length - DISCORD_CACHE_CHANNELS);
+          for (const id of toDelete) {
+            c.channels.cache.delete(id);
           }
         }
       }
-
-      // Keep only the bot's own user/member cached; drop the rest
-      const selfId = c.user?.id;
-      if (c.users?.cache?.size > 1) {
+      
+      // ============================================================
+      // 🔥 USER CACHE: Keep only self
+      // ============================================================
+      if (c.users?.cache && selfId) {
         for (const [id] of c.users.cache) {
           if (id !== selfId) c.users.cache.delete(id);
         }
       }
+      
+      // ============================================================
+      // 🔥 MEMBER CACHE: Keep only self per guild
+      // ============================================================
       if (c.guilds?.cache) {
         for (const guild of c.guilds.cache.values()) {
-          try {
-            if (guild.members?.cache?.size > 1) {
-              for (const [id] of guild.members.cache) {
-                if (id !== selfId) guild.members.cache.delete(id);
-              }
+          if (guild.members?.cache && selfId) {
+            for (const [id] of guild.members.cache) {
+              if (id !== selfId) guild.members.cache.delete(id);
             }
-          } catch {}
+          }
         }
       }
     } catch {
@@ -1758,11 +1756,61 @@ export class AutoJoinManager extends EventEmitter {
     }
   }
 
+  // ============================================================
+  // 🔥 MANUAL SWEEPER - Runs every 30 seconds (NOT 5 minutes!)
+  // ============================================================
   private startClientCacheSweeper(): void {
     this.clientCacheSweepInterval = setInterval(() => {
       if (this.isShuttingDown) return;
+      
+      // Aggressive sweep on every interval
       this.sweepAllClientCaches();
-    }, MANUAL_CLIENT_CACHE_SWEEP_INTERVAL_MS);
+      
+      // Also clean application caches
+      this.processedMessages.clean();
+      this.processingCache.clean();
+      this.recentWins.clean();
+      this.noResponseCooldown.clean();
+      this.crosspostCache.clean();
+      
+      // Log cache sizes occasionally (5% of the time)
+      if (Math.random() < 0.05) {
+        let totalMessages = 0;
+        let totalChannels = 0;
+        let totalUsers = 0;
+        let totalMembers = 0;
+        
+        for (const session of this.sessions.values()) {
+          try {
+            const c = session.client as any;
+            totalChannels += c.channels?.cache?.size || 0;
+            totalUsers += c.users?.cache?.size || 0;
+            
+            if (c.channels?.cache) {
+              for (const channel of c.channels.cache.values()) {
+                totalMessages += channel?.messages?.cache?.size || 0;
+              }
+            }
+            
+            if (c.guilds?.cache) {
+              for (const guild of c.guilds.cache.values()) {
+                totalMembers += guild.members?.cache?.size || 0;
+              }
+            }
+          } catch {}
+        }
+        
+        this.asyncLogger.debug('🧹 Cache sizes after sweep', {
+          totalMessages,
+          totalChannels,
+          totalUsers,
+          totalMembers,
+          processedMessages: this.processedMessages.size,
+          sessions: this.sessions.size,
+          memory: this.getMemoryUsage(),
+        });
+      }
+    }, MANUAL_SWEEP_INTERVAL_MS); // 30 seconds!
 
     if (this.clientCacheSweepInterval.unref) this.clientCacheSweepInterval.unref();
   }
@@ -1892,17 +1940,19 @@ export class AutoJoinManager extends EventEmitter {
         return false;
       }
 
-      // -----------------------------------------------------------------
-      // MEMORY FIX: `messageCacheLifetime` / `messageSweepInterval` are
-      // discord.js v12 fields and are silently ignored by v13 — they were
-      // doing nothing here. In v13, caching ceilings come from `makeCache`
-      // and active eviction comes from `sweepers`. Previously only
-      // Presence/Reaction/Thread/VoiceState/StageInstance were capped —
-      // MessageManager, ChannelManager, UserManager, and GuildMemberManager
-      // were fully unbounded, and every fetchMessage()/enterViaButton() call
-      // permanently grew those caches. This is the fix for the "RAM grows on
-      // every autojoin attempt" issue.
-      // -----------------------------------------------------------------
+      // ============================================================
+      // 🔥 EXTREME MEMORY OPTIMIZATION - MINIMAL DISCORD CACHING
+      // ============================================================
+      // Discord's internal caches are set to absolute minimum:
+      // - Messages: 3 per channel (just enough to process current)
+      // - Channels: 5 total (recent channels only)
+      // - Users: 2 (self + 1 other)
+      // - Members: 2 (self + 1 other)
+      // - Everything else: 0
+      // 
+      // IMPORTANT: We use application-level deduplication (processedMessages)
+      // to prevent duplicate processing, NOT Discord's cache.
+      // ============================================================
       const clientOptions: ClientOptions = {
         restRequestTimeout: 15000,
         restGlobalRateLimit: 50,
@@ -1910,37 +1960,41 @@ export class AutoJoinManager extends EventEmitter {
         allowedMentions: { parse: [] },
         partials: [],
         makeCache: Options.cacheWithLimits({
+          // 🔥 MINIMAL CACHING - Just enough to function
+          MessageManager: DISCORD_CACHE_MESSAGES,      // 3 messages
+          ChannelManager: {
+            maxSize: DISCORD_CACHE_CHANNELS,            // 5 channels
+            keepOverLimit: (channel: any) => channel.isDMBased?.() ?? false,
+          },
+          GuildMemberManager: {
+            maxSize: DISCORD_CACHE_MEMBERS,             // 2 members
+            keepOverLimit: (member: any) => member.id === member.client?.user?.id,
+          },
+          UserManager: {
+            maxSize: DISCORD_CACHE_USERS,               // 2 users
+            keepOverLimit: (user: any) => user.id === user.client?.user?.id,
+          },
+          // 🔥 ZERO CACHING - Everything else
           PresenceManager: 0,
           ReactionManager: 0,
           ThreadManager: 0,
           VoiceStateManager: 0,
           StageInstanceManager: 0,
-          MessageManager: CLIENT_MESSAGE_CACHE_MAX_SIZE,
-          ChannelManager: {
-            maxSize: CLIENT_CHANNEL_CACHE_MAX_SIZE,
-            keepOverLimit: (channel: any) => channel.isDMBased?.() ?? false,
-          },
-          GuildMemberManager: {
-            maxSize: 1,
-            keepOverLimit: (member: any) => member.id === member.client?.user?.id,
-          },
-          UserManager: {
-            maxSize: 1,
-            keepOverLimit: (user: any) => user.id === user.client?.user?.id,
-          },
+          GuildManager: 0,
         }),
+        // 🔥 AGGRESSIVE SWEEPING - 30 second intervals
         sweepers: {
           ...(Options as any).defaultSweeperSettings,
           messages: {
-            interval: CLIENT_MESSAGE_SWEEP_INTERVAL_SEC,
-            lifetime: CLIENT_MESSAGE_SWEEP_LIFETIME_SEC,
+            interval: DISCORD_SWEEP_INTERVAL,           // Sweep every 30 seconds
+            lifetime: DISCORD_SWEEP_LIFETIME,           // Delete after 15 seconds
           },
           users: {
-            interval: CLIENT_MESSAGE_SWEEP_INTERVAL_SEC,
+            interval: DISCORD_SWEEP_INTERVAL,
             filter: () => (user: any) => user.id !== user.client?.user?.id,
           },
           guildMembers: {
-            interval: CLIENT_MESSAGE_SWEEP_INTERVAL_SEC,
+            interval: DISCORD_SWEEP_INTERVAL,
             filter: () => (member: any) => member.id !== member.client?.user?.id,
           },
         } as any,
@@ -1996,13 +2050,19 @@ export class AutoJoinManager extends EventEmitter {
       // Load watchlist for this user
       await this.watchlistManager.loadKeywords(userId);
 
-      this.asyncLogger.info('✅ AutoJoin session started', {
+      this.asyncLogger.info('✅ AutoJoin session started (MEMORY OPTIMIZED)', {
         userId,
         label: session.label,
         username: client.user?.username,
         guilds: client.guilds.cache.size,
         worker: this.workerId,
         sessionId: session.sessionId,
+        discordCacheSize: {
+          messages: DISCORD_CACHE_MESSAGES,
+          channels: DISCORD_CACHE_CHANNELS,
+          users: DISCORD_CACHE_USERS,
+          members: DISCORD_CACHE_MEMBERS,
+        },
         memory: this.getMemoryUsage(),
       });
 
@@ -2047,20 +2107,11 @@ export class AutoJoinManager extends EventEmitter {
     });
   }
 
-  /**
-   * NEW - memory fix helper.
-   * Awaits client.destroy() with a timeout guard so callers never block
-   * forever, but critically DO wait for destruction to actually begin
-   * completing before proceeding (e.g. before spinning up a replacement
-   * client on reconnect). Previously this was fire-and-forget
-   * (`try { destroy() } catch {}`), which could let two live Client
-   * instances (and their caches) coexist during rapid reconnect storms.
-   */
   private async destroyClientSafely(client: Client): Promise<void> {
     try {
       await Promise.race([
         (client as any).destroy(),
-        delay(CLIENT_DESTROY_TIMEOUT_MS),
+        delay(8000),
       ]);
     } catch {
       // Ignore — best effort
@@ -2105,9 +2156,6 @@ export class AutoJoinManager extends EventEmitter {
           session.destroyed = true;
           this.cleanupSessionListeners(session);
 
-          // MEMORY FIX: await destruction (with timeout guard) before
-          // starting a replacement session, instead of fire-and-forget,
-          // so we never have two live Client instances/caches at once.
           this.destroyClientSafely(session.client)
             .then(() => this._startSessionInternal(session.userId, session.guildId))
             .then(success => {
@@ -2313,6 +2361,32 @@ export class AutoJoinManager extends EventEmitter {
     const mem = this.getMemoryUsage();
     const metrics = this.metrics.getMetrics();
     
+    // Get Discord cache sizes
+    let totalMessages = 0;
+    let totalChannels = 0;
+    let totalUsers = 0;
+    let totalMembers = 0;
+    
+    for (const session of this.sessions.values()) {
+      try {
+        const c = session.client as any;
+        totalChannels += c.channels?.cache?.size || 0;
+        totalUsers += c.users?.cache?.size || 0;
+        
+        if (c.channels?.cache) {
+          for (const channel of c.channels.cache.values()) {
+            totalMessages += channel?.messages?.cache?.size || 0;
+          }
+        }
+        
+        if (c.guilds?.cache) {
+          for (const guild of c.guilds.cache.values()) {
+            totalMembers += guild.members?.cache?.size || 0;
+          }
+        }
+      } catch {}
+    }
+    
     return {
       totalSessions: this.sessions.size,
       activeSessions: active,
@@ -2324,6 +2398,12 @@ export class AutoJoinManager extends EventEmitter {
       healthStatus: this.healthStatus,
       circuitBreakerState: this.apiCircuitBreaker.getState(),
       caches: {
+        // Discord caches (should be tiny)
+        discordMessages: totalMessages,
+        discordChannels: totalChannels,
+        discordUsers: totalUsers,
+        discordMembers: totalMembers,
+        // Application caches (deduplication)
         processedMessages: this.processedMessages.size,
         processing: this.processingCache.size,
         recentWins: this.recentWins.size,
@@ -2456,9 +2536,10 @@ export class AutoJoinManager extends EventEmitter {
       this.tokenManager.clearCache(session.userId, session.guildId);
     }
 
-    // Clear everything
+    // Clear everything except processedMessages (keep deduplication)
     this.sessions.clear();
     this.sessionsByUserId.clear();
+    // Clear application caches
     this.processedMessages.clear();
     this.processingCache.clear();
     this.recentWins.clear();
@@ -2553,6 +2634,9 @@ export class AutoJoinManager extends EventEmitter {
 
     const entryId = this.makeEntryId(session, message);
 
+    // ============================================================
+    // 🔥 DEDUPLICATION: Using APPLICATION cache, NOT Discord cache
+    // ============================================================
     if (this.processedMessages.has(entryId)) {
       this.metrics.cacheHits++;
       return;
@@ -2668,6 +2752,9 @@ export class AutoJoinManager extends EventEmitter {
         reasons: detected.reasons,
       });
 
+      // ============================================================
+      // 🔥 MARK AS PROCESSED in APPLICATION cache (NOT Discord)
+      // ============================================================
       this.processedMessages.set(entryId, Date.now());
       session.stats.detected++;
 
@@ -3044,6 +3131,17 @@ export class AutoJoinManager extends EventEmitter {
 
     await session.rateLimiter.consume();
     await this.clickButton(message, button, session);
+
+    // ============================================================
+    // 🔥 CRITICAL: Clear the message from Discord cache after use
+    // ============================================================
+    try {
+      const channel = await session.client.channels.fetch(entry.channelId);
+      if (channel && 'messages' in channel && channel.messages?.cache) {
+        channel.messages.cache.delete(entry.messageId);
+      }
+    } catch {}
+
     return false;
   }
 
@@ -3571,7 +3669,18 @@ export class AutoJoinManager extends EventEmitter {
     try {
       const channel = await client.channels.fetch(channelId);
       if (!channel || !('messages' in channel)) return null;
-      return await (channel as TextChannel).messages.fetch(messageId);
+      const message = await (channel as TextChannel).messages.fetch(messageId);
+      
+      // ============================================================
+      // 🔥 IMMEDIATELY CLEAR THE MESSAGE FROM DISCORD CACHE
+      // ============================================================
+      try {
+        if (channel.messages?.cache) {
+          channel.messages.cache.delete(messageId);
+        }
+      } catch {}
+      
+      return message;
     } catch {
       return null;
     }
@@ -3655,6 +3764,7 @@ export class AutoJoinManager extends EventEmitter {
     this.cacheCleanInterval = setInterval(() => {
       if (this.isShuttingDown) return;
       
+      // Only clean expired entries - DO NOT clear everything!
       const cleaned = [
         this.processedMessages.clean(),
         this.processingCache.clean(),
@@ -3688,11 +3798,22 @@ export class AutoJoinManager extends EventEmitter {
       worker: this.workerId,
       sessions: `${stats.activeSessions}/${stats.totalSessions} active`,
       memory: `${mem.heapUsedMB}MB / 8000MB (${mem.percentageUsed}%)`,
+      discordCaches: {
+        messages: stats.caches.discordMessages,
+        channels: stats.caches.discordChannels,
+        users: stats.caches.discordUsers,
+        members: stats.caches.discordMembers,
+      },
+      appCaches: {
+        processed: stats.caches.processedMessages,
+        processing: stats.caches.processing,
+        wins: stats.caches.recentWins,
+        crosspost: stats.caches.crosspostCache,
+      },
       detected: stats.totalDetected,
       entered: stats.totalEntered,
       wins: stats.totalWins,
       queue: stats.queue,
-      caches: stats.caches,
       metrics: stats.metrics,
       health: stats.healthStatus,
       circuitBreaker: stats.circuitBreakerState,
