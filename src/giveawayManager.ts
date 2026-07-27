@@ -3,26 +3,26 @@
  * Reliable giveaway detector — scans everything, misses nothing.
  * 
  * Optimizations applied:
- * 1. Single parse pass with lowercase variants
+ * 1. Single parse pass with lowercase variants (WeakMap cached)
  * 2. Never blocks on fetch - async refresh only when needed
  * 3. Pre-compiled Sets for O(1) lookups instead of regex
  * 4. Buttons parsed once
  * 5. Timestamps parsed once
  * 6. Text built once with all lowercase variants
- * 7. Reverse watchlist index for O(k) matching (k = text length)
- * 8. Aho-Corasick for watchlist matching when >50 items
- * 9. Bloom filter for watchlist pre-check (>500 items)
- * 10. LRU caches with size limits
- * 11. WeakMap for Message-bound data
- * 12. Parallelized independent async work
- * 13. Score with confidence and detection reason tracking
- * 14. Single Date.now() per message
- * 15. Message age rejection
- * 16. Guild whitelist/blacklist
- * 17. Duplicate giveaway detection via content hash
- * 18. Failed invite caching
- * 19. Background watchlist refresh
- * 20. Edited giveaway end detection via messageUpdate
+ * 7. Reverse watchlist index for O(k) matching
+ * 8. Aho-Corasick for watchlist matching when >100 items
+ * 9. LRU caches with size limits
+ * 10. WeakMap for Message-bound data (auto GC)
+ * 11. Parallelized independent async work
+ * 12. Score with confidence % and detection reason tracking
+ * 13. Single Date.now() per message
+ * 14. Message age rejection (30 min)
+ * 15. Duplicate giveaway detection via content hash
+ * 16. Failed invite caching (15 min retry)
+ * 17. Background watchlist refresh
+ * 18. Ended giveaway detection via messageUpdate
+ * 19. Per-guild statistics
+ * 20. Gateway latency + processing time measurement
  */
 
 import { Client, Message, TextChannel } from 'discord.js-selfbot-v13';
@@ -43,7 +43,7 @@ import {
 import { BotManager } from './bot.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
-// CONSTANTS (pre-compiled Sets/Maps for O(1) lookups)
+// CONSTANTS (pre-compiled Sets for O(1) lookups)
 // ═══════════════════════════════════════════════════════════════════════════
 
 const ALLOWED_GIVEAWAY_BOT_IDS = new Set(['530082442967646230']);
@@ -56,13 +56,11 @@ const ENTRY_EMOJIS = new Set(['🎉', '🎁', '🎊', '🎈', '🎀', '👍', '�
 const DRAFT_BUTTON_LABELS = new Set(['start', 'edit', 'cancel', 'preview', 'setup']);
 const GIVEAWAY_EMBED_COLORS = new Set([0xF1C40F, 0x7289DA, 0x2ECC71, 0xE91E63]);
 
-// Simple word sets for O(1) .has() checks (faster than .includes on array)
 const GIVEAWAY_WORDS = new Set(['giveaway', 'raffle', 'sweepstakes', 'win', 'prize']);
 const ENTRY_WORDS = new Set(['enter', 'join', 'participate', 'raffle', 'sweepstakes', 'submit']);
 const FOOTER_END_WORDS = new Set(['ends', 'expires']);
 const PRIZE_FIELD_NAMES = new Set(['prize', 'reward', 'item', 'prizes', 'rewards']);
 
-// Blocked phrases - checked via includes on full lowercase text
 const BLOCKED_PHRASES = [
   'already entered', 'you have already entered', "you've already entered",
   'you are already in', 'leave giveaway', 'joined successfully',
@@ -73,7 +71,6 @@ const BLOCKED_PHRASES = [
   'results are in', 'giveaway is now closed', 'thank you for participating',
 ];
 
-// Draft indicators
 const DRAFT_PHRASES = [
   'review your giveaway', 'click "start" to', "click 'start' to",
   'this message expires in', 'giveaway preview', 'configure your giveaway',
@@ -81,23 +78,56 @@ const DRAFT_PHRASES = [
   'create a giveaway', 'select a channel', 'set the prize', 'set the duration',
 ];
 
-// Ended giveaway indicators for messageUpdate
 const ENDED_PHRASES = [
   'ended', 'winner', 'closed', 'congratulations', 'results',
   'giveaway has ended', 'giveaway ended', 'giveaway is over',
 ];
 
-// Only regex that's genuinely needed
 const DURATION_REGEX = /(\d+)\s*(minute|min|m|hour|h)/i;
 const TIMESTAMP_REGEX = /<t:(\d{10,13})(?::[a-zA-Z])?>/g;
 const COUNT_ME_IN_REGEX = /count\s+me\s+in/i;
 
-// Thresholds
+// ─── Scoring weights ──────────────────────────────────────────────────────
+const SCORE = {
+  ENTRY_BUTTON: 3,
+  TIMESTAMP: 3,
+  TITLE_KEYWORD: 2,
+  FOOTER_ENDS: 2,
+  FIELD_GIVEAWAY: 2,
+  DESCRIPTION_KEYWORD: 1,
+  EMBED_COLOR: 1,
+  AUTHOR_KNOWN: 1,
+  CREATE_REVIEW: 5,
+  CREATE_EXPIRES: 5,
+  CREATE_CLICK_START: 5,
+  CREATE_CONFIG: 5,
+  CREATE_PREVIEW: 3,
+  CREATE_EDIT: 3,
+  CREATE_SETUP: 2,
+  CREATE_CHANNEL: 2,
+  CREATE_PRIZE: 2,
+  CREATE_BUTTON_START: 3,
+  CREATE_BUTTON_EDIT: 2,
+  CREATE_BUTTON_CANCEL: 2,
+  CREATE_BUTTON_PREVIEW: 2,
+  CREATE_BUTTON_SETUP: 2,
+  CREATE_SHORT_DURATION: 2,
+} as const;
+
+const MAX_POSSIBLE_SCORE =
+  SCORE.ENTRY_BUTTON +
+  SCORE.TIMESTAMP +
+  SCORE.TITLE_KEYWORD +
+  SCORE.FOOTER_ENDS +
+  SCORE.FIELD_GIVEAWAY +
+  SCORE.DESCRIPTION_KEYWORD +
+  SCORE.EMBED_COLOR +
+  SCORE.AUTHOR_KNOWN;
+
 const MINIMUM_SCORE_THRESHOLD = 6;
 const CREATION_SCORE_THRESHOLD = 7;
-const MAX_MESSAGE_AGE_MS = 30 * 60 * 1000; // 30 minutes
+const MAX_MESSAGE_AGE_MS = 30 * 60 * 1000;
 
-// Cache limits
 const MAX_CREATION_CACHE = 2000;
 const MAX_INVITE_CACHE = 500;
 const MAX_DUPLICATE_CACHE = 1000;
@@ -105,62 +135,10 @@ const MAX_FAILED_INVITE_CACHE = 200;
 const WATCHLIST_CACHE_TTL = 60000;
 const INVITE_CACHE_TTL = 30 * 60 * 1000;
 const FAILED_INVITE_RETRY_MS = 15 * 60 * 1000;
-const DUPLICATE_TTL = 10 * 60 * 1000;
-
-// Watchlist Aho-Corasick threshold
-const AHOCORASICK_THRESHOLD = 50;
-const BLOOM_FILTER_THRESHOLD = 500;
-
-// Guild filtering
-const allowedGuilds = CONFIG.allowedGuilds ? new Set(CONFIG.allowedGuilds) : null;
-const blockedGuilds = CONFIG.blockedGuilds ? new Set(CONFIG.blockedGuilds) : null;
+const AHOCORASICK_THRESHOLD = 100;
 
 // ═══════════════════════════════════════════════════════════════════════════
-// SIMPLE BLOOM FILTER (for watchlist pre-check)
-// ═══════════════════════════════════════════════════════════════════════════
-
-class BloomFilter {
-  private bits: Uint8Array;
-  private size: number;
-  private hashCount: number;
-
-  constructor(expectedItems: number, falsePositiveRate: number) {
-    this.size = Math.ceil(-expectedItems * Math.log(falsePositiveRate) / (Math.log(2) ** 2));
-    this.hashCount = Math.ceil((this.size / expectedItems) * Math.log(2));
-    this.bits = new Uint8Array(Math.ceil(this.size / 8));
-  }
-
-  add(item: string): void {
-    const lower = item.toLowerCase();
-    for (let i = 0; i < this.hashCount; i++) {
-      const hash = this.fnv1a(lower, i);
-      const pos = hash % this.size;
-      this.bits[pos >> 3] |= (1 << (pos & 7));
-    }
-  }
-
-  mightContain(item: string): boolean {
-    const lower = item.toLowerCase();
-    for (let i = 0; i < this.hashCount; i++) {
-      const hash = this.fnv1a(lower, i);
-      const pos = hash % this.size;
-      if (!(this.bits[pos >> 3] & (1 << (pos & 7)))) return false;
-    }
-    return true;
-  }
-
-  private fnv1a(str: string, seed: number): number {
-    let hash = 2166136261 ^ (seed * 16777619);
-    for (let i = 0; i < str.length; i++) {
-      hash ^= str.charCodeAt(i);
-      hash = Math.imul(hash, 16777619);
-    }
-    return hash >>> 0;
-  }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// AHO-CORASICK MATCHER (for large watchlists)
+// AHO-CORASICK (O(queue[head++]) BFS, no shift)
 // ═══════════════════════════════════════════════════════════════════════════
 
 interface AhoNode {
@@ -198,10 +176,10 @@ class AhoCorasick {
       queue.push(child);
     }
 
-    while (queue.length > 0) {
-      const current = queue.shift()!;
+    let head = 0;
+    while (head < queue.length) {
+      const current = queue[head++];
       for (const [char, child] of current.children) {
-        queue.push(child);
         let failNode = current.fail;
         while (failNode !== null && !failNode.children.has(char)) {
           failNode = failNode.fail;
@@ -210,6 +188,7 @@ class AhoCorasick {
         for (const output of child.fail.output) {
           child.output.add(output);
         }
+        queue.push(child);
       }
     }
     this.built = true;
@@ -231,19 +210,6 @@ class AhoCorasick {
       }
     }
     return results;
-  }
-
-  get patternCount(): number {
-    let count = 0;
-    const stack = [this.root];
-    while (stack.length > 0) {
-      const node = stack.pop()!;
-      count += node.output.size;
-      for (const child of node.children.values()) {
-        stack.push(child);
-      }
-    }
-    return count;
   }
 }
 
@@ -298,7 +264,7 @@ interface ParsedTimestamps {
 interface DetectionReason {
   signals: string[];
   score: number;
-  confidence: number; // 0-100%
+  confidence: number;
 }
 
 interface ParsedGiveawayData {
@@ -328,7 +294,6 @@ interface ParsedGiveawayData {
   isFromBot: boolean;
   botId: string;
   prize: string;
-  // Content hash for duplicate detection
   contentHash: string;
 }
 
@@ -341,7 +306,6 @@ function parseMessage(message: Message, now: number): ParsedGiveawayData {
   const embed = message.embeds?.[0];
   const messageAge = now - message.createdTimestamp;
 
-  // Extract text components once with lowercase variants
   const content = message.content || '';
   const lowerContent = content.toLowerCase();
   const title = embed?.title || '';
@@ -353,7 +317,6 @@ function parseMessage(message: Message, now: number): ParsedGiveawayData {
   const authorName = embed?.author?.name || '';
   const lowerAuthor = authorName.toLowerCase();
 
-  // Extract fields (just arrays, no Map allocation)
   const fieldNames: string[] = [];
   const lowerFieldNames: string[] = [];
   const fieldValues: string[] = [];
@@ -368,22 +331,14 @@ function parseMessage(message: Message, now: number): ParsedGiveawayData {
     }
   }
 
-  // Build full text once
   const textParts = [content, title, description, footer, authorName, ...fieldNames, ...fieldValues];
   const fullText = textParts.filter(Boolean).join(' ');
   const lowerText = fullText.toLowerCase();
 
-  // Parse buttons once
   const buttons = parseButtons((message as any).components);
-
-  // Parse timestamps once
   const timestamps = parseTimestamps(fullText, now);
-
-  // Extract prize (early stop on known field names)
   const prize = extractPrize(title, description, content, fieldNames, fieldValues);
-
-  // Content hash for duplicate detection
-  const contentHash = simpleHash(`${title}|${description}|${message.guild?.id}|${timestamps.end}`);
+  const contentHash = simpleHash(`${message.guild?.id}|${prize}|${timestamps.end}`);
 
   const parsed: ParsedGiveawayData = {
     parsedAt: now,
@@ -425,13 +380,12 @@ function refreshParsedMessage(message: Message, now: number): ParsedGiveawayData
 }
 
 function simpleHash(str: string): string {
-  let hash = 0;
+  let hash = 2166136261;
   for (let i = 0; i < str.length; i++) {
-    const char = str.charCodeAt(i);
-    hash = ((hash << 5) - hash) + char;
-    hash |= 0;
+    hash ^= str.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
   }
-  return hash.toString(36);
+  return (hash >>> 0).toString(36);
 }
 
 // ─── Button Parsing ───────────────────────────────────────────────────────
@@ -493,13 +447,12 @@ function parseTimestamps(text: string, now: number): ParsedTimestamps {
   return { end, all };
 }
 
-// ─── Prize Extraction (early stop) ────────────────────────────────────────
+// ─── Prize Extraction ─────────────────────────────────────────────────────
 
 function extractPrize(
   title: string, description: string, content: string,
   fieldNames: string[], fieldValues: string[],
 ): string {
-  // Early stop on known prize field names
   for (let i = 0; i < fieldNames.length; i++) {
     if (PRIZE_FIELD_NAMES.has(fieldNames[i].toLowerCase())) {
       return fieldValues[i].slice(0, 200).trim() || 'Unknown Prize';
@@ -518,26 +471,18 @@ function quickReject(message: Message, selfUserId: string, now: number): string 
   if (!message.guild) return 'no_guild';
   if (message.author?.id === selfUserId) return 'self';
 
-  // Guild whitelist/blacklist
-  if (allowedGuilds && !allowedGuilds.has(message.guild.id)) return 'not_allowed_guild';
-  if (blockedGuilds && blockedGuilds.has(message.guild.id)) return 'blocked_guild';
-
-  // Monitored channels
   if (CONFIG.monitoredChannels.length > 0 && !CONFIG.monitoredChannels.includes(message.channel.id)) {
     return 'not_monitored';
   }
 
-  // Not allowed bot
   if (!message.author?.bot || !ALLOWED_GIVEAWAY_BOT_IDS.has(message.author.id)) {
     return 'not_allowed_bot';
   }
 
-  // Message age rejection
   if (now - message.createdTimestamp > MAX_MESSAGE_AGE_MS) {
     return 'too_old';
   }
 
-  // Quick blocked content check on raw content (only if short)
   const rawContent = (message.content || '').toLowerCase();
   if (rawContent.length < 200) {
     for (const phrase of BLOCKED_PHRASES) {
@@ -555,25 +500,25 @@ function quickReject(message: Message, selfUserId: string, now: number): string 
 function detectCreation(parsed: ParsedGiveawayData): { isCreation: boolean; score: number } {
   let score = 0;
 
-  if (parsed.lowerText.includes('review your giveaway')) score += 5;
-  if (parsed.lowerText.includes('this message expires in')) score += 5;
-  if (parsed.lowerText.includes('click "start" to')) score += 5;
-  if (parsed.lowerText.includes("click 'start' to")) score += 5;
-  if (parsed.lowerText.includes('configure your giveaway')) score += 5;
-  if (parsed.lowerText.includes('giveaway preview')) score += 3;
-  if (parsed.lowerText.includes('setup your giveaway')) score += 3;
-  if (parsed.lowerText.includes('you can edit this')) score += 3;
-  if (parsed.lowerText.includes('you can change')) score += 3;
-  if (parsed.lowerText.includes('create a giveaway')) score += 2;
-  if (parsed.lowerText.includes('select a channel')) score += 2;
-  if (parsed.lowerText.includes('set the prize')) score += 2;
-  if (parsed.lowerText.includes('set the duration')) score += 2;
+  if (parsed.lowerText.includes('review your giveaway')) score += SCORE.CREATE_REVIEW;
+  if (parsed.lowerText.includes('this message expires in')) score += SCORE.CREATE_EXPIRES;
+  if (parsed.lowerText.includes('click "start" to')) score += SCORE.CREATE_CLICK_START;
+  if (parsed.lowerText.includes("click 'start' to")) score += SCORE.CREATE_CLICK_START;
+  if (parsed.lowerText.includes('configure your giveaway')) score += SCORE.CREATE_CONFIG;
+  if (parsed.lowerText.includes('giveaway preview')) score += SCORE.CREATE_PREVIEW;
+  if (parsed.lowerText.includes('setup your giveaway')) score += SCORE.CREATE_CONFIG;
+  if (parsed.lowerText.includes('you can edit this')) score += SCORE.CREATE_EDIT;
+  if (parsed.lowerText.includes('you can change')) score += SCORE.CREATE_EDIT;
+  if (parsed.lowerText.includes('create a giveaway')) score += SCORE.CREATE_SETUP;
+  if (parsed.lowerText.includes('select a channel')) score += SCORE.CREATE_CHANNEL;
+  if (parsed.lowerText.includes('set the prize')) score += SCORE.CREATE_PRIZE;
+  if (parsed.lowerText.includes('set the duration')) score += SCORE.CREATE_PRIZE;
 
-  if (parsed.buttons.draftLabels.includes('start')) score += 3;
-  if (parsed.buttons.draftLabels.includes('edit')) score += 2;
-  if (parsed.buttons.draftLabels.includes('cancel')) score += 2;
-  if (parsed.buttons.draftLabels.includes('preview')) score += 2;
-  if (parsed.buttons.draftLabels.includes('setup')) score += 2;
+  if (parsed.buttons.draftLabels.includes('start')) score += SCORE.CREATE_BUTTON_START;
+  if (parsed.buttons.draftLabels.includes('edit')) score += SCORE.CREATE_BUTTON_EDIT;
+  if (parsed.buttons.draftLabels.includes('cancel')) score += SCORE.CREATE_BUTTON_CANCEL;
+  if (parsed.buttons.draftLabels.includes('preview')) score += SCORE.CREATE_BUTTON_PREVIEW;
+  if (parsed.buttons.draftLabels.includes('setup')) score += SCORE.CREATE_BUTTON_SETUP;
 
   const durationMatch = parsed.fullText.match(DURATION_REGEX);
   if (durationMatch) {
@@ -581,7 +526,7 @@ function detectCreation(parsed: ParsedGiveawayData): { isCreation: boolean; scor
     const unit = (durationMatch[2] || '').toLowerCase();
     let minutes = value;
     if (unit.startsWith('h')) minutes = value * 60;
-    if (minutes <= 15) score += 2;
+    if (minutes <= 15) score += SCORE.CREATE_SHORT_DURATION;
   }
 
   return { isCreation: score >= CREATION_SCORE_THRESHOLD, score };
@@ -591,40 +536,38 @@ function detectCreation(parsed: ParsedGiveawayData): { isCreation: boolean; scor
 // SCORE CALCULATOR WITH DETECTION REASONS
 // ═══════════════════════════════════════════════════════════════════════════
 
-const MAX_POSSIBLE_SCORE = 17; // Sum of all possible signal weights
-
 function calculateGiveawayScore(parsed: ParsedGiveawayData): DetectionReason {
   let score = 0;
   const signals: string[] = [];
 
   if (parsed.buttons.entry) {
-    score += 3;
+    score += SCORE.ENTRY_BUTTON;
     signals.push('entry_button');
   }
 
   for (const word of GIVEAWAY_WORDS) {
-    if (parsed.lowerTitle.includes(word)) { score += 2; signals.push(`title:${word}`); break; }
+    if (parsed.lowerTitle.includes(word)) { score += SCORE.TITLE_KEYWORD; signals.push(`title:${word}`); break; }
   }
 
   for (const word of GIVEAWAY_WORDS) {
-    if (parsed.lowerDescription.includes(word)) { score += 1; signals.push(`desc:${word}`); break; }
+    if (parsed.lowerDescription.includes(word)) { score += SCORE.DESCRIPTION_KEYWORD; signals.push(`desc:${word}`); break; }
   }
 
   for (const word of FOOTER_END_WORDS) {
-    if (parsed.lowerFooter.includes(word)) { score += 2; signals.push(`footer:${word}`); break; }
+    if (parsed.lowerFooter.includes(word)) { score += SCORE.FOOTER_ENDS; signals.push(`footer:${word}`); break; }
   }
 
-  if (parsed.timestamps.end !== null) { score += 3; signals.push('timestamp'); }
+  if (parsed.timestamps.end !== null) { score += SCORE.TIMESTAMP; signals.push('timestamp'); }
 
   if (parsed.embedColor !== null && GIVEAWAY_EMBED_COLORS.has(parsed.embedColor)) {
-    score += 1; signals.push('embed_color');
+    score += SCORE.EMBED_COLOR; signals.push('embed_color');
   }
 
-  if (parsed.lowerAuthor.includes('giveaway')) { score += 1; signals.push('author'); }
+  if (parsed.lowerAuthor.includes('giveaway')) { score += SCORE.AUTHOR_KNOWN; signals.push('author'); }
 
   for (const fieldName of parsed.lowerFieldNames) {
     if (fieldName.includes('ends') || fieldName.includes('winners') || fieldName.includes('time remaining')) {
-      score += 2; signals.push(`field:${fieldName}`); break;
+      score += SCORE.FIELD_GIVEAWAY; signals.push(`field:${fieldName}`); break;
     }
   }
 
@@ -634,7 +577,7 @@ function calculateGiveawayScore(parsed: ParsedGiveawayData): DetectionReason {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// BLOCKED / DRAFT CHECKS
+// BLOCKED / DRAFT / ENDED CHECKS
 // ═══════════════════════════════════════════════════════════════════════════
 
 function isBlockedContent(parsed: ParsedGiveawayData): boolean {
@@ -659,6 +602,11 @@ function isEndedGiveaway(parsed: ParsedGiveawayData): boolean {
   return false;
 }
 
+function shouldRefreshMessage(parsed: ParsedGiveawayData): boolean {
+  return !parsed.hasAnyEmbed || !parsed.hasAnyComponent ||
+    (parsed.content.length < 50 && parsed.lowerText.includes('giveaway'));
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // GIVEAWAY MANAGER
 // ═══════════════════════════════════════════════════════════════════════════
@@ -672,18 +620,14 @@ export class GiveawayManager extends EventEmitter {
 
   private processingMessages = new Set<string>();
 
-  // LRU caches
   private creationCache = new LRUCache<string, { isCreation: boolean; score: number }>(MAX_CREATION_CACHE);
   private inviteCache = new LRUCache<string, { url: string; expiresAt: number }>(MAX_INVITE_CACHE);
   private failedInviteCache = new LRUCache<string, number>(MAX_FAILED_INVITE_CACHE);
   private duplicateCache = new LRUCache<string, number>(MAX_DUPLICATE_CACHE);
 
-  // Watchlist with reverse index and optional Aho-Corasick / Bloom
-  private watchlistData: Map<string, string[]> = new Map();
   private watchlistCacheExpiry = 0;
   private reverseWatchlistIndex: Map<string, string[]> = new Map();
   private watchlistAhoCorasick: AhoCorasick | null = null;
-  private watchlistBloomFilter: BloomFilter | null = null;
   private totalWatchlistItems = 0;
 
   private pendingInvites = new Map<string, Promise<string>>();
@@ -696,7 +640,6 @@ export class GiveawayManager extends EventEmitter {
     startedAt: Date.now(),
   };
 
-  // Per-guild stats
   private guildStats = new Map<string, { detected: number; notified: number; falsePositives: number }>();
 
   constructor(
@@ -720,6 +663,7 @@ export class GiveawayManager extends EventEmitter {
 
   public async handleMessage(message: Message): Promise<void> {
     const now = Date.now();
+    const processingStart = performance.now();
 
     // Stage 1: Quick Reject
     const rejectReason = quickReject(message, this.selfUserId, now);
@@ -753,10 +697,10 @@ export class GiveawayManager extends EventEmitter {
 
       if (creationResult.isCreation) { this.stats.draftsSkipped++; return; }
 
-      // Stage 3b: Draft / Ended checks
+      // Stage 3b: Draft Check
       if (isDraftGiveaway(parsed)) { this.stats.draftsSkipped++; return; }
 
-      // Stage 3c: Score with reasons
+      // Stage 3c: Score Calculation
       const detection = calculateGiveawayScore(parsed);
       if (detection.score < MINIMUM_SCORE_THRESHOLD) {
         this.stats.falsePositivesBlocked++;
@@ -771,11 +715,11 @@ export class GiveawayManager extends EventEmitter {
         return;
       }
 
-      // Stage 3d: Duplicate check
+      // Stage 3d: Duplicate Check
       if (this.duplicateCache.get(parsed.contentHash)) return;
       this.duplicateCache.set(parsed.contentHash, now);
 
-      // Stage 3e: Existing check
+      // Stage 3e: Existing Check
       const existing = await getGiveaway(message.id, message.channel.id);
       if (existing) {
         await updateLastSeen(message.id, message.channel.id);
@@ -785,16 +729,18 @@ export class GiveawayManager extends EventEmitter {
         return;
       }
 
-      // Cooldown
+      // Cooldown Check
       if (await wasNotifiedRecently(message.id, message.channel.id, CONFIG.notificationCooldown)) {
         this.stats.skipped++; return;
       }
 
-      // Stage 4: Build & Notify
+      // Stage 4: Build Data & Notify
       this.stats.detected++;
       this.recordGuildStat(message.guild!.id, 'detected');
 
-      const detectionTime = Date.now() - now;
+      // Performance metrics
+      const gatewayLatency = Math.max(1, Date.now() - message.createdTimestamp);
+      const processingTime = performance.now() - processingStart;
       const guild = message.guild!;
       const guildIcon = guild.iconURL({ size: 512 }) || null;
       const guildBanner = (guild as any).bannerURL?.({ size: 1024 }) || null;
@@ -806,7 +752,7 @@ export class GiveawayManager extends EventEmitter {
         channelName: (message.channel as any).name || 'unknown',
         authorId: parsed.botId, prize: parsed.prize,
         detectedAt: now, endsAt: parsed.timestamps.end,
-        detectionTimeMs: detectionTime,
+        detectionTimeMs: gatewayLatency,
         guildIcon, guildBanner, memberCount,
       };
 
@@ -838,8 +784,11 @@ export class GiveawayManager extends EventEmitter {
         this.log.error(`Notify error: ${formatError(error)}`);
       }
 
-      // Log detection with reasons
-      this.log.info(`Detected: "${parsed.prize}" [${detection.confidence}%] - ${detection.signals.join(', ')}`);
+      this.log.info(
+        `Detected: "${parsed.prize}" [${detection.confidence}%] ` +
+        `(gateway: ${gatewayLatency}ms, processing: ${processingTime.toFixed(2)}ms) - ` +
+        detection.signals.join(', ')
+      );
 
       await watchlistPromise;
 
@@ -852,11 +801,10 @@ export class GiveawayManager extends EventEmitter {
   }
 
   // ═══════════════════════════════════════════════════════════════════════
-  // MESSAGE UPDATE HANDLER (detect ended giveaways)
+  // MESSAGE UPDATE HANDLER
   // ═══════════════════════════════════════════════════════════════════════
 
-  public async handleMessageUpdate(oldMessage: Message, newMessage: Message): Promise<void> {
-    // Only check messages from allowed bots that we've seen before
+  public async handleMessageUpdate(_oldMessage: Message, newMessage: Message): Promise<void> {
     if (!newMessage.guild || !newMessage.author?.bot) return;
     if (!ALLOWED_GIVEAWAY_BOT_IDS.has(newMessage.author.id)) return;
 
@@ -873,7 +821,7 @@ export class GiveawayManager extends EventEmitter {
   }
 
   // ═══════════════════════════════════════════════════════════════════════
-  // WATCHLIST WITH REVERSE INDEX + AHO-CORASICK + BLOOM
+  // WATCHLIST MATCHING (reverse index + Aho-Corasick)
   // ═══════════════════════════════════════════════════════════════════════
 
   private async checkWatchlistMatches(
@@ -884,27 +832,17 @@ export class GiveawayManager extends EventEmitter {
     if (!this.botManager) return;
 
     try {
-      const { reverseIndex, ahoCorasick, bloomFilter, totalItems } = await this.getWatchlistData();
+      const { reverseIndex, ahoCorasick, totalItems } = await this.getWatchlistData();
       if (totalItems === 0) return;
 
       const lowerText = parsed.lowerText;
 
-      // Stage 1: Bloom filter pre-check (if applicable)
-      if (bloomFilter && !bloomFilter.mightContain(lowerText)) {
-        // Bloom filter says definitely no match - skip
-        return;
-      }
-
-      // Stage 2: Find matching keywords
       let matchedKeywords: string[];
-
       if (ahoCorasick) {
-        // Aho-Corasick: single pass, finds all matches
         matchedKeywords = Array.from(ahoCorasick.findMatches(lowerText));
       } else {
-        // Fallback: scan text for each keyword using reverse index
         matchedKeywords = [];
-        for (const [keyword, userIds] of reverseIndex) {
+        for (const keyword of reverseIndex.keys()) {
           if (lowerText.includes(keyword)) {
             matchedKeywords.push(keyword);
           }
@@ -913,14 +851,11 @@ export class GiveawayManager extends EventEmitter {
 
       if (matchedKeywords.length === 0) return;
 
-      // Stage 3: Collect unique users from matched keywords
       const matchedUserSet = new Set<string>();
       for (const keyword of matchedKeywords) {
         const userIds = reverseIndex.get(keyword);
         if (userIds) {
-          for (const userId of userIds) {
-            matchedUserSet.add(userId);
-          }
+          for (const userId of userIds) matchedUserSet.add(userId);
         }
       }
 
@@ -942,7 +877,6 @@ export class GiveawayManager extends EventEmitter {
   private async getWatchlistData(): Promise<{
     reverseIndex: Map<string, string[]>;
     ahoCorasick: AhoCorasick | null;
-    bloomFilter: BloomFilter | null;
     totalItems: number;
   }> {
     const now = Date.now();
@@ -951,12 +885,10 @@ export class GiveawayManager extends EventEmitter {
       return {
         reverseIndex: this.reverseWatchlistIndex,
         ahoCorasick: this.watchlistAhoCorasick,
-        bloomFilter: this.watchlistBloomFilter,
         totalItems: this.totalWatchlistItems,
       };
     }
 
-    // Refresh cache
     try {
       const watchlists = await getAllWatchlists();
       const data = new Map<string, string[]>();
@@ -964,32 +896,15 @@ export class GiveawayManager extends EventEmitter {
 
       for (const wl of watchlists) {
         if (wl.items?.length) {
-          // Store lowercased
           data.set(wl.userId, wl.items.map(i => i.toLowerCase()));
           totalItems += wl.items.length;
         }
       }
 
-      this.watchlistData = data;
       this.totalWatchlistItems = totalItems;
       this.watchlistCacheExpiry = now + WATCHLIST_CACHE_TTL;
-
-      // Build reverse index
       this.reverseWatchlistIndex = this.buildReverseIndex(data);
-
-      // Build Aho-Corasick if threshold met
-      if (totalItems >= AHOCORASICK_THRESHOLD) {
-        this.watchlistAhoCorasick = this.buildAhoCorasick(data);
-      } else {
-        this.watchlistAhoCorasick = null;
-      }
-
-      // Build Bloom filter if threshold met
-      if (totalItems >= BLOOM_FILTER_THRESHOLD) {
-        this.watchlistBloomFilter = this.buildBloomFilter(data);
-      } else {
-        this.watchlistBloomFilter = null;
-      }
+      this.watchlistAhoCorasick = totalItems >= AHOCORASICK_THRESHOLD ? this.buildAhoCorasick(data) : null;
 
     } catch (err) {
       this.log.error('Watchlist refresh error', { error: formatError(err) });
@@ -998,7 +913,6 @@ export class GiveawayManager extends EventEmitter {
     return {
       reverseIndex: this.reverseWatchlistIndex,
       ahoCorasick: this.watchlistAhoCorasick,
-      bloomFilter: this.watchlistBloomFilter,
       totalItems: this.totalWatchlistItems,
     };
   }
@@ -1007,7 +921,6 @@ export class GiveawayManager extends EventEmitter {
     const index = new Map<string, string[]>();
     for (const [userId, items] of data) {
       for (const item of items) {
-        // Items already lowercased
         let arr = index.get(item);
         if (!arr) { arr = []; index.set(item, arr); }
         arr.push(userId);
@@ -1029,16 +942,6 @@ export class GiveawayManager extends EventEmitter {
     }
     ac.build();
     return ac;
-  }
-
-  private buildBloomFilter(data: Map<string, string[]>): BloomFilter {
-    const bf = new BloomFilter(this.totalWatchlistItems, 0.01);
-    for (const items of data.values()) {
-      for (const item of items) {
-        bf.add(item);
-      }
-    }
-    return bf;
   }
 
   private async sendWatchlistDMs(
@@ -1078,13 +981,13 @@ export class GiveawayManager extends EventEmitter {
   }
 
   // ═══════════════════════════════════════════════════════════════════════
-  // BACKGROUND WATCHLIST REFRESHER
+  // BACKGROUND REFRESHERS
   // ═══════════════════════════════════════════════════════════════════════
 
   private startWatchlistRefresher(): void {
     if (this.watchlistRefreshInterval) clearInterval(this.watchlistRefreshInterval);
     this.watchlistRefreshInterval = setInterval(() => {
-      this.watchlistCacheExpiry = 0; // Force refresh on next access
+      this.watchlistCacheExpiry = 0;
     }, WATCHLIST_CACHE_TTL);
     if (this.watchlistRefreshInterval.unref) this.watchlistRefreshInterval.unref();
   }
@@ -1096,17 +999,14 @@ export class GiveawayManager extends EventEmitter {
   private async fetchInviteForGuild(guildId: string): Promise<string> {
     const now = Date.now();
 
-    // Check failed cache
     const failedUntil = this.failedInviteCache.get(guildId);
     if (failedUntil && failedUntil > now) {
       return `https://discord.com/channels/${guildId}`;
     }
 
-    // Check valid cache
     const cached = this.inviteCache.get(guildId);
     if (cached && cached.expiresAt > now) return cached.url;
 
-    // Check pending
     const pending = this.pendingInvites.get(guildId);
     if (pending) return pending;
 
@@ -1114,8 +1014,7 @@ export class GiveawayManager extends EventEmitter {
     this.pendingInvites.set(guildId, promise);
 
     try {
-      const url = await promise;
-      return url;
+      return await promise;
     } finally {
       this.pendingInvites.delete(guildId);
     }
@@ -1126,7 +1025,6 @@ export class GiveawayManager extends EventEmitter {
       const guild = this.client.guilds.cache.get(guildId);
       if (!guild) { this.cacheFailedInvite(guildId, now); return `https://discord.com/channels/${guildId}`; }
 
-      // Try existing invites
       try {
         const invites = await guild.invites.fetch();
         if (invites?.size) {
@@ -1136,13 +1034,11 @@ export class GiveawayManager extends EventEmitter {
         }
       } catch {}
 
-      // Try vanity
       try {
         const vanity = (guild as any).vanityURLCode;
         if (vanity) { const url = `https://discord.gg/${vanity}`; this.cacheInvite(guildId, url, now); return url; }
       } catch {}
 
-      // Create invite
       const textChannels = guild.channels.cache.filter(
         (ch): ch is TextChannel => ch.type === 'GUILD_TEXT'
       );
@@ -1151,7 +1047,6 @@ export class GiveawayManager extends EventEmitter {
       const botMember = guild.members.cache.get(this.selfUserId);
       if (!botMember) { this.cacheFailedInvite(guildId, now); return `https://discord.com/channels/${guildId}`; }
 
-      // Channels with permission
       for (const [, channel] of textChannels) {
         try {
           if (!channel.permissionsFor(botMember)?.has('CREATE_INSTANT_INVITE')) continue;
@@ -1161,7 +1056,6 @@ export class GiveawayManager extends EventEmitter {
         } catch {}
       }
 
-      // Fallback: any channel
       for (const [, channel] of textChannels) {
         try {
           const invite = await channel.createInvite({ maxAge: 0, maxUses: 0, reason: 'Giveaway tracker (fallback)', temporary: false });
@@ -1209,7 +1103,7 @@ export class GiveawayManager extends EventEmitter {
   }
 
   // ═══════════════════════════════════════════════════════════════════════
-  // PER-GUILD STATS
+  // STATS
   // ═══════════════════════════════════════════════════════════════════════
 
   private recordGuildStat(guildId: string, type: 'detected' | 'notified' | 'falsePositive'): void {
@@ -1223,10 +1117,6 @@ export class GiveawayManager extends EventEmitter {
   public getGuildStats(): Map<string, { detected: number; notified: number; falsePositives: number }> {
     return new Map(this.guildStats);
   }
-
-  // ═══════════════════════════════════════════════════════════════════════
-  // GLOBAL STATS & SHUTDOWN
-  // ═══════════════════════════════════════════════════════════════════════
 
   public getStats() {
     return { ...this.stats, uptime: Date.now() - this.stats.startedAt, guildStats: this.guildStats.size };
@@ -1250,15 +1140,14 @@ export class GiveawayManager extends EventEmitter {
     this.log.info(`  Guilds tracked      : ${this.guildStats.size}`);
     this.log.info(`────────────────────────────────────────────────────────`);
 
-    // Top 5 guilds
     if (this.guildStats.size > 0) {
       const top = Array.from(this.guildStats.entries())
         .sort((a, b) => b[1].detected - a[1].detected)
         .slice(0, 5);
       this.log.info('  Top guilds:');
-      for (const [guildId, stats] of top) {
+      for (const [guildId, gs] of top) {
         const guild = this.client.guilds.cache.get(guildId);
-        this.log.info(`    ${guild?.name || guildId}: ${stats.detected}d/${stats.notified}n/${stats.falsePositives}fp`);
+        this.log.info(`    ${guild?.name || guildId}: ${gs.detected}d/${gs.notified}n/${gs.falsePositives}fp`);
       }
     }
   }
@@ -1278,13 +1167,6 @@ export class GiveawayManager extends EventEmitter {
     this.log.info(`Shutting down ${this.accountLabel}...`);
     this.logStats();
   }
-}
-
-// ─── Helper (not a method to avoid `this` issues) ─────────────────────────
-
-function shouldRefreshMessage(parsed: ParsedGiveawayData): boolean {
-  return !parsed.hasAnyEmbed || !parsed.hasAnyComponent ||
-    (parsed.content.length < 50 && parsed.lowerText.includes('giveaway'));
 }
 
 export default GiveawayManager;
