@@ -12,12 +12,15 @@
  * 7. Added cache size limits
  * 8. Periodic cache cleanup
  * 9. Optimized watchlist matching
+ * 10. Database fallback for getGiveaway to prevent re-tracking on restart
+ * 11. Startup grace period to skip old replayed messages
+ * 12. Gateway latency capping to prevent misleading 200k+ ms stats
  */
 
 import { Client, Message, TextChannel } from 'discord.js-selfbot-v13';
 import { EventEmitter } from 'events';
 import { CONFIG } from './config.js';
-import { logger, AppLogger } from './logger.js';  // ✅ ADDED AppLogger
+import { logger, AppLogger } from './logger.js';
 import { delay, formatError } from './utils.js';
 import { GiveawayData } from './types.js';
 import {
@@ -125,6 +128,11 @@ const WATCHLIST_CACHE_TTL = 60000;
 const INVITE_CACHE_TTL = 30 * 60 * 1000;
 const FAILED_INVITE_RETRY_MS = 15 * 60 * 1000;
 const AHOCORASICK_THRESHOLD = 100;
+
+// Startup grace period constants
+const STARTUP_GRACE_PERIOD_MS = 30_000; // 30 seconds
+const MAX_STARTUP_MESSAGE_AGE_MS = 10_000; // 10 seconds during startup
+const MAX_GATEWAY_LATENCY_MS = 60_000; // Cap gateway latency at 60 seconds
 
 // ─── Parsed Message Cache with TTL ──────────────────────────────────────
 const PARSED_CACHE_TTL_MS = 60000; // 1 minute
@@ -511,12 +519,18 @@ function extractPrize(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// QUICK REJECT (Stage 1)
+// QUICK REJECT (Stage 1) - FIXED: Age check moved to top
 // ═══════════════════════════════════════════════════════════════════════════
 
 function quickReject(message: Message, selfUserId: string, now: number): string | null {
   if (!message.guild) return 'no_guild';
   if (message.author?.id === selfUserId) return 'self';
+
+  // AGE CHECK FIRST: Reject messages that are too old immediately
+  const messageAge = now - message.createdTimestamp;
+  if (messageAge > MAX_MESSAGE_AGE_MS) {
+    return 'too_old';
+  }
 
   if (CONFIG.monitoredChannels.length > 0 && !CONFIG.monitoredChannels.includes(message.channel.id)) {
     return 'not_monitored';
@@ -524,10 +538,6 @@ function quickReject(message: Message, selfUserId: string, now: number): string 
 
   if (!message.author?.bot || !ALLOWED_GIVEAWAY_BOT_IDS.has(message.author.id)) {
     return 'not_allowed_bot';
-  }
-
-  if (now - message.createdTimestamp > MAX_MESSAGE_AGE_MS) {
-    return 'too_old';
   }
 
   const rawContent = (message.content || '').toLowerCase();
@@ -655,7 +665,7 @@ function shouldRefreshMessage(parsed: ParsedGiveawayData): boolean {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// GIVEAWAY MANAGER
+// GIVEAWAY MANAGER - FIXED: Startup grace period, DB fallback, latency cap
 // ═══════════════════════════════════════════════════════════════════════════
 
 export class GiveawayManager extends EventEmitter {
@@ -681,17 +691,24 @@ export class GiveawayManager extends EventEmitter {
   private inviteRefresherInterval: NodeJS.Timeout | null = null;
   private watchlistRefreshInterval: NodeJS.Timeout | null = null;
 
+  // ─── NEW: Startup grace period properties ──────────────────────────
+  private readyEventReceived = false;
+  private readonly startupTime: number;
+  private pendingStartupMessages = new Set<string>();
+  private startupGraceTimer: NodeJS.Timeout | null = null;
+
   private stats = {
     detected: 0, notified: 0, skipped: 0, errors: 0,
     falsePositivesBlocked: 0, watchlistMatches: 0, draftsSkipped: 0,
     startedAt: Date.now(),
+    startupMessagesSkipped: 0, // NEW: Track skipped startup messages
   };
 
   private guildStats = new Map<string, { detected: number; notified: number; falsePositives: number }>();
 
   // Log sampling to reduce spam
   private logSampleCounter = 0;
-  private readonly LOG_SAMPLE_RATE = 10; // Log 1 out of every 10 messages
+  private readonly LOG_SAMPLE_RATE = 10;
 
   constructor(
     client: Client, log: AppLogger, _token: string,
@@ -703,20 +720,81 @@ export class GiveawayManager extends EventEmitter {
     this.accountLabel = accountLabel;
     this.botManager = botManager;
     this.selfUserId = client.user?.id || '';
+    this.startupTime = Date.now();
 
     this.startInviteRefresher();
     this.startWatchlistRefresher();
+    this.setupReadyHandler(); // NEW: Handle startup gracefully
   }
 
   // ═══════════════════════════════════════════════════════════════════════
-  // PUBLIC API
+  // NEW: Startup Ready Handler
+  // ═══════════════════════════════════════════════════════════════════════
+
+  private setupReadyHandler(): void {
+    // Listen for ready event to handle startup
+    this.client.once('ready', () => {
+      // Give Discord 2 seconds to finish replaying messages
+      setTimeout(() => {
+        this.readyEventReceived = true;
+        
+        const startupDuration = Date.now() - this.startupTime;
+        this.log.info(
+          `Startup complete - ${this.pendingStartupMessages.size} messages skipped during startup (${startupDuration}ms)`,
+          {
+            component: 'GiveawayManager',
+            account: this.accountLabel,
+            pendingMessages: this.pendingStartupMessages.size
+          }
+        );
+        
+        this.stats.startupMessagesSkipped = this.pendingStartupMessages.size;
+        this.pendingStartupMessages.clear();
+      }, 2000);
+      
+      // Set a hard grace period cutoff as fallback
+      this.startupGraceTimer = setTimeout(() => {
+        if (!this.readyEventReceived) {
+          this.readyEventReceived = true;
+          this.log.warn('Ready event not received within grace period, forcing startup complete', {
+            component: 'GiveawayManager',
+            account: this.accountLabel
+          });
+          this.stats.startupMessagesSkipped = this.pendingStartupMessages.size;
+          this.pendingStartupMessages.clear();
+        }
+      }, STARTUP_GRACE_PERIOD_MS);
+    });
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // PUBLIC API - FIXED: Startup guard, DB fallback, latency cap
   // ═══════════════════════════════════════════════════════════════════════
 
   public async handleMessage(message: Message): Promise<void> {
     const now = Date.now();
     const processingStart = performance.now();
 
-    // Stage 1: Quick Reject
+    // ─── NEW: Startup Guard - Skip old messages replayed by Discord ───
+    if (!this.readyEventReceived) {
+      // Calculate message age
+      const messageAge = now - message.createdTimestamp;
+      
+      // If message is older than 10 seconds during startup, skip it entirely
+      if (messageAge > MAX_STARTUP_MESSAGE_AGE_MS) {
+        return; // Old message replayed by Discord on reconnect
+      }
+      
+      // Track that we saw this message during startup
+      this.pendingStartupMessages.add(message.id);
+    }
+
+    // ─── NEW: Additional age check - reject messages that are too old regardless ───
+    if (now - message.createdTimestamp > MAX_MESSAGE_AGE_MS) {
+      return; // Message is too old to process
+    }
+
+    // Stage 1: Quick Reject (age check now at top of quickReject)
     const rejectReason = quickReject(message, this.selfUserId, now);
     if (rejectReason) return;
 
@@ -769,18 +847,20 @@ export class GiveawayManager extends EventEmitter {
         return;
       }
 
-      // Stage 3d: Duplicate Check
-      if (this.duplicateCache.get(parsed.contentHash)) return;
-      this.duplicateCache.set(parsed.contentHash, now);
+      // Stage 3d: Duplicate Check (in-memory, using message+channel ID)
+      const messageDupKey = `${message.id}:${message.channel.id}`;
+      if (this.duplicateCache.get(messageDupKey)) return;
+      this.duplicateCache.set(messageDupKey, now);
 
-      // Stage 3e: Existing Check
+      // ─── Stage 3e: Existing Check (NOW WITH MONGODB FALLBACK) ───
       const existing = await getGiveaway(message.id, message.channel.id);
       if (existing) {
+        // Already tracked - update last seen and check if ended
         await updateLastSeen(message.id, message.channel.id);
         if (existing.status === 'active' && isEndedGiveaway(parsed)) {
           await markEnded(message.id, message.channel.id);
         }
-        return;
+        return; // IMPORTANT: Don't re-notify on restart
       }
 
       // Cooldown Check
@@ -792,8 +872,11 @@ export class GiveawayManager extends EventEmitter {
       this.stats.detected++;
       this.recordGuildStat(message.guild!.id, 'detected');
 
-      // Performance metrics
-      const gatewayLatency = Math.max(1, Date.now() - message.createdTimestamp);
+      // ─── FIXED: Cap gateway latency to prevent misleading stats on restart ───
+      const gatewayLatency = Math.min(
+        Math.max(1, Date.now() - message.createdTimestamp),
+        MAX_GATEWAY_LATENCY_MS // Cap at 60 seconds
+      );
       const processingTime = performance.now() - processingStart;
       const guild = message.guild!;
       const guildIcon = guild.iconURL({ size: 512 }) || null;
@@ -1198,7 +1281,12 @@ export class GiveawayManager extends EventEmitter {
   }
 
   public getStats() {
-    return { ...this.stats, uptime: Date.now() - this.stats.startedAt, guildStats: this.guildStats.size };
+    return { 
+      ...this.stats, 
+      uptime: Date.now() - this.stats.startedAt, 
+      guildStats: this.guildStats.size,
+      readyEventReceived: this.readyEventReceived,
+    };
   }
 
   public logStats(): void {
@@ -1212,12 +1300,14 @@ export class GiveawayManager extends EventEmitter {
     this.log.info(`  False positives     : ${s.falsePositivesBlocked}`);
     this.log.info(`  Watchlist matches   : ${s.watchlistMatches}`);
     this.log.info(`  Drafts skipped      : ${s.draftsSkipped}`);
+    this.log.info(`  Startup skipped     : ${s.startupMessagesSkipped}`);
     this.log.info(`  Uptime              : ${Math.floor(uptime / 60)}m ${Math.floor(uptime % 60)}s`);
     this.log.info(`  Invites cached      : ${this.inviteCache.size}`);
     this.log.info(`  Failed invites      : ${this.failedInviteCache.size}`);
     this.log.info(`  Watchlist items     : ${this.totalWatchlistItems}`);
     this.log.info(`  Guilds tracked      : ${this.guildStats.size}`);
     this.log.info(`  Parse cache size    : ${parsedMessageCache.size}`);
+    this.log.info(`  Ready received      : ${this.readyEventReceived}`);
     this.log.info(`────────────────────────────────────────────────────────`);
 
     if (this.guildStats.size > 0) {
@@ -1237,6 +1327,7 @@ export class GiveawayManager extends EventEmitter {
       detected: 0, notified: 0, skipped: 0, errors: 0,
       falsePositivesBlocked: 0, watchlistMatches: 0, draftsSkipped: 0,
       startedAt: Date.now(),
+      startupMessagesSkipped: 0,
     };
     this.guildStats.clear();
   }
@@ -1258,7 +1349,7 @@ export class GiveawayManager extends EventEmitter {
   }
 
   // ═══════════════════════════════════════════════════════════════════════
-  // SHUTDOWN
+  // SHUTDOWN - FIXED: Clean up startup timer
   // ═══════════════════════════════════════════════════════════════════════
 
   public async shutdown(): Promise<void> {
@@ -1270,6 +1361,10 @@ export class GiveawayManager extends EventEmitter {
       clearInterval(this.watchlistRefreshInterval); 
       this.watchlistRefreshInterval = null; 
     }
+    if (this.startupGraceTimer) { 
+      clearTimeout(this.startupGraceTimer);
+      this.startupGraceTimer = null; 
+    }
     
     // Clear caches
     this.creationCache.clear();
@@ -1277,6 +1372,7 @@ export class GiveawayManager extends EventEmitter {
     this.failedInviteCache.clear();
     this.duplicateCache.clear();
     this.processingMessages.clear();
+    this.pendingStartupMessages.clear();
     
     // Clear parsed message cache
     parsedMessageCache.clear();
