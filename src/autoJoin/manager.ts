@@ -1,83 +1,93 @@
 /**
- * @module autoJoin/manager
+ * @module database
+ * MongoDB-backed store with an in-memory cache for instant reads.
  * 
- * Premium AutoJoiner - PRODUCTION GRADE - MEMORY SAFE
- * 
- * Based on the working autoJoin.ts detection logic with:
- * - Multi-session support
- * - Premium user management
- * - MongoDB persistence
- * - Queue system with retries
- * - Win detection
- * - Webhook notifications
+ * IMPROVEMENTS:
+ * 1. Max cache size to prevent unbounded growth with proper cleanup
+ * 2. TTL for cache entries with periodic cleanup
+ * 3. Proper cleanup on shutdown with graceful flushing
+ * 4. Reduced log spam with debug levels
+ * 5. Connection pooling for MongoDB with retry logic
+ * 6. Comprehensive retry logic for connection
+ * 7. Cache/DB consistency checking
+ * 8. Atomic operations where possible
+ * 9. Comprehensive error handling
+ * 10. Proper input validation
+ * 11. Performance optimizations with indexes
+ * 12. Transaction support for critical operations
  */
 
-import { Client, Message, TextChannel, ClientOptions, Options, PartialMessage } from 'discord.js-selfbot-v13';
-import { EventEmitter } from 'events';
-import axios, { AxiosInstance } from 'axios';
-import http from 'http';
-import https from 'https';
-import { v4 as uuidv4 } from 'uuid';
-import { logger } from '../logger.js';
-import {
-  delay,
-  exponentialBackoff,
-  formatError,
-  truncate,
-  sanitizeForLog,
-  formatTimestamp,
-} from '../utils.js';
-import {
-  incrementTokenEntries,
-  incrementTokenWins,
-  updateTokenLastUsed,
-  getPremiumUser,
-  setTokenActive,
-  getUserWebhook,
-  getAllPremiumUsersAllGuilds,
-  getAutoJoinEntry,
-  saveAutoJoinEntry,
-  updateAutoJoinEntryStatus,
-  cleanupAutoJoinEntries,
-  batchSaveJoinOutcomes,
-  batchUpdateDetectionConfidence,
-  archiveOldGiveaways,
-  saveWatchlistMatch,
-  getWatchlistKeywords,
-  getDetectionProfiles,
-  updateDetectionProfile,
-  saveQueueState,
-  loadQueueState,
-} from '../database.js';
-import { decryptToken } from '../premium/tokenManager.js';
-import { CONFIG } from '../config.js';
+import { MongoClient, Db, Collection, AnyBulkWriteOperation, ClientSession } from 'mongodb';
+import { logger } from './logger.js';
+import { GiveawayData, GiveawayStats, UserWatchlist, LicenseKey } from './types.js';
 
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
+// ============================================================================
+// Interfaces & Types
+// ============================================================================
 
-interface GiveawayEntry {
-  _id: string;
-  userId: string;
+interface StoredGiveaway {
   messageId: string;
   channelId: string;
   guildId: string;
-  authorId: string;
   guildName: string;
   channelName: string;
+  authorId: string;
   prize: string;
-  buttonCustomId?: string;
   detectedAt: number;
-  endsAt?: number;
-  status: 'pending' | 'queued' | 'attempting' | 'success' | 'failed' | 'skipped' | 'dead_letter';
-  attempts: number;
-  lastAttemptAt?: number;
-  lastError?: string;
-  expiresAt: number;
-  correlationId: string;
-  detectionConfidence: number;
-  detectionReasons: string[];
-  crosspostSource?: string;
+  endsAt: number | null;
+  status: 'active' | 'ended';
+  notifiedAt: number | null;
+  lastSeenAt: number;
+  notificationMessageId?: string;
+  notificationStatus?: string;
+  notificationSentAt?: number;
+  notificationError?: string;
+  version?: number; // For optimistic locking
+}
+
+interface TotalCounter {
+  _id: string;
+  total: number;
+  lastUpdated: number;
+}
+
+interface CacheEntry {
+  doc: StoredGiveaway;
+  timestamp: number;
+  version: number;
+}
+
+// Premium User Tracking
+interface PremiumUser {
+  userId: string;
+  guildId: string;
+  isPremium: boolean;
+  source: 'key' | 'booster' | 'manual';
+  licenseKey?: string;
+  activatedAt: number;
+  expiresAt: number | null;
+  lastChecked: number;
+  token?: string | null;
+  tokenLabel?: string | null;
+  tokenAddedAt?: number | null;
+  tokenLastUsed?: number | null;
+  tokenEntries?: number;
+  tokenWins?: number;
+  tokenActive?: boolean;
+  webhookUrl?: string | null;
+  webhookAddedAt?: number | null;
+  webhookLastUsed?: number | null;
+  version?: number;
+}
+
+interface BoosterPremium {
+  userId: string;
+  guildId: string;
+  isBooster: boolean;
+  premiumAssigned: boolean;
+  assignedAt: number;
+  lastChecked: number;
+  version?: number;
 }
 
 interface AutoJoinEntry {
@@ -93,3649 +103,1830 @@ interface AutoJoinEntry {
   buttonCustomId?: string;
   detectedAt: number;
   endsAt?: number;
-  status: 'pending' | 'queued' | 'attempting' | 'success' | 'failed' | 'skipped' | 'dead_letter';
+  status: 'pending' | 'attempting' | 'success' | 'failed' | 'skipped';
   attempts: number;
   lastAttemptAt?: number;
   lastError?: string;
   expiresAt: number;
-  correlationId?: string;
-  detectionConfidence?: number;
-  detectionReasons?: string[];
-  crosspostSource?: string;
-  queuePosition?: number;
-  entryTimeMs?: number;
-  archived?: boolean;
-  archivedAt?: number;
 }
 
-interface GiveawayButton {
-  customId: string;
-  label: string;
-  disabled: boolean;
+// ============================================================================
+// Constants & Configuration
+// ============================================================================
+
+const MONGO_URI = process.env.MONGO_URI;
+if (!MONGO_URI) {
+  throw new Error('MONGO_URI environment variable is required');
 }
 
-interface UserSession {
-  client: Client;
-  userId: string;
-  guildId: string;
-  label: string;
-  startedAt: number;
-  isActive: boolean;
-  stats: SessionStats;
-  heartbeatInterval?: NodeJS.Timeout;
-  reconnectAttempts: number;
-  maxReconnectAttempts: number;
-  rateLimiter: TokenBucket;
-  listeners: {
-    messageCreate?: (message: Message) => void;
-    messageUpdate?: (oldMessage: Message | PartialMessage, newMessage: Message | PartialMessage) => void;
-    error?: (error: Error) => void;
-    disconnect?: () => void;
+const SYNC_INTERVAL_MS = 2000;
+const MAX_CACHE_SIZE = 10000;
+const CACHE_TTL_MS = 3600000; // 1 hour
+const CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+const CONSISTENCY_CHECK_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
+const MAX_CONNECTION_ATTEMPTS = 5;
+const INITIAL_RETRY_DELAY_MS = 5000;
+const MAX_RETRY_DELAY_MS = 30000;
+const BULK_WRITE_BATCH_SIZE = 500;
+
+// ============================================================================
+// MongoDB Client Setup
+// ============================================================================
+
+let client: MongoClient;
+let db: Db;
+let giveawaysCol: Collection<StoredGiveaway>;
+let countersCol: Collection<TotalCounter>;
+let watchlistCol: Collection<UserWatchlist>;
+let licenseKeysCol: Collection<LicenseKey>;
+let premiumUsersCol: Collection<PremiumUser>;
+let boosterPremiumCol: Collection<BoosterPremium>;
+let autoJoinEntriesCol: Collection<AutoJoinEntry>;
+
+let connected = false;
+let connectingPromise: Promise<void> | null = null;
+let connectionAttempts = 0;
+let isShuttingDown = false;
+
+// ============================================================================
+// Cache Management
+// ============================================================================
+
+const cache = new Map<string, CacheEntry>();
+let totalDetectedCount = 0;
+let cacheHits = 0;
+let cacheMisses = 0;
+
+let syncTimeout: NodeJS.Timeout | null = null;
+let dirtyTotal = false;
+const dirtyKeys = new Set<string>();
+const pendingDeletes = new Set<string>();
+let isSyncing = false;
+
+// Indexes for faster lookups
+const activeGiveawaysCache = new Map<string, StoredGiveaway>();
+const guildGiveawaysCache = new Map<string, Set<string>>();
+
+function cacheKey(messageId: string, channelId: string): string {
+  return `${channelId}:${messageId}`;
+}
+
+function getCacheStats(): { size: number; hits: number; misses: number; hitRate: number } {
+  const total = cacheHits + cacheMisses;
+  return {
+    size: cache.size,
+    hits: cacheHits,
+    misses: cacheMisses,
+    hitRate: total > 0 ? cacheHits / total : 0,
   };
-  sessionId: string;
-  destroyed: boolean;
-  lastHealthCheck: number;
-  stallCount: number;
 }
 
-interface SessionStats {
-  detected: number;
-  entered: number;
-  failed: number;
-  wins: number;
-  falsePositives: number;
-  lastEntryAt?: number;
-  queueWaitTimes: number[];
-}
+// ============================================================================
+// Cache Cleanup & Maintenance
+// ============================================================================
 
-interface DetectionProfile {
-  botId: string;
-  botName: string;
-  detectionCount: number;
-  truePositives: number;
-  falsePositives: number;
-  averageConfidence: number;
-  lastSeen: number;
-  patterns: {
-    buttonPatterns: string[];
-    embedPatterns: string[];
-    contentPatterns: string[];
-  };
-}
-
-interface DetectionResult {
-  isGiveaway: boolean;
-  confidence: number;
-  reasons: string[];
-  button?: GiveawayButton;
-  prize?: string;
-  profile?: DetectionProfile;
-}
-
-interface QueueItem {
-  entryId: string;
-  userId: string;
-  guildId: string;
-  channelId: string;
-  messageId: string;
-  priority: number;
-  addedAt: number;
-  endsAt?: number;
-  correlationId: string;
-  attempts: number;
-  maxAttempts: number;
-  lastError?: string;
-}
-
-interface WatchlistKeyword {
-  keyword: string;
-  aliases: string[];
-  matchCount: number;
-  lastMatched: number;
-  compiled: RegExp;
-}
-
-interface GuildStats {
-  guildId: string;
-  guildName: string;
-  detected: number;
-  entered: number;
-  failed: number;
-  wins: number;
-  falsePositives: number;
-  averageConfidence: number;
-  averageQueueWaitMs: number;
-}
-
-interface AccountStats {
-  userId: string;
-  detected: number;
-  entered: number;
-  failed: number;
-  wins: number;
-  falsePositives: number;
-  averageConfidence: number;
-  averageDetectionMs: number;
-  averageQueueWaitMs: number;
-  reconnectCount: number;
-}
-
-// ---------------------------------------------------------------------------
-// Constants - Based on working autoJoin.ts
-// ---------------------------------------------------------------------------
-
-/**
- * Known giveaway bot Snowflake IDs.
- * Used for ENTRY detection only (bypasses the keyword requirement when
- * scanning for a clickable button). Win detection deliberately does NOT
- * require the author to be in this list.
- */
-const KNOWN_GIVEAWAY_BOT_IDS: ReadonlySet<string> = new Set([
-  '294882584201003009', // GiveawayBot
-  '739448630517039104', // GiveawayBoat
-  '515195524879237130',
-  '235148962103951360',
-  '282859044593598464',
-  '270904126974590976',
-  '508391840525975553',
-  '530082442967646230',
-]);
-
-/**
- * customIds that are always giveaway entry buttons regardless of their label.
- * GiveawayBoat uses customId "giveaway_message" with a bare participant
- * count as the label (e.g. "815", "1,292") — no text like "Enter" appears.
- */
-const TRUSTED_ENTRY_CUSTOM_IDS: ReadonlySet<string> = new Set([
-  'giveaway_message',   // GiveawayBoat — participant count button
-  'giveaway-enter',
-  'enter_giveaway',
-  'giveaway_enter',
-  'join_giveaway',
-  'giveaway-join',
-  'giveaway_participate',
-  'participate_giveaway',
-  'enter',
-  'participants',
-]);
-
-/**
- * Regex patterns for button labels that must NEVER be clicked.
- * GiveawayBoat sends "Leave Giveaway" on its confirmation ephemeral.
- */
-const BLOCKED_BUTTON_LABELS: ReadonlyArray<RegExp> = [
-  /\bleave\b/i,
-  /\bquit\b/i,
-  /\bexit\b/i,
-  /\bunenter\b/i,
-  /\bwithdraw\b/i,
-  /remove\s+entry/i,
-  /cancel\s+entry/i,
-  /cancel\s+giveaway/i,
-  /end\s+giveaway/i,
-];
-
-/**
- * Button labels that identify a giveaway ENTRY button.
- * A button whose label matches ANY of these (and is not blocked) is clickable.
- * Also accepts bare numbers — GiveawayBoat shows the participant count as
- * the button label (e.g. "815", "1,292").
- */
-const ENTRY_BUTTON_PATTERNS: ReadonlyArray<RegExp> = [
-  /\benter\b/i,
-  /\bjoin\b/i,
-  /\bparticipate\b/i,
-  /\braffle\b/i,
-  /\bsweepstakes\b/i,
-  /\bsubmit\b/i,
-  /count\s+me\s+in/i,
-  /\bgiveaway\b/i,
-  /🎉/,
-  /🎁/,
-  /🏆/,
-  /^\d[\d,]*$/,   // bare participant count — GiveawayBoat style (e.g. "815", "1,292")
-];
-
-/**
- * If ANY of these patterns match the message's plain-text content the entire
- * message is rejected for ENTRY — even from known bots.
- */
-const BLOCKED_MESSAGE_CONTENT: ReadonlyArray<RegExp> = [
-  /already\s+entered\s+this\s+giveaway/i,
-  /you(?:'ve|\s+have)\s+already\s+entered/i,
-  /you\s+are\s+already\s+(?:in|entered|participating)/i,
-  /you(?:'ve|\s+have)\s+already\s+(?:joined|joined\s+this)/i,
-  /leave\s+giveaway/i,
-];
-
-/**
- * Win notification patterns.
- * Checked against the FULL combined text of a message.
- */
-const WIN_PATTERNS: ReadonlyArray<RegExp> = [
-  /congratulations?[^.!?\n]{0,60}(?:you|won)/i,
-  /you(?:'ve|\s+have)\s+won/i,
-  /you\s+won\s/i,
-  /you\s+are\s+(?:a\s+)?(?:the\s+)?winner/i,
-  /\bwinner[s]?\b/i,
-  /has\s+won\s+(?:the\s+)?giveaway/i,
-  /won\s+the\s+giveaway/i,
-  /won\s+(?:a\s+)?(?:the\s+)?(?:prize|raffle|giveaway)/i,
-  /🎉\s*congrat/i,
-  /🏆\s*(?:congrat|winner|you)/i,
-];
-
-// Detection stages
-const DETECTION_STAGES = {
-  CHEAP_CACHE_CHECK: 0,
-  CHEAP_KEYWORD_SCAN: 1,
-  CHEAP_BOT_ID_MATCH: 2,
-  EXPENSIVE_BUTTON_ANALYSIS: 3,
-  EXPENSIVE_EMBED_PARSING: 4,
-  EXPENSIVE_PROFILE_MATCH: 5,
-} as const;
-
-// Confidence thresholds - INCREASED to reduce false positives
-const CONFIDENCE_HIGH = 0.9;
-const CONFIDENCE_MEDIUM = 0.75;
-const CONFIDENCE_LOW = 0.6;  // Was 0.3 - much higher threshold
-
-// Queue limits
-const MAX_QUEUE_SIZE = 1000;
-const MAX_QUEUE_PER_GUILD = 50;
-const DEAD_LETTER_RETENTION_MS = 24 * 60 * 60 * 1000;
-const QUEUE_PERSIST_INTERVAL_MS = 60000;
-
-const ENTRY_TTL_MS = 2 * 60 * 60 * 1000;
-const WIN_DEDUP_TTL_MS = 30 * 60 * 1000;
-const COMPONENT_RETRY_DELAY_MS = 300;
-const COMPONENT_RETRY_ATTEMPTS = 3;
-const SESSION_REFRESH_INTERVAL_MS = 300_000;
-const HEARTBEAT_INTERVAL_MS = 120_000;
-const HEALTH_CHECK_INTERVAL_MS = 30000;
-const STALL_TIMEOUT_MS = 60000;
-const MAX_SESSIONS_PER_WORKER = 25;
-const PROCESSING_CACHE_TTL_MS = 60000;
-const MAX_RECONNECT_ATTEMPTS = 3;
-const RECONNECT_DELAY_MS = 60000;
-const INTERACTION_RETRY_ATTEMPTS = 3;
-const INTERACTION_RETRY_DELAY_MS = 2000;
-const NO_RESPONSE_COOLDOWN_MS = 5000;
-const BATCH_DB_WRITE_INTERVAL_MS = 5000;
-const ARCHIVE_AGE_MS = 7 * 24 * 60 * 60 * 1000;
-
-// Cache sizes
-const CACHE_PROCESSED_MESSAGES = 5000;
-const CACHE_MAX_PROCESSING = 1000;
-const CACHE_MAX_WINS = 200;
-const CACHE_MAX_COOLDOWN = 100;
-const CACHE_MAX_TOKEN = 50;
-const CACHE_DETECTION_PROFILES = 100;
-const CACHE_WATCHLISTS = 50;
-const CACHE_CROSSPOST = 1000;
-
-// Memory thresholds
-const MEMORY_WARNING_THRESHOLD_MB = 3000;
-const MEMORY_CRITICAL_THRESHOLD_MB = 4500;
-const MEMORY_MAX_THRESHOLD_MB = 5500;
-
-// Queue limits
-const MAX_LOG_QUEUE_SIZE = 1000;
-const MAX_SESSION_START_PROMISES = 50;
-
-// HTTP pool
-const HTTP_MAX_SOCKETS = 30;
-const HTTP_MAX_FREE_SOCKETS = 15;
-
-// Circuit breaker
-const CIRCUIT_BREAKER_THRESHOLD = 10;
-const CIRCUIT_BREAKER_TIMEOUT_MS = 30000;
-const CIRCUIT_BREAKER_HALF_OPEN_ATTEMPTS = 3;
-
-// Metrics
-const METRICS_SAMPLE_SIZE = 100;
-
-// Session login timeouts
-const LOGIN_TIMEOUT_MS = 15000;
-const READY_TIMEOUT_MS = 10000;
-
-// ---------------------------------------------------------------------------
-// LRU Cache Implementation
-// ---------------------------------------------------------------------------
-
-class LRUCache<K, V> {
-  private cache: Map<K, { value: V; timestamp: number }>;
-  private readonly maxSize: number;
-  private readonly ttl: number;
-
-  constructor(maxSize: number, ttlMs: number = 0) {
-    this.cache = new Map();
-    this.maxSize = Math.max(1, maxSize);
-    this.ttl = ttlMs;
-  }
-
-  get(key: K): V | undefined {
-    const entry = this.cache.get(key);
-    if (!entry) return undefined;
-    if (this.ttl > 0 && Date.now() - entry.timestamp > this.ttl) {
-      this.cache.delete(key);
-      return undefined;
-    }
-    this.cache.delete(key);
-    this.cache.set(key, entry);
-    return entry.value;
-  }
-
-  set(key: K, value: V): void {
-    if (this.cache.has(key)) {
-      this.cache.delete(key);
-    } else if (this.cache.size >= this.maxSize) {
-      const toDelete = Math.ceil(this.maxSize * 0.2);
-      let count = 0;
-      for (const k of this.cache.keys()) {
-        if (count >= toDelete) break;
-        this.cache.delete(k);
-        count++;
+function cleanCache(): void {
+  const now = Date.now();
+  let removed = 0;
+  let expiredRemoved = 0;
+  
+  // First pass: remove expired entries
+  for (const [key, entry] of cache) {
+    if (now - entry.timestamp > CACHE_TTL_MS) {
+      cache.delete(key);
+      dirtyKeys.delete(key);
+      activeGiveawaysCache.delete(key);
+      // Remove from guild cache
+      const guildId = entry.doc.guildId;
+      const guildSet = guildGiveawaysCache.get(guildId);
+      if (guildSet) {
+        guildSet.delete(key);
+        if (guildSet.size === 0) {
+          guildGiveawaysCache.delete(guildId);
+        }
       }
+      removed++;
+      expiredRemoved++;
     }
-    this.cache.set(key, { value, timestamp: Date.now() });
   }
-
-  delete(key: K): boolean {
-    return this.cache.delete(key);
-  }
-
-  clear(): void {
-    this.cache.clear();
-  }
-
-  get size(): number {
-    return this.cache.size;
-  }
-
-  has(key: K): boolean {
-    return this.cache.has(key);
-  }
-
-  clean(): number {
-    if (this.ttl === 0) return 0;
-    const now = Date.now();
-    let removed = 0;
-    for (const [key, entry] of this.cache) {
-      if (now - entry.timestamp > this.ttl) {
-        this.cache.delete(key);
+  
+  // Second pass: if still over limit, remove oldest (LRU)
+  if (cache.size > MAX_CACHE_SIZE) {
+    const entries = Array.from(cache.entries());
+    entries.sort((a, b) => a[1].timestamp - b[1].timestamp);
+    const toRemove = cache.size - Math.floor(MAX_CACHE_SIZE * 0.8);
+    
+    for (let i = 0; i < toRemove && i < entries.length; i++) {
+      const [key, entry] = entries[i];
+      if (key && entry) {
+        cache.delete(key);
+        dirtyKeys.delete(key);
+        activeGiveawaysCache.delete(key);
+        const guildId = entry.doc.guildId;
+        const guildSet = guildGiveawaysCache.get(guildId);
+        if (guildSet) {
+          guildSet.delete(key);
+          if (guildSet.size === 0) {
+            guildGiveawaysCache.delete(guildId);
+          }
+        }
         removed++;
       }
     }
-    return removed;
   }
-}
-
-// ---------------------------------------------------------------------------
-// Async Logger Queue
-// ---------------------------------------------------------------------------
-
-class AsyncLogger {
-  private queue: Array<{ level: string; msg: string; meta?: Record<string, unknown> }> = [];
-  private processing = false;
-  private interval: NodeJS.Timeout | null = null;
-  private droppedCount = 0;
-  private totalLogged = 0;
-
-  constructor() {
-    this.interval = setInterval(() => this.flush(), 1000);
-    if (this.interval.unref) this.interval.unref();
-  }
-
-  info(msg: string, meta?: Record<string, unknown>): void {
-    this.enqueue('info', msg, meta);
-  }
-
-  warn(msg: string, meta?: Record<string, unknown>): void {
-    this.enqueue('warn', msg, meta);
-  }
-
-  error(msg: string, meta?: Record<string, unknown>): void {
-    this.enqueue('error', msg, meta);
-  }
-
-  debug(msg: string, meta?: Record<string, unknown>): void {
-    this.enqueue('debug', msg, meta);
-  }
-
-  private enqueue(level: string, msg: string, meta?: Record<string, unknown>): void {
-    if (this.queue.length >= MAX_LOG_QUEUE_SIZE) {
-      this.droppedCount++;
-      this.queue.shift();
-    }
-    this.queue.push({ level, msg, meta });
-    this.totalLogged++;
-    if (this.queue.length > 50) this.flush();
-  }
-
-  private async flush(): Promise<void> {
-    if (this.processing || this.queue.length === 0) return;
-    this.processing = true;
-
-    const batch = this.queue.splice(0, 25);
-    for (const item of batch) {
-      try {
-        switch (item.level) {
-          case 'info': logger.info(item.msg, item.meta); break;
-          case 'warn': logger.warn(item.msg, item.meta); break;
-          case 'error': logger.error(item.msg, item.meta); break;
-          case 'debug': logger.debug(item.msg, item.meta); break;
-        }
-      } catch {
-        // Silently fail
-      }
-    }
-
-    this.processing = false;
-    if (this.queue.length > 0) this.flush();
-  }
-
-  shutdown(): void {
-    if (this.interval) {
-      clearInterval(this.interval);
-      this.interval = null;
-    }
-    this.flush();
-  }
-
-  getStats(): { queueSize: number; droppedCount: number; totalLogged: number } {
-    return { queueSize: this.queue.length, droppedCount: this.droppedCount, totalLogged: this.totalLogged };
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Circuit Breaker
-// ---------------------------------------------------------------------------
-
-class CircuitBreaker {
-  private failures = 0;
-  private state: 'closed' | 'open' | 'half-open' = 'closed';
-  private openUntil = 0;
-  private halfOpenAttempts = 0;
-  private lastFailureTime = 0;
-  private totalFailures = 0;
-  private totalSuccesses = 0;
-
-  constructor(
-    private readonly threshold = CIRCUIT_BREAKER_THRESHOLD,
-    private readonly timeoutMs = CIRCUIT_BREAKER_TIMEOUT_MS,
-    private readonly halfOpenMaxAttempts = CIRCUIT_BREAKER_HALF_OPEN_ATTEMPTS,
-  ) {}
-
-  async execute<T>(fn: () => Promise<T>): Promise<T> {
-    if (this.failures > 0 && Date.now() - this.lastFailureTime > 60000) {
-      this.failures = Math.max(0, this.failures - 1);
-    }
-
-    if (this.state === 'open') {
-      if (Date.now() > this.openUntil) {
-        this.state = 'half-open';
-        this.halfOpenAttempts = 0;
-        this.failures = 0;
-      } else {
-        throw new Error(`Circuit breaker open (cooldown: ${Math.ceil((this.openUntil - Date.now()) / 1000)}s)`);
-      }
-    }
-
-    try {
-      const result = await fn();
-      this.totalSuccesses++;
-      if (this.state === 'half-open') {
-        this.halfOpenAttempts++;
-        if (this.halfOpenAttempts >= this.halfOpenMaxAttempts) {
-          this.state = 'closed';
-          this.failures = 0;
-        }
-      } else {
-        this.failures = Math.max(0, this.failures - 1);
-      }
-      return result;
-    } catch (error) {
-      this.failures++;
-      this.totalFailures++;
-      this.lastFailureTime = Date.now();
-      if (this.failures >= this.threshold) {
-        this.state = 'open';
-        this.openUntil = Date.now() + this.timeoutMs;
-        this.failures = 0;
-      }
-      throw error;
-    }
-  }
-
-  isOpen(): boolean {
-    return this.state === 'open' || (this.state === 'half-open' && this.halfOpenAttempts >= this.halfOpenMaxAttempts);
-  }
-
-  reset(): void {
-    this.failures = 0;
-    this.state = 'closed';
-    this.openUntil = 0;
-    this.halfOpenAttempts = 0;
-    this.lastFailureTime = 0;
-  }
-
-  getState(): string {
-    return this.state;
-  }
-
-  getStats(): { failures: number; totalFailures: number; totalSuccesses: number; state: string } {
-    return {
-      failures: this.failures,
-      totalFailures: this.totalFailures,
-      totalSuccesses: this.totalSuccesses,
-      state: this.state,
-    };
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Token Manager
-// ---------------------------------------------------------------------------
-
-class TokenManager {
-  private decryptedCache = new LRUCache<string, { token: string; timestamp: number }>(CACHE_MAX_TOKEN, 30000);
-
-  async getDecryptedToken(userId: string, guildId: string, encryptedToken: string): Promise<string> {
-    const cacheKey = `${userId}:${guildId}`;
-    const cached = this.decryptedCache.get(cacheKey);
-    if (cached) return cached.token;
-
-    const decrypted = decryptToken(encryptedToken);
-    this.decryptedCache.set(cacheKey, { token: decrypted, timestamp: Date.now() });
-    return decrypted;
-  }
-
-  clearCache(userId: string, guildId: string): void {
-    this.decryptedCache.delete(`${userId}:${guildId}`);
-  }
-
-  clearAll(): void {
-    this.decryptedCache.clear();
-  }
-
-  getCacheStats(): { size: number; maxSize: number } {
-    return { size: this.decryptedCache.size, maxSize: CACHE_MAX_TOKEN };
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Token Bucket
-// ---------------------------------------------------------------------------
-
-class TokenBucket {
-  private tokens: number;
-  private lastRefill: number;
-  private totalConsumed = 0;
-  private totalWaits = 0;
-
-  constructor(
-    private readonly maxTokens: number,
-    private readonly refillIntervalMs: number,
-  ) {
-    this.tokens = maxTokens;
-    this.lastRefill = Date.now();
-  }
-
-  async consume(): Promise<void> {
-    this.refill();
-    if (this.tokens <= 0) {
-      this.totalWaits++;
-      const waitMs = this.refillIntervalMs - (Date.now() - this.lastRefill);
-      await delay(Math.max(waitMs, 50));
-      this.refill();
-    }
-    this.tokens = Math.max(0, this.tokens - 1);
-    this.totalConsumed++;
-  }
-
-  private refill(): void {
-    const now = Date.now();
-    const elapsed = now - this.lastRefill;
-    const batches = Math.floor(elapsed / this.refillIntervalMs);
-    if (batches > 0) {
-      this.tokens = Math.min(this.maxTokens, this.tokens + batches * this.maxTokens);
-      this.lastRefill = now;
-    }
-  }
-
-  getStats(): { tokens: number; maxTokens: number; totalConsumed: number; totalWaits: number } {
-    return {
-      tokens: this.tokens,
-      maxTokens: this.maxTokens,
-      totalConsumed: this.totalConsumed,
-      totalWaits: this.totalWaits,
-    };
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Metrics Collector
-// ---------------------------------------------------------------------------
-
-class MetricsCollector {
-  private detectionTimes: number[] = [];
-  private entryTimes: number[] = [];
-  private apiLatencies: number[] = [];
   
-  public totalMessagesProcessed = 0;
-  public totalGiveawaysDetected = 0;
-  public totalEntriesAttempted = 0;
-  public totalEntriesSucceeded = 0;
-  public totalEntriesFailed = 0;
-  public totalWinsDetected = 0;
-  public apiCalls = 0;
-  public apiErrors = 0;
-  public cacheHits = 0;
-  public cacheMisses = 0;
-  public dbQueries = 0;
-  public startTime = Date.now();
-  public lastStatsReset = Date.now();
-
-  recordDetectionTime(ms: number): void {
-    this.detectionTimes.push(ms);
-    if (this.detectionTimes.length > METRICS_SAMPLE_SIZE) {
-      this.detectionTimes.shift();
-    }
-  }
-
-  recordEntryTime(ms: number): void {
-    this.entryTimes.push(ms);
-    if (this.entryTimes.length > METRICS_SAMPLE_SIZE) {
-      this.entryTimes.shift();
-    }
-  }
-
-  recordApiLatency(ms: number): void {
-    this.apiLatencies.push(ms);
-    if (this.apiLatencies.length > METRICS_SAMPLE_SIZE) {
-      this.apiLatencies.shift();
-    }
-  }
-
-  getAverageDetectionTime(): number {
-    if (this.detectionTimes.length === 0) return 0;
-    return Math.round(this.detectionTimes.reduce((a, b) => a + b, 0) / this.detectionTimes.length);
-  }
-
-  getAverageEntryTime(): number {
-    if (this.entryTimes.length === 0) return 0;
-    return Math.round(this.entryTimes.reduce((a, b) => a + b, 0) / this.entryTimes.length);
-  }
-
-  getAverageApiLatency(): number {
-    if (this.apiLatencies.length === 0) return 0;
-    return Math.round(this.apiLatencies.reduce((a, b) => a + b, 0) / this.apiLatencies.length);
-  }
-
-  getMetrics() {
-    const mem = process.memoryUsage();
-    return {
-      totalMessagesProcessed: this.totalMessagesProcessed,
-      totalGiveawaysDetected: this.totalGiveawaysDetected,
-      totalEntriesAttempted: this.totalEntriesAttempted,
-      totalEntriesSucceeded: this.totalEntriesSucceeded,
-      totalEntriesFailed: this.totalEntriesFailed,
-      totalWinsDetected: this.totalWinsDetected,
-      averageDetectionTime: this.getAverageDetectionTime(),
-      averageEntryTime: this.getAverageEntryTime(),
-      apiCalls: this.apiCalls,
-      apiErrors: this.apiErrors,
-      cacheHits: this.cacheHits,
-      cacheMisses: this.cacheMisses,
-      dbQueries: this.dbQueries,
-      memoryUsage: {
-        heapUsed: Math.round(mem.heapUsed / 1024 / 1024),
-        heapTotal: Math.round(mem.heapTotal / 1024 / 1024),
-        rss: Math.round(mem.rss / 1024 / 1024),
-      },
-      startTime: this.startTime,
-      lastStatsReset: this.lastStatsReset,
-    };
-  }
-
-  reset(): void {
-    this.detectionTimes = [];
-    this.entryTimes = [];
-    this.apiLatencies = [];
-    this.totalMessagesProcessed = 0;
-    this.totalGiveawaysDetected = 0;
-    this.totalEntriesAttempted = 0;
-    this.totalEntriesSucceeded = 0;
-    this.totalEntriesFailed = 0;
-    this.totalWinsDetected = 0;
-    this.apiCalls = 0;
-    this.apiErrors = 0;
-    this.cacheHits = 0;
-    this.cacheMisses = 0;
-    this.dbQueries = 0;
-    this.lastStatsReset = Date.now();
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Structured Tracing - Correlation Tracker
-// ---------------------------------------------------------------------------
-
-class CorrelationTracker {
-  private activeTraces: Map<string, {
-    correlationId: string;
-    startTime: number;
-    stages: Map<string, { startTime: number; endTime?: number; metadata?: any }>;
-    userId: string;
-    messageId: string;
-    status: 'active' | 'completed' | 'failed';
-  }> = new Map();
-
-  createTrace(userId: string, messageId: string): string {
-    const correlationId = uuidv4();
-    this.activeTraces.set(correlationId, {
-      correlationId,
-      startTime: Date.now(),
-      stages: new Map(),
-      userId,
-      messageId,
-      status: 'active',
-    });
-
-    if (this.activeTraces.size > 1000) {
-      const toDelete = Array.from(this.activeTraces.keys()).slice(0, 100);
-      toDelete.forEach(id => this.activeTraces.delete(id));
-    }
-
-    return correlationId;
-  }
-
-  startStage(correlationId: string, stage: string, metadata?: any): void {
-    const trace = this.activeTraces.get(correlationId);
-    if (trace) {
-      trace.stages.set(stage, { startTime: Date.now(), metadata });
-    }
-  }
-
-  endStage(correlationId: string, stage: string, metadata?: any): void {
-    const trace = this.activeTraces.get(correlationId);
-    if (trace) {
-      const stageData = trace.stages.get(stage);
-      if (stageData) {
-        stageData.endTime = Date.now();
-        if (metadata) stageData.metadata = { ...stageData.metadata, ...metadata };
-      }
-    }
-  }
-
-  completeTrace(correlationId: string, status: 'completed' | 'failed' = 'completed'): any {
-    const trace = this.activeTraces.get(correlationId);
-    if (!trace) return null;
-
-    trace.status = status;
-    const duration = Date.now() - trace.startTime;
-    
-    const stageDetails: any = {};
-    trace.stages.forEach((stage, name) => {
-      stageDetails[name] = {
-        duration: stage.endTime ? stage.endTime - stage.startTime : Date.now() - stage.startTime,
-        metadata: stage.metadata,
-      };
-    });
-
-    const summary = {
-      correlationId: trace.correlationId,
-      userId: trace.userId,
-      messageId: trace.messageId,
-      totalDuration: duration,
-      status,
-      stages: stageDetails,
-    };
-
-    setTimeout(() => this.activeTraces.delete(correlationId), 5000);
-    
-    return summary;
-  }
-
-  getTrace(correlationId: string): any {
-    return this.activeTraces.get(correlationId);
-  }
-
-  getActiveTraceCount(): number {
-    return this.activeTraces.size;
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Join Queue System
-// ---------------------------------------------------------------------------
-
-class JoinQueue {
-  private queues: Map<string, QueueItem[]> = new Map();
-  private deadLetterQueue: QueueItem[] = [];
-  private totalProcessed = 0;
-  private totalWaitTimes: number[] = [];
-
-  enqueue(item: QueueItem): boolean {
-    if (this.getTotalSize() >= MAX_QUEUE_SIZE) return false;
-
-    const guildQueue = this.getGuildQueue(item.guildId);
-    if (guildQueue.length >= MAX_QUEUE_PER_GUILD) return false;
-
-    guildQueue.push(item);
-    guildQueue.sort((a, b) => a.priority - b.priority);
-    return true;
-  }
-
-  dequeue(guildId?: string): QueueItem | undefined {
-    if (guildId) {
-      const guildQueue = this.queues.get(guildId);
-      if (guildQueue?.length) {
-        this.totalProcessed++;
-        const startWait = Date.now();
-        const item = guildQueue.shift()!;
-        this.totalWaitTimes.push(startWait - item.addedAt);
-        return item;
-      }
-      return undefined;
-    }
-
-    let highestPriority: QueueItem | undefined;
-    let highestPriorityGuild: string | undefined;
-
-    for (const [guildId, guildQueue] of this.queues) {
-      if (guildQueue.length && (!highestPriority || guildQueue[0].priority < highestPriority.priority)) {
-        highestPriority = guildQueue[0];
-        highestPriorityGuild = guildId;
-      }
-    }
-
-    if (highestPriority && highestPriorityGuild) {
-      this.queues.get(highestPriorityGuild)?.shift();
-      this.totalProcessed++;
-      const startWait = Date.now();
-      this.totalWaitTimes.push(startWait - highestPriority.addedAt);
-    }
-
-    return highestPriority;
-  }
-
-  removeGuildEntries(guildId: string): number {
-    const count = this.queues.get(guildId)?.length || 0;
-    this.queues.delete(guildId);
-    return count;
-  }
-
-  cancelGiveaway(messageId: string, channelId: string): boolean {
-    for (const [guildId, guildQueue] of this.queues) {
-      const index = guildQueue.findIndex(
-        item => item.messageId === messageId && item.channelId === channelId
-      );
-      if (index !== -1) {
-        guildQueue.splice(index, 1);
-        return true;
-      }
-    }
-    return false;
-  }
-
-  moveToDeadLetter(item: QueueItem, error: string): void {
-    item.lastError = error;
-    item.addedAt = Date.now();
-    this.deadLetterQueue.push(item);
-    
-    const cutoff = Date.now() - DEAD_LETTER_RETENTION_MS;
-    this.deadLetterQueue = this.deadLetterQueue.filter(dl => dl.addedAt > cutoff);
-  }
-
-  retryDeadLetter(correlationId: string): QueueItem | undefined {
-    const index = this.deadLetterQueue.findIndex(item => item.correlationId === correlationId);
-    if (index !== -1) {
-      const item = this.deadLetterQueue.splice(index, 1)[0];
-      if (this.enqueue(item)) return item;
-      this.deadLetterQueue.push(item);
-    }
-    return undefined;
-  }
-
-  getGuildQueue(guildId: string): QueueItem[] {
-    if (!this.queues.has(guildId)) {
-      this.queues.set(guildId, []);
-    }
-    return this.queues.get(guildId)!;
-  }
-
-  getTotalSize(): number {
-    let total = 0;
-    for (const queue of this.queues.values()) {
-      total += queue.length;
-    }
-    return total;
-  }
-
-  getAverageWaitTime(): number {
-    if (this.totalWaitTimes.length === 0) return 0;
-    return Math.round(
-      this.totalWaitTimes.reduce((a, b) => a + b, 0) / this.totalWaitTimes.length
-    );
-  }
-
-  getStats() {
-    return {
-      totalQueued: this.getTotalSize(),
-      totalProcessed: this.totalProcessed,
-      deadLetterCount: this.deadLetterQueue.length,
-      averageWaitMs: this.getAverageWaitTime(),
-      guildQueues: Array.from(this.queues.entries()).map(([guildId, queue]) => ({
-        guildId,
-        size: queue.length,
-      })),
-    };
-  }
-
-  async persist(): Promise<void> {
-    try {
-      const allItems: QueueItem[] = [];
-      for (const queue of this.queues.values()) {
-        allItems.push(...queue);
-      }
-      allItems.push(...this.deadLetterQueue);
-      await saveQueueState(allItems);
-    } catch (error) {
-      // Silently fail
-    }
-  }
-
-  async restore(): Promise<void> {
-    try {
-      const items = await loadQueueState();
-      for (const item of items) {
-        if (item.priority < 0) {
-          this.deadLetterQueue.push(item);
-        } else {
-          this.enqueue(item);
-        }
-      }
-    } catch (error) {
-      // Start fresh
-    }
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Watchlist System
-// ---------------------------------------------------------------------------
-
-class WatchlistManager {
-  private keywords: Map<string, WatchlistKeyword> = new Map();
-  private compiledCache: Map<string, RegExp[]> = new Map();
-
-  async loadKeywords(userId: string): Promise<void> {
-    try {
-      const keywords = await getWatchlistKeywords(userId);
-      for (const kw of keywords) {
-        this.addKeyword(kw.keyword, kw.aliases || []);
-      }
-    } catch (error) {
-      this.addKeyword('giveaway', ['raffle', 'sweepstakes']);
-      this.addKeyword('nitro', ['discord nitro', 'nitro classic']);
-    }
-  }
-
-  addKeyword(keyword: string, aliases: string[] = []): void {
-    const allTerms = [keyword, ...aliases];
-    const compiled = allTerms.map(term => 
-      new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i')
-    );
-
-    this.keywords.set(keyword.toLowerCase(), {
-      keyword,
-      aliases,
-      matchCount: 0,
-      lastMatched: 0,
-      compiled: compiled[0],
-    });
-
-    this.compiledCache.set(keyword.toLowerCase(), compiled);
-    this.compiledCache.clear();
-  }
-
-  getCompiledPatterns(): RegExp[] {
-    const cacheKey = 'all_patterns';
-    if (this.compiledCache.has(cacheKey)) {
-      return this.compiledCache.get(cacheKey)!;
-    }
-
-    const patterns: RegExp[] = [];
-    for (const kw of this.keywords.values()) {
-      patterns.push(kw.compiled);
-    }
-
-    this.compiledCache.set(cacheKey, patterns);
-    return patterns;
-  }
-
-  matchKeyword(text: string): { keyword: string; matched: boolean }[] {
-    const results: { keyword: string; matched: boolean }[] = [];
-    
-    for (const [key, kw] of this.keywords) {
-      if (kw.compiled.test(text)) {
-        kw.matchCount++;
-        kw.lastMatched = Date.now();
-        results.push({ keyword: kw.keyword, matched: true });
-      }
-    }
-
-    return results;
-  }
-
-  getTopKeywords(limit: number = 10): WatchlistKeyword[] {
-    return Array.from(this.keywords.values())
-      .sort((a, b) => b.matchCount - a.matchCount)
-      .slice(0, limit);
-  }
-
-  getStats() {
-    return {
-      totalKeywords: this.keywords.size,
-      topKeywords: this.getTopKeywords(5).map(kw => ({
-        keyword: kw.keyword,
-        matches: kw.matchCount,
-        lastMatched: kw.lastMatched ? new Date(kw.lastMatched).toISOString() : 'never',
-      })),
-    };
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Detection Engine - Based on working autoJoin.ts
-// ---------------------------------------------------------------------------
-
-class DetectionEngine {
-  private profiles: Map<string, DetectionProfile> = new Map();
-  private falsePositiveHistory: Map<string, number> = new Map();
-  private detectionAccuracy: Map<string, { tp: number; fp: number }> = new Map();
-
-  async loadProfiles(): Promise<void> {
-    try {
-      const profiles = await getDetectionProfiles();
-      for (const profile of profiles) {
-        this.profiles.set(profile.botId, profile);
-      }
-    } catch (error) {
-      for (const botId of KNOWN_GIVEAWAY_BOT_IDS) {
-        this.profiles.set(botId, {
-          botId,
-          botName: `Bot-${botId}`,
-          detectionCount: 0,
-          truePositives: 0,
-          falsePositives: 0,
-          averageConfidence: 0.9,
-          lastSeen: 0,
-          patterns: {
-            buttonPatterns: ['giveaway', 'enter', 'join'],
-            embedPatterns: ['giveaway', 'prize', 'winners'],
-            contentPatterns: ['giveaway', '🎉'],
-          },
-        });
-      }
-    }
-  }
-
-  async detect(message: Message, correlationId: string): Promise<DetectionResult> {
-    const reasons: string[] = [];
-    let totalConfidence = 0;
-    let stageCount = 0;
-
-    // Stage 1: Check blocked content first (from working autoJoin.ts)
-    const rawContent = message.content ?? '';
-    if (BLOCKED_MESSAGE_CONTENT.some(re => re.test(rawContent))) {
-      return { isGiveaway: false, confidence: 0, reasons: ['Blocked content'], button: undefined, prize: undefined };
-    }
-
-    // Stage 2: Check for known bot or keyword
-    const isKnownBot = this.cheapBotIdMatch(message);
-    const hasKeyword = this.messageHasKeyword(message);
-    const hasSignal = isKnownBot || hasKeyword;
-
-    if (!hasSignal) {
-      return { isGiveaway: false, confidence: 0, reasons: ['No signal'], button: undefined, prize: undefined };
-    }
-
-    // Stage 3: Try to extract entry button immediately
-    let button = this.extractEntryButton(message, isKnownBot);
-    if (button) {
-      totalConfidence += 0.8;
-      stageCount++;
-      reasons.push('Entry button found');
-    }
-
-    // Stage 4: Keyword scoring
-    if (hasKeyword) {
-      totalConfidence += 0.3;
-      stageCount++;
-      reasons.push('Keyword match');
-    }
-
-    // Stage 5: Bot ID match
-    if (isKnownBot) {
-      totalConfidence += 0.2;
-      stageCount++;
-      reasons.push(`Known bot: ${message.author?.username}`);
-    }
-
-    // Stage 6: Embed analysis
-    if (message.embeds?.length) {
-      const embedResult = this.expensiveEmbedParsing(message);
-      if (embedResult.score > 0) {
-        totalConfidence += embedResult.score;
-        stageCount++;
-        reasons.push(...embedResult.reasons);
-      }
-    }
-
-    // If no button found, try to fetch with retry (from working autoJoin.ts)
-    if (!button) {
-      for (let i = 0; i < COMPONENT_RETRY_ATTEMPTS; i++) {
-        await delay(COMPONENT_RETRY_DELAY_MS);
-        try {
-          const refreshed = await message.fetch();
-          button = this.extractEntryButton(refreshed, isKnownBot);
-          if (button) {
-            totalConfidence += 0.3;
-            stageCount++;
-            reasons.push('Entry button found after retry');
-            break;
-          }
-        } catch {
-          break;
-        }
-      }
-    }
-
-    // If still no button and no strong signal, reject
-    if (!button && !isKnownBot) {
-      return { 
-        isGiveaway: false, 
-        confidence: 0, 
-        reasons: ['No entry button found'], 
-        button: undefined, 
-        prize: undefined 
-      };
-    }
-
-    const finalConfidence = stageCount > 0 ? Math.min(totalConfidence / Math.max(stageCount, 1), 1.0) : 0;
-    
-    // Only detect if confidence is above threshold
-    if (finalConfidence < CONFIDENCE_LOW) {
-      return { 
-        isGiveaway: false, 
-        confidence: finalConfidence, 
-        reasons: [...reasons, `Confidence below threshold (${finalConfidence.toFixed(2)} < ${CONFIDENCE_LOW})`],
-        button: undefined, 
-        prize: undefined 
-      };
-    }
-
-    return {
-      isGiveaway: true,
-      confidence: finalConfidence,
-      reasons,
-      button,
-      prize: button ? this.extractPrize(message) : 'Unknown Prize',
-      profile: message.author?.id ? this.profiles.get(message.author.id) : undefined,
-    };
-  }
-
-  private cheapBotIdMatch(message: Message): boolean {
-    return !!(message.author?.bot && message.author.id && 
-              KNOWN_GIVEAWAY_BOT_IDS.has(message.author.id));
-  }
-
-  private messageHasKeyword(message: Message): boolean {
-    const texts = [
-      message.content ?? '',
-      ...message.embeds.flatMap(e => [
-        e.title ?? '',
-        e.description ?? '',
-        e.footer?.text ?? '',
-        ...(e.fields ?? []).flatMap(f => [f.name, f.value]),
-      ]),
-    ];
-    const giveawayWords = ['giveaway', 'raffle', 'sweepstakes', 'win', 'prize'];
-    return texts.some(t => giveawayWords.some(word => t.toLowerCase().includes(word)));
-  }
-
-  private extractEntryButton(message: Message, isKnownBot: boolean): GiveawayButton | undefined {
-    const msgAny = message as unknown as Record<string, unknown>;
-    const components = msgAny['components'] as unknown[] | undefined;
-    if (!components?.length) return undefined;
-
-    for (const row of components) {
-      const rowAny = row as Record<string, unknown>;
-      const rowComps = rowAny['components'] as unknown[] | undefined;
-      if (!rowComps) continue;
-
-      for (const comp of rowComps) {
-        const c = comp as Record<string, unknown>;
-        
-        const type = c['type'];
-        if (type !== 2 && type !== 'BUTTON') continue;
-        if (c['style'] === 5) continue; // link button
-        if (c['disabled'] === true) continue;
-
-        const customId = (c['customId'] ?? c['custom_id']) as string | undefined;
-        if (!customId) continue;
-
-        const label = ((c['label'] as string | undefined) ?? '').trim();
-
-        // Skip blocked buttons
-        if (BLOCKED_BUTTON_LABELS.some(re => re.test(label))) {
-          continue;
-        }
-
-        // Check trusted custom IDs first
-        if (TRUSTED_ENTRY_CUSTOM_IDS.has(customId)) {
-          return { customId, label: label || customId, disabled: false };
-        }
-
-        // Check label patterns
-        if (ENTRY_BUTTON_PATTERNS.some(re => re.test(label))) {
-          return { customId, label: label || 'Enter', disabled: false };
-        }
-      }
-    }
-
-    return undefined;
-  }
-
-  private expensiveEmbedParsing(message: Message): { score: number; reasons: string[] } {
-    const reasons: string[] = [];
-    let score = 0;
-
-    if (!message.embeds?.length) return { score: 0, reasons: [] };
-
-    const embed = message.embeds[0];
-    
-    if (embed.description) {
-      const timestampMatch = embed.description.match(/<t:(\d{10,13})(?::[a-zA-Z])?>/);
-      if (timestampMatch) {
-        score += 0.3;
-        reasons.push('Countdown timer found');
-      }
-    }
-
-    if (embed.title || embed.description) {
-      const text = (embed.title + ' ' + (embed.description || '')).toLowerCase();
-      if (/\b(prize|reward|win|nitro|steam|gift card)\b/i.test(text)) {
-        score += 0.2;
-        reasons.push('Prize mentioned');
-      }
-    }
-
-    if (embed.description && /\d+\s*(winner|winners)/i.test(embed.description)) {
-      score += 0.2;
-      reasons.push('Winner count specified');
-    }
-
-    return { score: Math.min(score, 0.5), reasons };
-  }
-
-  private extractPrize(message: Message): string {
-    const embed = message.embeds?.[0];
-    if (embed?.title) return truncate(embed.title, 200);
-    if (embed?.description) return truncate(embed.description, 200);
-    if (message.content) return truncate(message.content, 200);
-    return 'Unknown Prize';
-  }
-
-  recordResult(botId: string, isTruePositive: boolean, confidence: number): void {
-    const profile = this.profiles.get(botId);
-    if (profile) {
-      profile.detectionCount++;
-      if (isTruePositive) {
-        profile.truePositives++;
-      } else {
-        profile.falsePositives++;
-      }
-      profile.averageConfidence = 
-        (profile.averageConfidence * (profile.detectionCount - 1) + confidence) / 
-        profile.detectionCount;
-      profile.lastSeen = Date.now();
-    }
-
-    const accuracy = this.detectionAccuracy.get(botId) || { tp: 0, fp: 0 };
-    if (isTruePositive) {
-      accuracy.tp++;
-    } else {
-      accuracy.fp++;
-    }
-    this.detectionAccuracy.set(botId, accuracy);
-
-    if (profile && profile.detectionCount % 10 === 0) {
-      updateDetectionProfile(profile).catch(() => {});
-    }
-  }
-
-  recordFalsePositive(pattern: string): void {
-    const count = (this.falsePositiveHistory.get(pattern) || 0) + 1;
-    this.falsePositiveHistory.set(pattern, count);
-  }
-
-  getProfile(botId: string): DetectionProfile | undefined {
-    return this.profiles.get(botId);
-  }
-
-  getAccuracy(botId: string): number {
-    const accuracy = this.detectionAccuracy.get(botId);
-    if (!accuracy || (accuracy.tp + accuracy.fp) === 0) return 1.0;
-    return accuracy.tp / (accuracy.tp + accuracy.fp);
-  }
-
-  getStats() {
-    return {
-      profilesTracked: this.profiles.size,
-      falsePositivePatterns: this.falsePositiveHistory.size,
-      botAccuracies: Array.from(this.detectionAccuracy.entries()).map(([botId, acc]) => ({
-        botId,
-        accuracy: acc.tp / (acc.tp + acc.fp) || 1.0,
-        total: acc.tp + acc.fp,
-      })),
-    };
-  }
-}
-
-// ---------------------------------------------------------------------------
-// AutoJoinManager - Main Class
-// ---------------------------------------------------------------------------
-
-export class AutoJoinManager extends EventEmitter {
-  // Sessions - key includes guildId
-  private sessions: Map<string, UserSession> = new Map();
-  private sessionsByUserId: Map<string, UserSession> = new Map();
-  
-  // Caches
-  private processedMessages: LRUCache<string, number>;
-  private processingCache: LRUCache<string, number>;
-  private recentWins: LRUCache<string, number>;
-  private noResponseCooldown: LRUCache<string, number>;
-  private crosspostCache: LRUCache<string, string>;
-  private globalProcessedMessages: LRUCache<string, number>; // Cross-session dedup
-  
-  // Enhanced systems
-  private correlationTracker: CorrelationTracker;
-  private joinQueue: JoinQueue;
-  private detectionEngine: DetectionEngine;
-  private watchlistManager: WatchlistManager;
-  
-  // Managers
-  private tokenManager: TokenManager;
-  private asyncLogger: AsyncLogger;
-  private apiCircuitBreaker: CircuitBreaker;
-  private metrics: MetricsCollector;
-  
-  // Intervals
-  private refreshInterval: NodeJS.Timeout | null = null;
-  private cleanupInterval: NodeJS.Timeout | null = null;
-  private memoryCheckInterval: NodeJS.Timeout | null = null;
-  private reconnectCheckInterval: NodeJS.Timeout | null = null;
-  private cacheCleanInterval: NodeJS.Timeout | null = null;
-  private metricsInterval: NodeJS.Timeout | null = null;
-  private healthCheckInterval: NodeJS.Timeout | null = null;
-  private queuePersistInterval: NodeJS.Timeout | null = null;
-  private stallCheckInterval: NodeJS.Timeout | null = null;
-  private batchDbInterval: NodeJS.Timeout | null = null;
-  private archiveInterval: NodeJS.Timeout | null = null;
-  
-  // State
-  private isShuttingDown = false;
-  private sessionStartPromises: Map<string, Promise<boolean>> = new Map();
-  private workerId: string;
-  private memoryWarningLogged = false;
-  private healthStatus: 'healthy' | 'warning' | 'critical' = 'healthy';
-  private sessionIdCounter = 0;
-  private memoryCriticalLogged = false;
-  private lastMemoryCheck = 0;
-  private sessionStartErrors: Map<string, { count: number; lastError: string; lastAttempt: number }> = new Map();
-
-  // Batch write buffers
-  private joinOutcomeBuffer: any[] = [];
-  private detectionConfidenceBuffer: any[] = [];
-  
-  // Per-guild and per-account stats
-  private guildStats: Map<string, GuildStats> = new Map();
-  private accountStats: Map<string, AccountStats> = new Map();
-  private reconnectCount: Map<string, number> = new Map();
-
-  // HTTP client
-  private readonly http: AxiosInstance;
-
-  constructor(workerId: string = 'main') {
-    super();
-    this.workerId = workerId;
-    this.setMaxListeners(100);
-    
-    // Initialize caches
-    this.processedMessages = new LRUCache<string, number>(CACHE_PROCESSED_MESSAGES, 300000);
-    this.processingCache = new LRUCache<string, number>(CACHE_MAX_PROCESSING, PROCESSING_CACHE_TTL_MS);
-    this.recentWins = new LRUCache<string, number>(CACHE_MAX_WINS, WIN_DEDUP_TTL_MS);
-    this.noResponseCooldown = new LRUCache<string, number>(CACHE_MAX_COOLDOWN);
-    this.crosspostCache = new LRUCache<string, string>(CACHE_CROSSPOST, 3600000);
-    this.globalProcessedMessages = new LRUCache<string, number>(CACHE_PROCESSED_MESSAGES, 300000);
-    
-    // Initialize enhanced systems
-    this.correlationTracker = new CorrelationTracker();
-    this.joinQueue = new JoinQueue();
-    this.detectionEngine = new DetectionEngine();
-    this.watchlistManager = new WatchlistManager();
-    
-    // Initialize managers
-    this.tokenManager = new TokenManager();
-    this.asyncLogger = new AsyncLogger();
-    this.apiCircuitBreaker = new CircuitBreaker();
-    this.metrics = new MetricsCollector();
-
-    // HTTP client
-    this.http = axios.create({
-      timeout: 10_000,
-      httpAgent: new http.Agent({
-        keepAlive: true,
-        keepAliveMsecs: 1000,
-        maxSockets: HTTP_MAX_SOCKETS,
-        maxFreeSockets: HTTP_MAX_FREE_SOCKETS,
-        scheduling: 'lifo',
-      }),
-      httpsAgent: new https.Agent({
-        keepAlive: true,
-        keepAliveMsecs: 1000,
-        maxSockets: HTTP_MAX_SOCKETS,
-        maxFreeSockets: HTTP_MAX_FREE_SOCKETS,
-        scheduling: 'lifo',
-      }),
-    });
-
-    // Initialize systems
-    this.initialize().catch(error => {
-      this.asyncLogger.error('Failed to initialize AutoJoinManager', { error: formatError(error) });
-    });
-
-    // Start intervals
-    this.startSessionRefresher();
-    this.startCleanupInterval();
-    this.startMemoryCheck();
-    this.startReconnectChecker();
-    this.startCacheCleaner();
-    this.startMetricsInterval();
-    this.startHealthChecker();
-    this.startQueuePersister();
-    this.startStallChecker();
-    this.startBatchDbWriter();
-    this.startArchiveInterval();
-
-    this.asyncLogger.info('🚀 Enhanced AutoJoinManager initialized', {
-      worker: this.workerId,
-      features: {
-        multiStageDetection: true,
-        joinQueue: true,
-        structuredTracing: true,
-        watchlists: true,
-        batchDb: true,
-        healthChecks: true,
-      },
-      memory: this.getMemoryUsage(),
+  if (removed > 0) {
+    logger.debug(`Cache cleaned: removed ${removed} entries (${expiredRemoved} expired)`, { 
+      component: 'Database',
+      cacheSize: cache.size,
+      hitRate: getCacheStats().hitRate
     });
   }
+}
 
-  private async initialize(): Promise<void> {
-    await Promise.all([
-      this.detectionEngine.loadProfiles(),
-      this.joinQueue.restore(),
-    ]);
-  }
+// Schedule periodic cache cleanup
+const cleanupInterval = setInterval(cleanCache, CLEANUP_INTERVAL_MS);
 
-  // -------------------------------------------------------------------------
-  // Memory Management
-  // -------------------------------------------------------------------------
+// ============================================================================
+// Consistency Check
+// ============================================================================
 
-  private getMemoryUsage(): { heapUsedMB: number; heapTotalMB: number; rssMB: number } {
-    const mem = process.memoryUsage();
-    return {
-      heapUsedMB: Math.round(mem.heapUsed / 1024 / 1024),
-      heapTotalMB: Math.round(mem.heapTotal / 1024 / 1024),
-      rssMB: Math.round(mem.rss / 1024 / 1024),
-    };
-  }
-
-  private checkMemory(): boolean {
-    const now = Date.now();
-    if (now - this.lastMemoryCheck < 5000) return this.healthStatus !== 'critical';
-    this.lastMemoryCheck = now;
-
-    const mem = this.getMemoryUsage();
+async function checkConsistency(): Promise<void> {
+  if (!connected || isShuttingDown) return;
+  
+  try {
+    const dbCount = await giveawaysCol.countDocuments({});
+    const cacheCount = cache.size;
     
-    if (mem.heapUsedMB > MEMORY_MAX_THRESHOLD_MB) {
-      this.healthStatus = 'critical';
-    } else if (mem.heapUsedMB > MEMORY_CRITICAL_THRESHOLD_MB) {
-      this.healthStatus = 'warning';
-    } else {
-      this.healthStatus = 'healthy';
-    }
-    
-    if (mem.heapUsedMB > MEMORY_MAX_THRESHOLD_MB) {
-      if (!this.memoryCriticalLogged) {
-        this.asyncLogger.error('🚨 CRITICAL: Memory exceeded limit', {
-          worker: this.workerId,
-          ...mem,
-          threshold: MEMORY_MAX_THRESHOLD_MB,
-        });
-        this.memoryCriticalLogged = true;
-      }
-      this.forceCleanup();
-      this.emit('memoryCritical', { ...mem, worker: this.workerId });
-      return false;
-    }
-    
-    if (mem.heapUsedMB > MEMORY_CRITICAL_THRESHOLD_MB) {
-      if (!this.memoryWarningLogged) {
-        this.asyncLogger.warn('⚠️ Memory critical, aggressive cleanup', {
-          worker: this.workerId,
-          ...mem,
-        });
-        this.memoryWarningLogged = true;
-      }
-      this.aggressiveCleanup();
-      return true;
-    }
-    
-    if (mem.heapUsedMB > MEMORY_WARNING_THRESHOLD_MB) {
-      if (!this.memoryWarningLogged) {
-        this.asyncLogger.warn('⚠️ Memory warning threshold reached', {
-          worker: this.workerId,
-          ...mem,
-        });
-        this.memoryWarningLogged = true;
-      }
-      this.processedMessages.clean();
-      this.processingCache.clean();
-      this.recentWins.clean();
-      this.noResponseCooldown.clean();
-    } else {
-      this.memoryWarningLogged = false;
-      this.memoryCriticalLogged = false;
-    }
-    
-    return true;
-  }
-
-  private aggressiveCleanup(): void {
-    this.processedMessages.clear();
-    this.processingCache.clear();
-    this.recentWins.clear();
-    this.noResponseCooldown.clear();
-    this.crosspostCache.clear();
-    this.globalProcessedMessages.clear();
-    this.tokenManager.clearAll();
-    
-    if (this.sessionStartPromises.size > 10) {
-      this.sessionStartPromises.clear();
-    }
-    
-    if (global.gc) {
-      global.gc();
-    }
-  }
-
-  private forceCleanup(): void {
-    this.aggressiveCleanup();
-    
-    const mem = this.getMemoryUsage();
-    if (mem.heapUsedMB > MEMORY_CRITICAL_THRESHOLD_MB && this.sessions.size > 1) {
-      const toStop = Math.max(1, Math.floor(this.sessions.size * 0.3));
-      let stopped = 0;
-      for (const [key, session] of this.sessions) {
-        if (stopped >= toStop) break;
-        if (this.sessions.size <= 1) break;
-        this.stopSession(session.userId, session.guildId);
-        stopped++;
-      }
-      this.asyncLogger.warn(`Stopped ${stopped} sessions to free memory`, {
-        worker: this.workerId,
-        remaining: this.sessions.size,
+    if (Math.abs(cacheCount - dbCount) > 100) {
+      logger.warn(`Cache/DB inconsistency detected: cache=${cacheCount}, db=${dbCount}`, {
+        component: 'Database',
+        difference: Math.abs(cacheCount - dbCount)
       });
-    }
-  }
-
-  // -------------------------------------------------------------------------
-  // Public API
-  // -------------------------------------------------------------------------
-
-  async startAllSessions(): Promise<void> {
-    if (!this.checkMemory()) {
-      this.asyncLogger.warn('Memory too high, skipping session start', {
-        worker: this.workerId,
-        memory: this.getMemoryUsage(),
-      });
-      return;
-    }
-
-    this.asyncLogger.info(`🚀 Starting AutoJoin sessions (worker: ${this.workerId})...`);
-
-    try {
-      const allPremiumUsers = await this.getAllPremiumUsersAcrossAllGuilds();
-      const validUsers = allPremiumUsers.filter(u => u.token);
       
-      this.asyncLogger.info(`Found ${validUsers.length} premium users with tokens`, {
-        worker: this.workerId,
-      });
+      // If inconsistency is large, trigger a resync
+      if (Math.abs(cacheCount - dbCount) > 500) {
+        await resyncCache();
+      }
+    }
+  } catch (err) {
+    logger.debug('Consistency check failed', { 
+      component: 'Database', 
+      error: err instanceof Error ? err.message : String(err) 
+    });
+  }
+}
 
-      const usersToStart = validUsers.slice(0, MAX_SESSIONS_PER_WORKER);
-
-      const concurrencyLimit = 3;
-      let started = 0;
-      let failed = 0;
+async function resyncCache(): Promise<void> {
+  if (!connected || isShuttingDown) return;
+  
+  logger.info('Starting cache resync', { component: 'Database' });
+  
+  try {
+    // Clear existing caches
+    cache.clear();
+    dirtyKeys.clear();
+    pendingDeletes.clear();
+    activeGiveawaysCache.clear();
+    guildGiveawaysCache.clear();
+    
+    // Reload from database
+    const docs = await giveawaysCol.find({})
+      .sort({ detectedAt: -1 })
+      .limit(MAX_CACHE_SIZE)
+      .toArray();
+    
+    const now = Date.now();
+    const activeNow = Date.now();
+    
+    for (const doc of docs) {
+      const key = cacheKey(doc.messageId, doc.channelId);
+      const entry: CacheEntry = {
+        doc,
+        timestamp: now,
+        version: doc.version || 1,
+      };
+      cache.set(key, entry);
       
-      for (let i = 0; i < usersToStart.length; i += concurrencyLimit) {
-        const batch = usersToStart.slice(i, i + concurrencyLimit);
-        
-        if (!this.checkMemory()) {
-          this.asyncLogger.warn('Memory threshold reached, stopping session start', {
-            worker: this.workerId,
-            started,
-            failed,
-          });
-          break;
-        }
-        
-        const results = await Promise.allSettled(
-          batch.map(user => this.startSession(user.userId, user.guildId))
+      // Update active cache
+      if (doc.status === 'active' && (doc.endsAt === null || doc.endsAt > activeNow)) {
+        activeGiveawaysCache.set(key, doc);
+      }
+      
+      // Update guild cache
+      if (!guildGiveawaysCache.has(doc.guildId)) {
+        guildGiveawaysCache.set(doc.guildId, new Set());
+      }
+      guildGiveawaysCache.get(doc.guildId)!.add(key);
+    }
+    
+    // Update total count
+    const counter = await countersCol.findOne({ _id: 'total_detected' });
+    if (counter) {
+      totalDetectedCount = Math.max(counter.total, cache.size);
+    } else {
+      totalDetectedCount = cache.size;
+    }
+    
+    logger.info(`Cache resync complete: ${cache.size} entries loaded`, {
+      component: 'Database',
+      totalDetected: totalDetectedCount
+    });
+  } catch (err) {
+    logger.error('Cache resync failed', { 
+      component: 'Database', 
+      error: err instanceof Error ? err.message : String(err) 
+    });
+  }
+}
+
+// Schedule periodic consistency checks
+const consistencyInterval = setInterval(checkConsistency, CONSISTENCY_CHECK_INTERVAL_MS);
+
+// ============================================================================
+// Connection Management
+// ============================================================================
+
+async function connect(): Promise<void> {
+  if (connected) return;
+  if (connectingPromise) return connectingPromise;
+
+  connectingPromise = (async () => {
+    try {
+      connectionAttempts++;
+      
+      logger.debug(`Connecting to MongoDB (attempt ${connectionAttempts}/${MAX_CONNECTION_ATTEMPTS})`, {
+        component: 'Database'
+      });
+      
+      client = new MongoClient(MONGO_URI!, {
+        maxPoolSize: 20,
+        minPoolSize: 5,
+        maxIdleTimeMS: 60000,
+        connectTimeoutMS: 10000,
+        socketTimeoutMS: 30000,
+        serverSelectionTimeoutMS: 10000,
+        heartbeatFrequencyMS: 10000,
+        retryWrites: true,
+        retryReads: true,
+        compressors: ['snappy', 'zlib'],
+        // Enable monitoring
+        monitorCommands: process.env.NODE_ENV === 'development',
+      });
+      
+      // Set up event listeners for connection monitoring
+      client.on('connectionCreated', () => {
+        logger.debug('MongoDB connection created', { component: 'Database' });
+      });
+      
+      client.on('connectionClosed', () => {
+        logger.debug('MongoDB connection closed', { component: 'Database' });
+      });
+      
+      client.on('error', (err) => {
+        logger.error('MongoDB client error', { 
+          component: 'Database', 
+          error: err instanceof Error ? err.message : String(err) 
+        });
+      });
+      
+      await client.connect();
+      db = client.db('giveaway_tracker');
+      
+      // Initialize collections
+      giveawaysCol = db.collection<StoredGiveaway>('giveaways');
+      countersCol = db.collection<TotalCounter>('counters');
+      watchlistCol = db.collection<UserWatchlist>('watchlists');
+      licenseKeysCol = db.collection<LicenseKey>('license_keys');
+      premiumUsersCol = db.collection<PremiumUser>('premium_users');
+      boosterPremiumCol = db.collection<BoosterPremium>('booster_premium');
+      autoJoinEntriesCol = db.collection<AutoJoinEntry>('autojoin_entries');
+
+      // Create indexes with proper error handling
+      await createIndexes();
+
+      // Load initial data
+      await loadInitialData();
+
+      connected = true;
+      connectionAttempts = 0;
+      
+      logger.info(`Connected to MongoDB successfully`, {
+        component: 'Database',
+        cacheSize: cache.size,
+        totalDetected: totalDetectedCount
+      });
+      
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      logger.error('Failed to connect to MongoDB', { 
+        component: 'Database', 
+        error: errorMsg,
+        attempt: connectionAttempts,
+        maxAttempts: MAX_CONNECTION_ATTEMPTS,
+      });
+      
+      if (connectionAttempts < MAX_CONNECTION_ATTEMPTS && !isShuttingDown) {
+        const delayMs = Math.min(
+          INITIAL_RETRY_DELAY_MS * Math.pow(2, connectionAttempts - 1),
+          MAX_RETRY_DELAY_MS
         );
-        
-        for (const result of results) {
-          if (result.status === 'fulfilled' && result.value) {
-            started++;
-          } else {
-            failed++;
-          }
-        }
-        
-        await delay(1000);
+        logger.info(`Retrying connection in ${delayMs}ms`, { component: 'Database' });
+        await new Promise(r => setTimeout(r, delayMs));
+        connectingPromise = null;
+        return connect();
       }
-
-      this.asyncLogger.info(`✅ AutoJoin sessions started: ${started} active (${failed} failed)`, {
-        worker: this.workerId,
-        sessions: this.sessions.size,
-        memory: this.getMemoryUsage(),
-      });
-    } catch (error) {
-      this.asyncLogger.error('Failed to start AutoJoin sessions', {
-        worker: this.workerId,
-        error: formatError(error),
-      });
+      
+      throw err;
+    } finally {
+      connectingPromise = null;
     }
-  }
+  })();
 
-  private async getAllPremiumUsersAcrossAllGuilds(): Promise<any[]> {
-    try {
-      const users = await getAllPremiumUsersAllGuilds();
-      if (users.length === 0) {
-        const { getAllPremiumUsers } = await import('../database.js');
-        const guildId = process.env.GUILD_ID;
-        if (guildId) return await getAllPremiumUsers(guildId);
-      }
-      return users;
-    } catch (error) {
-      this.asyncLogger.error('Failed to get premium users', { error: formatError(error) });
-      return [];
-    }
-  }
+  return connectingPromise;
+}
 
-  async startSession(userId: string, guildId: string): Promise<boolean> {
-    const sessionKey = this.makeSessionKey(userId, guildId);
+async function createIndexes(): Promise<void> {
+  try {
+    // Giveaways indexes
+    await giveawaysCol.createIndex({ messageId: 1, channelId: 1 }, { unique: true });
+    await giveawaysCol.createIndex({ status: 1 });
+    await giveawaysCol.createIndex({ detectedAt: -1 });
+    await giveawaysCol.createIndex({ notificationStatus: 1 });
+    await giveawaysCol.createIndex({ guildId: 1, status: 1 });
+    await giveawaysCol.createIndex({ endsAt: 1, status: 1 });
     
-    if (this.sessions.has(sessionKey)) return true;
-    if (this.sessions.size >= MAX_SESSIONS_PER_WORKER) {
-      this.asyncLogger.warn(`Session limit reached (${MAX_SESSIONS_PER_WORKER})`, { userId, guildId });
-      return false;
-    }
-
-    if (this.sessionStartPromises.size >= MAX_SESSION_START_PROMISES) {
-      this.asyncLogger.warn('Too many pending session starts', { userId, guildId });
-      return false;
-    }
-
-    if (this.sessionStartPromises.has(sessionKey)) {
-      return this.sessionStartPromises.get(sessionKey)!;
-    }
-
-    const errorHistory = this.sessionStartErrors.get(sessionKey);
-    if (errorHistory) {
-      const now = Date.now();
-      if (errorHistory.count >= 5 && now - errorHistory.lastAttempt < 600000) {
-        this.asyncLogger.warn('Session start throttled due to repeated failures', {
-          userId,
-          guildId,
-          failures: errorHistory.count,
-          lastError: errorHistory.lastError,
-        });
-        return false;
-      }
-      if (now - errorHistory.lastAttempt > 600000) {
-        this.sessionStartErrors.delete(sessionKey);
-      }
-    }
-
-    const startPromise = this._startSessionInternal(userId, guildId);
-    this.sessionStartPromises.set(sessionKey, startPromise);
-
-    try {
-      const result = await startPromise;
-      if (result) {
-        this.sessionStartErrors.delete(sessionKey);
-      } else {
-        const history = this.sessionStartErrors.get(sessionKey) || { count: 0, lastError: '', lastAttempt: 0 };
-        history.count++;
-        history.lastError = 'Session start returned false';
-        history.lastAttempt = Date.now();
-        this.sessionStartErrors.set(sessionKey, history);
-      }
-      return result;
-    } catch (error) {
-      const history = this.sessionStartErrors.get(sessionKey) || { count: 0, lastError: '', lastAttempt: 0 };
-      history.count++;
-      history.lastError = formatError(error);
-      history.lastAttempt = Date.now();
-      this.sessionStartErrors.set(sessionKey, history);
-      return false;
-    } finally {
-      this.sessionStartPromises.delete(sessionKey);
-    }
-  }
-
-  private async _startSessionInternal(userId: string, guildId: string): Promise<boolean> {
-    const sessionKey = this.makeSessionKey(userId, guildId);
-
-    try {
-      this.asyncLogger.debug('Starting session', { userId, guildId, worker: this.workerId });
-
-      const user = await getPremiumUser(userId, guildId);
-      if (!user?.token) {
-        this.asyncLogger.warn('No token found for user', { userId, guildId });
-        return false;
-      }
-
-      let decryptedToken: string;
-      try {
-        decryptedToken = await this.tokenManager.getDecryptedToken(userId, guildId, user.token);
-      } catch (error) {
-        this.asyncLogger.error('Failed to decrypt token', { userId, guildId, error: formatError(error) });
-        await setTokenActive(userId, guildId, false);
-        return false;
-      }
-
-      const isValid = await this.validateToken(decryptedToken);
-      if (!isValid) {
-        this.asyncLogger.warn('Token validation failed', { userId, guildId });
-        await setTokenActive(userId, guildId, false);
-        this.tokenManager.clearCache(userId, guildId);
-        return false;
-      }
-
-      const clientOptions: ClientOptions = {
-        messageCacheLifetime: 60,
-        messageSweepInterval: 300,
-        restRequestTimeout: 15000,
-        restGlobalRateLimit: 50,
-        retryLimit: 3,
-        allowedMentions: { parse: [] },
-        partials: [],
-        makeCache: Options.cacheWithLimits({
-          PresenceManager: 0,
-          ReactionManager: 0,
-          ThreadManager: 0,
-          VoiceStateManager: 0,
-          StageInstanceManager: 0,
-        }),
-        // Fix deprecation warning - use sweepers
-        sweepers: {
-          messages: {
-            interval: 3600,
-            lifetime: 1800,
-          },
-          threads: {
-            interval: 3600,
-            lifetime: 1800,
-          },
-        },
-      };
-
-      const client = new Client(clientOptions);
-      client.setMaxListeners(50);
-      
-      this.sessionIdCounter++;
-      const sessionId = `${userId}-${Date.now()}-${this.sessionIdCounter}`;
-      
-      const session: UserSession = {
-        client,
-        userId,
-        guildId,
-        label: user.tokenLabel || 'main',
-        startedAt: Date.now(),
-        isActive: true,
-        stats: { detected: 0, entered: 0, failed: 0, wins: 0, falsePositives: 0, queueWaitTimes: [] },
-        reconnectAttempts: 0,
-        maxReconnectAttempts: MAX_RECONNECT_ATTEMPTS,
-        rateLimiter: new TokenBucket(5, 5000),
-        listeners: {},
-        sessionId,
-        destroyed: false,
-        lastHealthCheck: Date.now(),
-        stallCount: 0,
-      };
-
-      this.registerEvents(session);
-      
-      try {
-        await Promise.race([
-          this.loginWithTimeout(client, decryptedToken),
-          delay(LOGIN_TIMEOUT_MS).then(() => { throw new Error('Login timeout'); })
-        ]);
-      } catch (loginError) {
-        this.asyncLogger.error('Login failed', { userId, guildId, error: formatError(loginError) });
-        try { await client.destroy(); } catch {}
-        await setTokenActive(userId, guildId, false);
-        this.tokenManager.clearCache(userId, guildId);
-        return false;
-      }
-
-      try {
-        await Promise.race([
-          this.waitForReady(client),
-          delay(READY_TIMEOUT_MS).then(() => { throw new Error('Ready timeout'); })
-        ]);
-      } catch (readyError) {
-        this.asyncLogger.error('Ready timeout', { userId, guildId, error: formatError(readyError) });
-        try { await client.destroy(); } catch {}
-        await setTokenActive(userId, guildId, false);
-        this.tokenManager.clearCache(userId, guildId);
-        return false;
-      }
-      
-      this.tokenManager.clearCache(userId, guildId);
-
-      if (this.isShuttingDown) {
-        this.asyncLogger.warn('Shutdown in progress, destroying newly created session', {
-          userId,
-          sessionId: session.sessionId,
-        });
-        try {
-          await client.destroy();
-        } catch {}
-        return false;
-      }
-
-      this.sessions.set(sessionKey, session);
-      this.sessionsByUserId.set(`${userId}:${guildId}`, session);
-      this.startHeartbeat(session);
-      
-      await setTokenActive(userId, guildId, true);
-      await updateTokenLastUsed(userId, guildId);
-      await this.watchlistManager.loadKeywords(userId);
-
-      this.asyncLogger.info('✅ AutoJoin session started', {
-        userId,
-        label: session.label,
-        username: client.user?.username,
-        guilds: client.guilds.cache.size,
-        worker: this.workerId,
-        sessionId: session.sessionId,
-        memory: this.getMemoryUsage(),
-      });
-
-      this.emit('sessionStarted', { userId, guildId });
-      return true;
-
-    } catch (error) {
-      this.asyncLogger.error('Failed to start AutoJoin session', {
-        userId,
-        guildId,
-        error: formatError(error),
-        worker: this.workerId,
-      });
-      await setTokenActive(userId, guildId, false);
-      this.tokenManager.clearCache(userId, guildId);
-      return false;
-    }
-  }
-
-  private async validateToken(token: string): Promise<boolean> {
-    const client = new Client();
-    try {
-      await Promise.race([
-        client.login(token),
-        delay(10000).then(() => { throw new Error('Login timeout'); })
-      ]);
-      return client.isReady();
-    } catch {
-      return false;
-    } finally {
-      try {
-        await client.destroy();
-      } catch {}
-    }
-  }
-
-  private async loginWithTimeout(client: Client, token: string): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error('Login timeout')), LOGIN_TIMEOUT_MS);
-      client.login(token)
-        .then(() => { clearTimeout(timeout); resolve(); })
-        .catch((err) => { clearTimeout(timeout); reject(err); });
+    // Watchlist indexes
+    await watchlistCol.createIndex({ userId: 1 }, { unique: true });
+    await watchlistCol.createIndex({ items: 1 });
+    
+    // License keys indexes
+    await licenseKeysCol.createIndex({ key: 1 }, { unique: true });
+    await licenseKeysCol.createIndex({ used: 1 });
+    await licenseKeysCol.createIndex({ createdAt: -1 });
+    
+    // Premium users indexes
+    await premiumUsersCol.createIndex({ userId: 1, guildId: 1 }, { unique: true });
+    await premiumUsersCol.createIndex({ isPremium: 1 });
+    await premiumUsersCol.createIndex({ source: 1 });
+    await premiumUsersCol.createIndex({ guildId: 1, isPremium: 1 });
+    
+    // Booster premium indexes
+    await boosterPremiumCol.createIndex({ userId: 1, guildId: 1 }, { unique: true });
+    await boosterPremiumCol.createIndex({ isBooster: 1 });
+    await boosterPremiumCol.createIndex({ premiumAssigned: 1 });
+    await boosterPremiumCol.createIndex({ guildId: 1, isBooster: 1 });
+    
+    // Auto-join entries indexes with TTL
+    await autoJoinEntriesCol.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+    await autoJoinEntriesCol.createIndex({ detectedAt: -1 });
+    await autoJoinEntriesCol.createIndex({ userId: 1, status: 1 });
+    await autoJoinEntriesCol.createIndex({ status: 1, detectedAt: 1 });
+    
+    logger.debug('Database indexes created/verified', { component: 'Database' });
+  } catch (err) {
+    logger.error('Failed to create indexes', { 
+      component: 'Database', 
+      error: err instanceof Error ? err.message : String(err) 
     });
+    throw err;
   }
+}
 
-  private async waitForReady(client: Client): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error('Ready timeout')), READY_TIMEOUT_MS);
-      
-      if (client.isReady()) {
-        clearTimeout(timeout);
-        resolve();
-        return;
-      }
-      
-      const selfbotClient = client as any;
-      selfbotClient.once('ready', () => { clearTimeout(timeout); resolve(); });
-      selfbotClient.once('error', (err: Error) => { clearTimeout(timeout); reject(err); });
-    });
-  }
-
-  // -------------------------------------------------------------------------
-  // Heartbeat with reconnect
-  // -------------------------------------------------------------------------
-
-  private startHeartbeat(session: UserSession): void {
-    if (session.heartbeatInterval) {
-      clearInterval(session.heartbeatInterval);
-      session.heartbeatInterval = undefined;
-    }
-
-    session.heartbeatInterval = setInterval(() => {
-      if (this.isShuttingDown || !session.isActive || session.destroyed) return;
-
-      try {
-        const client = session.client as any;
-        if (!client.isReady()) throw new Error('Client not ready');
-        if (client.ws?.connection?.readyState !== 1) throw new Error('WebSocket not open');
-      } catch (error) {
-        if (session.heartbeatInterval) {
-          clearInterval(session.heartbeatInterval);
-          session.heartbeatInterval = undefined;
-        }
-        
-        if (session.reconnectAttempts < session.maxReconnectAttempts) {
-          session.reconnectAttempts++;
-          
-          const count = (this.reconnectCount.get(session.userId) || 0) + 1;
-          this.reconnectCount.set(session.userId, count);
-          
-          this.asyncLogger.debug('Attempting reconnect', {
-            userId: session.userId,
-            guildId: session.guildId,
-            attempt: session.reconnectAttempts,
-            oldSessionId: session.sessionId,
-          });
-          
-          try {
-            (session.client as any).destroy();
-          } catch {}
-          this.cleanupSessionListeners(session);
-          
-          session.destroyed = true;
-          
-          const oldKey = this.makeSessionKey(session.userId, session.guildId);
-          this.sessions.delete(oldKey);
-          this.sessionsByUserId.delete(`${session.userId}:${session.guildId}`);
-          
-          const backoffMs = exponentialBackoff(session.reconnectAttempts - 1, 5000, 60000);
-          setTimeout(() => {
-            this._startSessionInternal(session.userId, session.guildId)
-              .then(success => {
-                if (success) {
-                  const newSession = this.sessionsByUserId.get(`${session.userId}:${session.guildId}`);
-                  if (newSession) {
-                    newSession.reconnectAttempts = 0;
-                    this.asyncLogger.debug('Reconnect successful', {
-                      userId: session.userId,
-                      guildId: session.guildId,
-                      newSessionId: newSession.sessionId,
-                    });
-                  }
-                }
-              })
-              .catch(() => {});
-          }, backoffMs);
-        } else {
-          this.asyncLogger.error('Max reconnect attempts reached, stopping session', {
-            userId: session.userId,
-            guildId: session.guildId,
-          });
-          session.isActive = false;
-          this.stopSession(session.userId, session.guildId);
-        }
-      }
-    }, HEARTBEAT_INTERVAL_MS);
-
-    if (session.heartbeatInterval.unref) {
-      session.heartbeatInterval.unref();
-    }
-  }
-
-  async restoreSessionsFromDatabase(): Promise<void> {
-    if (!this.checkMemory()) {
-      this.asyncLogger.warn('Memory too high, skipping restore', { worker: this.workerId });
-      return;
-    }
-
-    this.asyncLogger.info('🔄 Restoring AutoJoin sessions from database...', { worker: this.workerId });
+async function loadInitialData(): Promise<void> {
+  try {
+    // Load giveaways into cache
+    const docs = await giveawaysCol.find({})
+      .sort({ detectedAt: -1 })
+      .limit(MAX_CACHE_SIZE)
+      .toArray();
     
-    try {
-      const allPremiumUsers = await this.getAllPremiumUsersAcrossAllGuilds();
-      let restored = 0, failed = 0, skipped = 0;
-      
-      for (const user of allPremiumUsers) {
-        if (!this.checkMemory()) break;
-        if (!user.token) { skipped++; continue; }
-        const sessionKey = this.makeSessionKey(user.userId, user.guildId);
-        if (this.sessions.has(sessionKey)) { skipped++; continue; }
-        
-        const success = await this.startSession(user.userId, user.guildId);
-        if (success) restored++;
-        else failed++;
-        await delay(500);
-      }
-      
-      this.asyncLogger.info(`✅ Restored ${restored} AutoJoin sessions (${failed} failed, ${skipped} skipped)`, {
-        worker: this.workerId,
-        total: this.sessions.size,
-        memory: this.getMemoryUsage(),
-      });
-    } catch (error) {
-      this.asyncLogger.error('Failed to restore AutoJoin sessions', { error: formatError(error) });
-    }
-  }
-
-  async stopSession(userId: string, guildId: string): Promise<void> {
-    const sessionKey = this.makeSessionKey(userId, guildId);
-    const session = this.sessions.get(sessionKey);
-    if (!session) return;
-
-    session.destroyed = true;
-    session.isActive = false;
-
-    try {
-      if (session.heartbeatInterval) {
-        clearInterval(session.heartbeatInterval);
-        session.heartbeatInterval = undefined;
-      }
-      
-      this.cleanupSessionListeners(session);
-      
-      try {
-        await (session.client as any).destroy();
-      } catch {}
-      
-      this.sessions.delete(sessionKey);
-      this.sessionsByUserId.delete(`${userId}:${guildId}`);
-      this.tokenManager.clearCache(userId, guildId);
-      
-      await setTokenActive(userId, guildId, false);
-      
-      this.asyncLogger.info('⏹️ AutoJoin session stopped', { 
-        userId, 
-        guildId,
-        sessionId: session.sessionId,
-        memory: this.getMemoryUsage(),
-      });
-      
-      this.emit('sessionStopped', { userId, guildId });
-    } catch (error) {
-      this.asyncLogger.error('Failed to stop AutoJoin session', { 
-        userId, 
-        guildId, 
-        error: formatError(error) 
-      });
-      this.sessions.delete(sessionKey);
-      this.sessionsByUserId.delete(`${userId}:${guildId}`);
-    }
-  }
-
-  private cleanupSessionListeners(session: UserSession): void {
-    const { client, listeners } = session;
+    const now = Date.now();
+    const activeNow = Date.now();
     
-    if (listeners.messageCreate) {
-      client.off('messageCreate', listeners.messageCreate);
-      delete listeners.messageCreate;
-    }
-    if (listeners.messageUpdate) {
-      client.off('messageUpdate', listeners.messageUpdate);
-      delete listeners.messageUpdate;
-    }
-    if (listeners.error) {
-      client.off('error', listeners.error);
-      delete listeners.error;
-    }
-    if (listeners.disconnect) {
-      client.off('disconnect', listeners.disconnect);
-      delete listeners.disconnect;
-    }
+    cache.clear();
+    activeGiveawaysCache.clear();
+    guildGiveawaysCache.clear();
     
-    try {
-      client.removeAllListeners();
-    } catch {}
-  }
-
-  async refreshSessions(): Promise<void> {
-    if (this.isShuttingDown) return;
-    if (!this.checkMemory()) {
-      this.asyncLogger.warn('Memory too high, skipping refresh', { worker: this.workerId });
-      return;
-    }
-
-    try {
-      const allPremiumUsers = await this.getAllPremiumUsersAcrossAllGuilds();
-      const activeUserIds = new Set(allPremiumUsers.filter(u => u.token).map(u => `${u.userId}:${u.guildId}`));
-
-      for (const [key, session] of this.sessions) {
-        const sessionKey = `${session.userId}:${session.guildId}`;
-        if (!activeUserIds.has(sessionKey)) {
-          await this.stopSession(session.userId, session.guildId);
-        }
-      }
-
-      for (const user of allPremiumUsers) {
-        if (!this.checkMemory()) break;
-        if (!user.token) continue;
-        const sessionKey = this.makeSessionKey(user.userId, user.guildId);
-        if (!this.sessions.has(sessionKey)) {
-          await this.startSession(user.userId, user.guildId);
-          await delay(500);
-        }
-      }
-
-      this.logStats();
-    } catch (error) {
-      this.asyncLogger.error('Failed to refresh sessions', { error: formatError(error) });
-    }
-  }
-
-  async retryFailedSessions(): Promise<void> {
-    if (this.isShuttingDown) return;
-    if (!this.checkMemory()) {
-      this.asyncLogger.warn('Memory too high, skipping retry', { worker: this.workerId });
-      return;
-    }
-    
-    try {
-      const allPremiumUsers = await this.getAllPremiumUsersAcrossAllGuilds();
-      const failedUsers = allPremiumUsers.filter(u => u.token && u.tokenActive === false);
-      
-      for (const user of failedUsers) {
-        if (!this.checkMemory()) break;
-        const sessionKey = this.makeSessionKey(user.userId, user.guildId);
-        if (!this.sessions.has(sessionKey)) {
-          const errorHistory = this.sessionStartErrors.get(sessionKey);
-          if (errorHistory && errorHistory.count >= 5) {
-            const now = Date.now();
-            if (now - errorHistory.lastAttempt < 300000) {
-              continue;
-            }
-          }
-          await this.startSession(user.userId, user.guildId);
-          await delay(2000);
-        }
-      }
-    } catch (error) {
-      this.asyncLogger.error('Failed to retry sessions', { error: formatError(error) });
-    }
-  }
-
-  private makeSessionKey(userId: string, guildId: string): string {
-    return `${userId}:${guildId}`;
-  }
-
-  // -------------------------------------------------------------------------
-  // Event Handlers - Based on working autoJoin.ts
-  // -------------------------------------------------------------------------
-
-  private registerEvents(session: UserSession): void {
-    const { client, userId, guildId } = session;
-
-    const messageCreateHandler = async (message: Message) => {
-      if (this.isShuttingDown || !session.isActive || session.destroyed) return;
-      
-      try {
-        this.metrics.totalMessagesProcessed++;
-        session.lastHealthCheck = Date.now();
-        
-        // Handle DM wins first
-        if (!message.guild) {
-          await this.handleDmWin(message, userId);
-          return;
-        }
-        
-        // Skip own messages
-        if (message.author?.id === client.user?.id) return;
-        
-        // Handle guild wins
-        await this.handleWin(message, userId);
-        
-        // Handle giveaway detection
-        await this.handleMessage(message, session);
-      } catch (error) {
-        this.asyncLogger.error('Message handler error', { userId, error: formatError(error) });
-      }
-    };
-
-    const messageUpdateHandler = async (_old: Message | PartialMessage, updated: Message | PartialMessage) => {
-      if (this.isShuttingDown || !session.isActive || session.destroyed) return;
-      try {
-        const entryId = this.makeEntryId(session, updated as Message);
-        if (!this.processedMessages.has(entryId)) {
-          await this.handleMessage(updated as Message, session);
-        }
-      } catch (error) {
-        this.asyncLogger.error('Message update handler error', { userId, error: formatError(error) });
-      }
-    };
-
-    const errorHandler = (error: Error) => {
-      this.asyncLogger.error('Client error', { userId, error: formatError(error) });
-    };
-
-    const disconnectHandler = () => {
-      this.asyncLogger.warn('Client disconnected, will attempt reconnect', { userId });
-    };
-
-    session.listeners.messageCreate = messageCreateHandler;
-    session.listeners.messageUpdate = messageUpdateHandler;
-    session.listeners.error = errorHandler;
-    session.listeners.disconnect = disconnectHandler;
-
-    client.on('messageCreate', messageCreateHandler);
-    client.on('messageUpdate', messageUpdateHandler);
-    client.on('error', errorHandler);
-    client.on('disconnect', disconnectHandler);
-  }
-
-  // -------------------------------------------------------------------------
-  // Message Handling - Based on working autoJoin.ts
-  // -------------------------------------------------------------------------
-
-  private async handleMessage(message: Message, session: UserSession): Promise<void> {
-    if (CONFIG.monitoredChannels.length > 0 && 
-        !CONFIG.monitoredChannels.includes(message.channel.id)) {
-      return;
-    }
-
-    const entryId = this.makeEntryId(session, message);
-
-    // Check global cross-session dedup first
-    const globalKey = `${message.guild?.id}:${message.channel.id}:${message.id}`;
-    if (this.globalProcessedMessages.has(globalKey)) {
-      this.metrics.cacheHits++;
-      return;
-    }
-
-    if (this.processedMessages.has(entryId)) {
-      this.metrics.cacheHits++;
-      return;
-    }
-    
-    if (this.processingCache.get(entryId) !== undefined) {
-      this.metrics.cacheHits++;
-      return;
-    }
-    
-    this.metrics.cacheMisses++;
-
-    // Set global dedup immediately
-    this.globalProcessedMessages.set(globalKey, Date.now());
-
-    const crosspostId = this.extractCrosspostId(message);
-    if (crosspostId && this.crosspostCache.has(crosspostId)) {
-      this.asyncLogger.debug('Skipping cross-posted duplicate', {
-        messageId: message.id,
-        crosspostSource: this.crosspostCache.get(crosspostId),
-      });
-      return;
-    }
-    if (crosspostId) {
-      this.crosspostCache.set(crosspostId, message.id);
-    }
-
-    if (!this.checkMemory()) return;
-
-    const correlationId = this.correlationTracker.createTrace(session.userId, message.id);
-    this.correlationTracker.startStage(correlationId, 'detection');
-
-    const startTime = Date.now();
-    
-    // Check if already in database
-    const existing = await getAutoJoinEntry(session.userId, message.id, message.channel.id);
-    this.metrics.dbQueries++;
-    
-    if (existing) {
-      this.processedMessages.set(entryId, Date.now());
-      this.correlationTracker.completeTrace(correlationId, 'completed');
-      return;
-    }
-
-    this.processingCache.set(entryId, Date.now());
-    this.correlationTracker.startStage(correlationId, 'processing');
-
-    try {
-      // Use the detection engine (based on working autoJoin.ts)
-      const detected = await this.detectionEngine.detect(message, correlationId);
-      this.correlationTracker.endStage(correlationId, 'detection', {
-        isGiveaway: detected.isGiveaway,
-        confidence: detected.confidence,
-        reasons: detected.reasons,
-      });
-
-      if (!detected.isGiveaway) {
-        this.correlationTracker.completeTrace(correlationId, 'completed');
-        this.processingCache.delete(entryId);
-        return;
-      }
-
-      this.metrics.totalGiveawaysDetected++;
-      const detectionTime = Date.now() - startTime;
-      this.metrics.recordDetectionTime(detectionTime);
-
-      // Watchlist matches
-      const watchlistMatches = this.watchlistManager.matchKeyword(
-        message.content + ' ' + 
-        message.embeds?.map(e => e.title + ' ' + e.description).join(' ') || ''
-      );
-      
-      if (watchlistMatches.length > 0) {
-        this.correlationTracker.startStage(correlationId, 'watchlist', {
-          matches: watchlistMatches.map(m => m.keyword),
-        });
-        
-        for (const match of watchlistMatches) {
-          if (match.matched) {
-            saveWatchlistMatch(session.userId, match.keyword, message.id, message.channel.id)
-              .catch(() => {});
-          }
-        }
-        
-        this.correlationTracker.endStage(correlationId, 'watchlist');
-      }
-
-      const entryData: Omit<GiveawayEntry, '_id'> = {
-        userId: session.userId,
-        messageId: message.id,
-        channelId: message.channel.id,
-        guildId: message.guild!.id,
-        authorId: message.author?.id ?? '',
-        guildName: message.guild!.name,
-        channelName: (message.channel as { name?: string }).name ?? 'unknown',
-        prize: detected.prize || 'Unknown Prize',
-        buttonCustomId: detected.button?.customId,
-        detectedAt: Date.now(),
-        endsAt: this.extractEndTimestamp(message),
-        status: 'pending',
-        attempts: 0,
-        expiresAt: Date.now() + ENTRY_TTL_MS,
-        correlationId,
-        detectionConfidence: detected.confidence,
-        detectionReasons: detected.reasons,
-        crosspostSource: this.extractCrosspostId(message),
+    for (const doc of docs) {
+      const key = cacheKey(doc.messageId, doc.channelId);
+      const entry: CacheEntry = {
+        doc,
+        timestamp: now,
+        version: doc.version || 1,
       };
-
-      await saveAutoJoinEntry(entryData as Omit<AutoJoinEntry, '_id'>);
-      this.metrics.dbQueries++;
+      cache.set(key, entry);
       
-      this.detectionConfidenceBuffer.push({
-        messageId: message.id,
-        channelId: message.channel.id,
-        confidence: detected.confidence,
-        reasons: detected.reasons,
-      });
-
-      this.processedMessages.set(entryId, Date.now());
-      session.stats.detected++;
-
-      this.updateGuildStats(message.guild!.id, message.guild!.name, 'detected', detected.confidence);
-      this.updateAccountStats(session.userId, 'detected', detected.confidence, detectionTime);
-
-      this.correlationTracker.startStage(correlationId, 'queueing');
-
-      this.asyncLogger.info('🎯 AutoJoin: Giveaway detected', {
-        correlationId,
-        userId: session.userId,
-        prize: truncate(entryData.prize, 60),
-        confidence: detected.confidence.toFixed(2),
-        reasons: detected.reasons,
-        guild: entryData.guildName,
-        worker: this.workerId,
-        detectionTime: `${detectionTime}ms`,
-      });
-
-      await this.queueOrEnter(entryId, session, entryData as GiveawayEntry, correlationId);
-
-    } catch (error) {
-      this.asyncLogger.error('AutoJoin: Handle message error', {
-        correlationId,
-        userId: session.userId,
-        error: formatError(error),
-        worker: this.workerId,
-      });
-      this.correlationTracker.completeTrace(correlationId, 'failed');
-    } finally {
-      this.processingCache.delete(entryId);
-      await cleanupAutoJoinEntries(session.userId);
+      // Update active cache
+      if (doc.status === 'active' && (doc.endsAt === null || doc.endsAt > activeNow)) {
+        activeGiveawaysCache.set(key, doc);
+      }
+      
+      // Update guild cache
+      if (!guildGiveawaysCache.has(doc.guildId)) {
+        guildGiveawaysCache.set(doc.guildId, new Set());
+      }
+      guildGiveawaysCache.get(doc.guildId)!.add(key);
     }
-  }
 
-  // -------------------------------------------------------------------------
-  // Queue or Enter Decision
-  // -------------------------------------------------------------------------
-
-  private async queueOrEnter(
-    entryId: string, 
-    session: UserSession, 
-    entry: GiveawayEntry, 
-    correlationId: string
-  ): Promise<void> {
-    const queueItem: QueueItem = {
-      entryId,
-      userId: session.userId,
-      guildId: entry.guildId,
-      channelId: entry.channelId,
-      messageId: entry.messageId,
-      priority: entry.endsAt ? Math.max(0, entry.endsAt - Date.now()) : 999999,
-      addedAt: Date.now(),
-      endsAt: entry.endsAt,
-      correlationId,
-      attempts: 0,
-      maxAttempts: CONFIG.maxRetries + 1,
-    };
-
-    const enqueued = this.joinQueue.enqueue(queueItem);
-
-    if (enqueued) {
-      await updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'queued', {
-        queuePosition: this.joinQueue.getGuildQueue(entry.guildId).indexOf(queueItem),
+    // Load counter
+    const counter = await countersCol.findOne({ _id: 'total_detected' });
+    if (!counter) {
+      await countersCol.insertOne({ 
+        _id: 'total_detected', 
+        total: cache.size,
+        lastUpdated: Date.now()
       });
-      
-      this.correlationTracker.endStage(correlationId, 'queueing', {
-        queued: true,
-        queueSize: this.joinQueue.getGuildQueue(entry.guildId).length,
-      });
-
-      this.processQueue(session.userId, entry.guildId).catch(error => {
-        this.asyncLogger.error('Queue processing error', {
-          correlationId,
-          error: formatError(error),
-        });
-      });
+      totalDetectedCount = cache.size;
     } else {
-      this.correlationTracker.endStage(correlationId, 'queueing', { queued: false, reason: 'queue_full' });
-      await this.enterGiveaway(entryId, session);
+      totalDetectedCount = Math.max(counter.total, cache.size);
     }
+    
+    logger.debug(`Initial data loaded: ${cache.size} giveaways`, {
+      component: 'Database',
+      totalDetected: totalDetectedCount
+    });
+    
+  } catch (err) {
+    logger.error('Failed to load initial data', { 
+      component: 'Database', 
+      error: err instanceof Error ? err.message : String(err) 
+    });
+    throw err;
   }
+}
 
-  // -------------------------------------------------------------------------
-  // Queue Processing
-  // -------------------------------------------------------------------------
+async function ensureConnected(): Promise<void> {
+  if (!connected) await connect();
+}
 
-  private async processQueue(userId: string, guildId: string): Promise<void> {
-    const session = this.sessionsByUserId.get(`${userId}:${guildId}`);
-    if (!session || !session.isActive) return;
+// ============================================================================
+// Sync Management
+// ============================================================================
 
-    let item = this.joinQueue.dequeue(guildId);
-    while (item) {
-      const correlationId = item.correlationId;
-      this.correlationTracker.startStage(correlationId, 'queue_processing');
+function markDirty(key: string): void {
+  if (isShuttingDown) return;
+  dirtyKeys.add(key);
+  scheduleSync();
+}
 
-      if (item.endsAt && Date.now() > item.endsAt) {
-        this.joinQueue.cancelGiveaway(item.messageId, item.channelId);
-        await updateAutoJoinEntryStatus(userId, item.messageId, item.channelId, 'skipped', {
-          lastError: 'giveaway_ended',
+function scheduleSync(): void {
+  if (syncTimeout || isShuttingDown) return;
+  syncTimeout = setTimeout(() => {
+    flushSync().catch((err) => {
+      if (!isShuttingDown) {
+        logger.error('Unhandled error during scheduled sync', { 
+          component: 'Database', 
+          error: err instanceof Error ? err.message : String(err) 
         });
-        this.correlationTracker.completeTrace(correlationId, 'completed');
-        item = this.joinQueue.dequeue(guildId);
-        continue;
+      }
+    });
+  }, SYNC_INTERVAL_MS);
+}
+
+async function flushSync(): Promise<void> {
+  if (isSyncing || isShuttingDown) return;
+  
+  syncTimeout = null;
+  if (!connected) return;
+
+  isSyncing = true;
+  
+  try {
+    // Sync counter first
+    if (dirtyTotal) {
+      await countersCol.updateOne(
+        { _id: 'total_detected' },
+        { $set: { total: totalDetectedCount, lastUpdated: Date.now() } },
+        { upsert: true }
+      );
+      dirtyTotal = false;
+    }
+
+    // Batch process dirty keys
+    if (dirtyKeys.size > 0) {
+      const keys = Array.from(dirtyKeys);
+      const ops: AnyBulkWriteOperation<StoredGiveaway>[] = [];
+      const docsForKeys: string[] = [];
+
+      for (const key of keys) {
+        const entry = cache.get(key);
+        if (!entry) {
+          dirtyKeys.delete(key);
+          continue;
+        }
+        
+        ops.push({
+          updateOne: {
+            filter: { 
+              messageId: entry.doc.messageId, 
+              channelId: entry.doc.channelId,
+              version: { $lt: entry.version } // Optimistic locking
+            },
+            update: { $set: entry.doc, $inc: { version: 1 } },
+            upsert: true,
+          },
+        });
+        docsForKeys.push(key);
+        
+        // Batch in chunks to avoid memory issues
+        if (ops.length >= BULK_WRITE_BATCH_SIZE) {
+          await executeBulkWrite(ops, docsForKeys);
+          ops.length = 0;
+          docsForKeys.length = 0;
+        }
       }
 
-      const queueWait = Date.now() - item.addedAt;
-      if (session.stats.queueWaitTimes.length >= METRICS_SAMPLE_SIZE) {
-        session.stats.queueWaitTimes.shift();
+      // Execute remaining operations
+      if (ops.length > 0) {
+        await executeBulkWrite(ops, docsForKeys);
       }
-      session.stats.queueWaitTimes.push(queueWait);
+    }
 
-      this.correlationTracker.endStage(correlationId, 'queue_processing', {
-        queueWaitMs: queueWait,
+    // Handle deletes
+    if (pendingDeletes.size > 0) {
+      const ids = Array.from(pendingDeletes);
+      const chunks = chunkArray(ids, BULK_WRITE_BATCH_SIZE);
+      
+      for (const chunk of chunks) {
+        await giveawaysCol.deleteMany({ messageId: { $in: chunk } });
+      }
+      pendingDeletes.clear();
+    }
+    
+  } catch (err) {
+    if (!isShuttingDown) {
+      logger.error('Sync failed', { 
+        component: 'Database', 
+        error: err instanceof Error ? err.message : String(err) 
       });
-
-      const entryId = this.makeEntryIdFromMessage(userId, item.channelId, item.messageId);
-      await this.enterGiveaway(entryId, session);
-
-      item = this.joinQueue.dequeue(guildId);
+      scheduleSync(); // Retry on failure
     }
+  } finally {
+    isSyncing = false;
   }
+}
 
-  // -------------------------------------------------------------------------
-  // Enter Giveaway - Based on working autoJoin.ts
-  // -------------------------------------------------------------------------
-
-  private async enterGiveaway(entryId: string, session: UserSession): Promise<void> {
-    const parts = entryId.split(':');
-    const userId = parts[0];
-    const channelId = parts[1];
-    const messageId = parts.slice(2).join(':');
+async function executeBulkWrite(ops: AnyBulkWriteOperation<StoredGiveaway>[], keys: string[]): Promise<void> {
+  try {
+    const result = await giveawaysCol.bulkWrite(ops, { ordered: false });
     
-    const entry = await getAutoJoinEntry(session.userId, messageId, channelId);
-    this.metrics.dbQueries++;
-    if (!entry) return;
-
-    const correlationId = entry.correlationId || 
-      this.correlationTracker.createTrace(session.userId, messageId);
-
-    this.correlationTracker.startStage(correlationId, 'entry_attempt');
-
-    await updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'attempting', {});
-    this.metrics.dbQueries++;
-
-    const maxAttempts = CONFIG.maxRetries + 1;
-    let entryStartTime = Date.now();
-
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      const attemptNum = attempt + 1;
-      this.metrics.totalEntriesAttempted++;
-      
-      if (attempt > 0) {
-        const backoffMs = exponentialBackoff(attempt - 1, CONFIG.retryDelayMs, 30000);
-        await delay(backoffMs);
-      }
-
-      if (attempt === 2) {
-        try {
-          const refreshedEntry = await this.refreshButtonData(entry as GiveawayEntry, session);
-          if (refreshedEntry && refreshedEntry.buttonCustomId !== entry.buttonCustomId) {
-            entry.buttonCustomId = refreshedEntry.buttonCustomId;
-          }
-        } catch {}
-      }
-
-      const cooldownEnd = this.noResponseCooldown.get(session.userId) || 0;
-      if (Date.now() < cooldownEnd) {
-        await delay(Math.min(cooldownEnd - Date.now(), 5000));
-      }
-
+    // Clean up successfully synced keys
+    for (const key of keys) {
+      dirtyKeys.delete(key);
+    }
+    
+    // Log any issues
+    if (result.hasWriteErrors()) {
+      const errors = result.getWriteErrors();
+      logger.warn(`Bulk write completed with ${errors.length} errors`, {
+        component: 'Database',
+        errors: errors.map(e => e.errmsg).slice(0, 5) // Limit to first 5 errors
+      });
+    }
+    
+  } catch (err) {
+    // If bulk write fails, retry individually
+    logger.debug('Bulk write failed, retrying individually', {
+      component: 'Database',
+      error: err instanceof Error ? err.message : String(err)
+    });
+    
+    for (const op of ops) {
       try {
-        const skipped = await this.enterViaButton(entry as GiveawayEntry, session);
-        if (skipped) {
-          await updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'skipped', {});
-          this.metrics.dbQueries++;
-          this.correlationTracker.completeTrace(correlationId, 'completed');
-          return;
+        if ('updateOne' in op) {
+          await giveawaysCol.updateOne(
+            op.updateOne.filter,
+            op.updateOne.update,
+            { upsert: op.updateOne.upsert }
+          );
         }
-
-        const entryTime = Date.now() - entryStartTime;
-        this.metrics.recordEntryTime(entryTime);
-        
-        session.stats.entered++;
-        session.stats.lastEntryAt = Date.now();
-        this.metrics.totalEntriesSucceeded++;
-
-        await updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'success', { 
-          attempts: attemptNum,
-        });
-        this.metrics.dbQueries++;
-        await incrementTokenEntries(session.userId, session.guildId);
-        await updateTokenLastUsed(session.userId, session.guildId);
-
-        this.joinOutcomeBuffer.push({
-          userId: session.userId,
-          messageId: entry.messageId,
-          channelId: entry.channelId,
-          guildId: entry.guildId,
-          status: 'success',
-          attempts: attemptNum,
-          entryTimeMs: entryTime,
-          correlationId,
-          timestamp: Date.now(),
-        });
-
-        this.updateGuildStats(entry.guildId, entry.guildName, 'entered', entry.detectionConfidence || 0);
-        this.updateAccountStats(session.userId, 'entered', entry.detectionConfidence || 0);
-
-        this.correlationTracker.completeTrace(correlationId, 'completed');
-
-        this.asyncLogger.info('✅ AutoJoin: Entered giveaway', {
-          correlationId,
-          userId: session.userId,
-          prize: truncate(entry.prize, 60),
-          attempts: attemptNum,
-          guild: entry.guildName,
-          worker: this.workerId,
-          time: `${entryTime}ms`,
-        });
-
-        this.emit('giveawayEntered', { entry, userId: session.userId, correlationId });
-        return;
-
-      } catch (error) {
-        const errorMsg = formatError(error);
-        const isNoResponse = errorMsg.includes('No response from Application') || 
-                            errorMsg.includes('No response from Application');
-
-        if (isNoResponse && attempt < maxAttempts - 1) {
-          this.noResponseCooldown.set(session.userId, Date.now() + NO_RESPONSE_COOLDOWN_MS);
-          await delay(2000);
-          try { await this.refreshButtonData(entry as GiveawayEntry, session); } catch {}
-          continue;
-        }
-
-        await updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'attempting', { 
-          attempts: attemptNum, 
-          lastError: errorMsg 
-        });
-        this.metrics.dbQueries++;
-        
-        this.asyncLogger.warn(`AutoJoin: Attempt ${attemptNum}/${maxAttempts} failed`, {
-          correlationId,
-          userId: session.userId,
-          entryId,
-          error: errorMsg,
-          worker: this.workerId,
+      } catch (individualErr) {
+        logger.error('Individual write failed', {
+          component: 'Database',
+          error: individualErr instanceof Error ? individualErr.message : String(individualErr)
         });
       }
     }
+  }
+}
 
-    // All retries exhausted - move to dead letter queue
-    const queueItem: QueueItem = {
-      entryId,
-      userId: session.userId,
-      guildId: entry.guildId,
-      channelId: entry.channelId,
-      messageId: entry.messageId,
-      priority: -1,
-      addedAt: Date.now(),
-      correlationId,
-      attempts: maxAttempts,
-      maxAttempts,
-      lastError: 'All retries exhausted',
-    };
+function chunkArray<T>(array: T[], size: number): T[][] {
+  const chunks: T[][] = [];
+  for (let i = 0; i < array.length; i += size) {
+    chunks.push(array.slice(i, i + size));
+  }
+  return chunks;
+}
 
-    this.joinQueue.moveToDeadLetter(queueItem, 'All retries exhausted');
+// ============================================================================
+// Public API - Giveaway Management
+// ============================================================================
 
-    await updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'dead_letter', {
-      lastError: 'All retries exhausted',
-      attempts: maxAttempts,
+export async function getDb(): Promise<Db> {
+  await ensureConnected();
+  return db;
+}
+
+export async function getTotalDetected(): Promise<number> {
+  return totalDetectedCount;
+}
+
+export async function insertGiveaway(
+  g: Omit<GiveawayData, 'id' | 'status' | 'notifiedAt' | 'lastSeenAt'>
+): Promise<boolean> {
+  // Input validation
+  if (!g.messageId || !g.channelId || !g.guildId) {
+    logger.warn('Invalid giveaway data', { component: 'Database', data: g });
+    return false;
+  }
+  
+  const key = cacheKey(g.messageId, g.channelId);
+  if (cache.has(key)) {
+    logger.debug('Giveaway already exists', { 
+      component: 'Database', 
+      messageId: g.messageId,
+      channelId: g.channelId 
     });
-    this.metrics.dbQueries++;
-    session.stats.failed++;
-    this.metrics.totalEntriesFailed++;
-
-    this.correlationTracker.completeTrace(correlationId, 'failed');
-
-    this.asyncLogger.error('❌ AutoJoin: All retries exhausted - moved to dead letter', {
-      correlationId,
-      userId: session.userId,
-      prize: truncate(entry.prize, 60),
-      attempts: entry.attempts,
-      worker: this.workerId,
-    });
-
-    this.emit('giveawayFailed', { entry, userId: session.userId, correlationId });
-  }
-
-  // -------------------------------------------------------------------------
-  // Button Interaction Methods - Based on working autoJoin.ts
-  // -------------------------------------------------------------------------
-
-  private async refreshButtonData(entry: GiveawayEntry, session: UserSession): Promise<GiveawayEntry | null> {
-    try {
-      const message = await this.fetchMessage(session.client, entry.channelId, entry.messageId);
-      if (!message) return null;
-      
-      const components = (message as any).components;
-      if (!components?.length) return null;
-      
-      const isKnownBot = this.detectionEngine.getProfile(entry.authorId) !== undefined;
-      const button = this.findEntryButton(components, isKnownBot);
-      if (button && button.customId !== entry.buttonCustomId) {
-        entry.buttonCustomId = button.customId;
-        return entry;
-      }
-      return entry;
-    } catch {
-      return null;
-    }
-  }
-
-  private findEntryButton(components: unknown[], isKnownBot: boolean): GiveawayButton | null {
-    for (const row of components) {
-      const rowAny = row as Record<string, unknown>;
-      const rowComps = rowAny['components'] as unknown[] | undefined;
-      if (!rowComps?.length) continue;
-
-      for (const comp of rowComps) {
-        const c = comp as Record<string, unknown>;
-        if (c['type'] !== 2 && c['type'] !== 'BUTTON') continue;
-        if (c['style'] === 5 || c['disabled'] === true) continue;
-
-        const customId = (c['customId'] ?? c['custom_id']) as string | undefined;
-        if (!customId) continue;
-
-        const label = ((c['label'] as string | undefined) ?? '').trim();
-
-        // Skip blocked buttons
-        if (BLOCKED_BUTTON_LABELS.some(re => re.test(label))) {
-          continue;
-        }
-
-        if (isKnownBot) {
-          if (customId.includes('giveaway') || customId.includes('enter') || customId.includes('join')) {
-            return { customId, label: label || customId, disabled: false };
-          }
-        }
-
-        if (TRUSTED_ENTRY_CUSTOM_IDS.has(customId)) {
-          return { customId, label: label || customId, disabled: false };
-        }
-
-        if (ENTRY_BUTTON_PATTERNS.some(re => re.test(label))) {
-          return { customId, label: label || 'Enter', disabled: false };
-        }
-      }
-    }
-    return null;
-  }
-
-  private async enterViaButton(entry: GiveawayEntry, session: UserSession): Promise<boolean> {
-    if (!entry.buttonCustomId) throw new Error('No buttonCustomId set');
-
-    if (CONFIG.buttonDelayMs > 0) await delay(CONFIG.buttonDelayMs);
-
-    const message = await this.fetchMessage(session.client, entry.channelId, entry.messageId);
-    if (!message) throw new Error(`Message ${entry.messageId} not found`);
-
-    let button = this.findButtonById(message, entry.buttonCustomId);
-    
-    if (!button) {
-      const components = (message as any).components;
-      if (components?.length) {
-        const isKnownBot = this.detectionEngine.getProfile(entry.authorId) !== undefined;
-        const foundButton = this.findEntryButton(components, isKnownBot);
-        if (foundButton) {
-          button = foundButton;
-          entry.buttonCustomId = button.customId;
-        }
-      }
-    }
-
-    if (!button || button.disabled) {
-      return true;
-    }
-
-    await session.rateLimiter.consume();
-    await this.clickButton(message, button, session);
     return false;
   }
 
-  private async clickButton(message: Message, button: GiveawayButton, session: UserSession): Promise<void> {
-    const selfbotMsg = message as Message & { clickButton?: (id: string) => Promise<unknown> };
-    
-    if (typeof selfbotMsg.clickButton === 'function') {
-      try {
-        await selfbotMsg.clickButton(button.customId);
-        return;
-      } catch (error) {
-        const errorMsg = formatError(error);
-        if (errorMsg.includes('No responsed from Application') || 
-            errorMsg.includes('No response from Application')) {
-          await this.postInteraction(message, button, session);
-          return;
-        }
-        throw error;
-      }
-    }
+  const doc: StoredGiveaway = {
+    messageId: g.messageId,
+    channelId: g.channelId,
+    guildId: g.guildId,
+    guildName: g.guildName || 'Unknown',
+    channelName: g.channelName || 'Unknown',
+    authorId: g.authorId,
+    prize: g.prize || 'Unknown Prize',
+    detectedAt: g.detectedAt || Date.now(),
+    endsAt: g.endsAt ?? null,
+    status: 'active',
+    notifiedAt: null,
+    lastSeenAt: Date.now(),
+    notificationStatus: 'pending',
+    version: 1,
+  };
 
-    await this.postInteraction(message, button, session);
+  const now = Date.now();
+  const entry: CacheEntry = {
+    doc,
+    timestamp: now,
+    version: 1,
+  };
+
+  cache.set(key, entry);
+  
+  // Update active cache
+  if (doc.status === 'active' && (doc.endsAt === null || doc.endsAt > now)) {
+    activeGiveawaysCache.set(key, doc);
   }
-
-  private async postInteraction(message: Message, button: GiveawayButton, session: UserSession): Promise<void> {
-    if (this.apiCircuitBreaker.isOpen()) {
-      throw new Error(`Circuit breaker is open (${this.apiCircuitBreaker.getState()})`);
-    }
-
-    await this.apiCircuitBreaker.execute(async () => {
-      const client = message.client as any;
-      const sessionId: string | undefined = client.ws?.shards?.first?.()?.sessionId
-        ?? client.ws?.shards?.get?.(0)?.sessionId;
-
-      if (!sessionId) {
-        throw new Error('No active gateway session ID available');
-      }
-      
-      const nonce = `${Date.now()}${Math.random().toString(36).slice(2, 8)}`;
-      const applicationId = message.author?.id || 
-        (message as any).applicationId || 
-        (message as any).webhookId ||
-        (message as any).interaction?.application_id;
-
-      if (!applicationId) {
-        throw new Error('Could not determine application ID for interaction');
-      }
-
-      const payload = {
-        type: 3,
-        nonce,
-        guild_id: message.guild?.id ?? null,
-        channel_id: message.channel.id,
-        message_id: message.id,
-        application_id: applicationId,
-        session_id: sessionId,
-        message_flags: 0,
-        data: {
-          component_type: 2,
-          custom_id: button.customId,
-        },
-      };
-
-      const token = (message.client as any).token as string;
-
-      for (let attempt = 0; attempt < INTERACTION_RETRY_ATTEMPTS; attempt++) {
-        try {
-          if (attempt > 0) await delay(INTERACTION_RETRY_DELAY_MS * attempt);
-
-          const startTime = Date.now();
-          const response = await this.http.post('https://discord.com/api/v10/interactions', payload, {
-            headers: {
-              'Authorization': token,
-              'Content-Type': 'application/json',
-              'Accept': 'application/json',
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-              'X-Discord-Locale': 'en-US',
-            },
-            timeout: 15000,
-          });
-          
-          this.metrics.apiCalls++;
-          this.metrics.recordApiLatency(Date.now() - startTime);
-
-          if (response.status === 204 || response.status === 200 || response.status === 201) {
-            return;
-          }
-
-        } catch (error) {
-          this.metrics.apiCalls++;
-          this.metrics.apiErrors++;
-          
-          const axiosErr = error as { response?: { status?: number; data?: { retry_after?: number; message?: string } } };
-          const status = axiosErr.response?.status;
-          const errorMessage = axiosErr.response?.data?.message;
-
-          if (errorMessage?.includes('No response') || errorMessage?.includes('no response')) {
-            if (attempt === INTERACTION_RETRY_ATTEMPTS - 1) {
-              throw new Error(`No response from Application after ${INTERACTION_RETRY_ATTEMPTS} attempts`);
-            }
-            if (attempt === 1) {
-              payload.nonce = `${Date.now()}${Math.random().toString(36).slice(2, 8)}`;
-              payload.session_id = `${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
-            }
-            continue;
-          }
-
-          if (status === 429) {
-            const retryAfterMs = Math.ceil((axiosErr.response?.data?.retry_after ?? 1) * 1000);
-            await delay(retryAfterMs);
-            continue;
-          }
-
-          if (status === 401 || status === 403) {
-            this.asyncLogger.error('Token appears to be blocked or invalid', { 
-              userId: session.userId, 
-              status 
-            });
-            await setTokenActive(session.userId, session.guildId, false);
-            throw new Error(`Token ${status === 401 ? 'invalid' : 'blocked'}`);
-          }
-
-          if (status === 404 || errorMessage?.includes('unknown interaction')) {
-            throw new Error('Interaction expired or button no longer exists');
-          }
-
-          if (status === 502 || status === 504 || status === 500) {
-            if (attempt === INTERACTION_RETRY_ATTEMPTS - 1) throw error;
-            continue;
-          }
-
-          if (attempt === INTERACTION_RETRY_ATTEMPTS - 1) throw error;
-        }
-      }
-
-      throw new Error(`Failed to send interaction after ${INTERACTION_RETRY_ATTEMPTS} attempts`);
-    });
+  
+  // Update guild cache
+  if (!guildGiveawaysCache.has(doc.guildId)) {
+    guildGiveawaysCache.set(doc.guildId, new Set());
   }
-
-  private findButtonById(message: Message, customId: string): GiveawayButton | null {
-    const msgAny = message as unknown as Record<string, unknown>;
-    const components = msgAny['components'] as unknown[] | undefined;
-    if (!components) return null;
-
-    for (const row of components) {
-      const rowAny = row as Record<string, unknown>;
-      const rowComps = rowAny['components'] as unknown[] | undefined;
-      if (!rowComps) continue;
-
-      for (const comp of rowComps) {
-        const c = comp as Record<string, unknown>;
-        const id = (c['customId'] ?? c['custom_id']) as string | undefined;
-        if (id !== customId) continue;
-        return {
-          customId: id,
-          label: ((c['label'] as string | undefined) ?? ''),
-          disabled: (c['disabled'] as boolean | undefined) ?? false,
-        };
-      }
-    }
-    return null;
-  }
-
-  // -------------------------------------------------------------------------
-  // Win Detection - Based on working autoJoin.ts
-  // -------------------------------------------------------------------------
-
-  private async handleWin(message: Message, userId: string): Promise<void> {
-    if (!message.guild || !message.author?.bot) return;
-
-    const myId = message.client.user?.id;
-    if (!myId) return;
-
-    const mentionedInUsers = message.mentions?.users?.has(myId) ?? false;
-    const mentionedInContent = (message.content ?? '').includes(myId);
-    if (!mentionedInUsers && !mentionedInContent) return;
-
-    const allText = this.extractAllText(message);
-    if (!WIN_PATTERNS.some(re => re.test(allText))) return;
-
-    const dedupKey = `${message.channel.id}:${message.author?.id ?? 'unknown'}`;
-    if (this.recentWins.get(dedupKey) !== undefined) return;
-    this.recentWins.set(dedupKey, Date.now());
-
-    const session = this.findSessionByUserId(userId);
-    if (session) {
-      session.stats.wins++;
-      this.updateGuildStats(message.guild.id, message.guild.name, 'wins');
-      this.updateAccountStats(userId, 'wins');
-    }
-    this.metrics.totalWinsDetected++;
-
-    await incrementTokenWins(userId, session?.guildId || '');
-
-    const prize = this.extractPrize(message);
-    const sourceName = `#${(message.channel as { name?: string }).name ?? message.channel.id} in ${message.guild.name}`;
-
-    this.asyncLogger.info('🏆 AutoJoin: WIN DETECTED!', {
-      userId,
-      prize,
-      source: sourceName,
-      guild: message.guild.name,
-      worker: this.workerId,
-    });
-
-    await this.sendWinWebhook(message, prize, sourceName, userId);
-    this.emit('giveawayWon', { message, prize, userId });
-  }
-
-  private async handleDmWin(message: Message, userId: string): Promise<void> {
-    if (message.guild) return;
-
-    const allText = this.extractAllText(message);
-    if (!WIN_PATTERNS.some(re => re.test(allText))) return;
-
-    const session = this.findSessionByUserId(userId);
-    if (session) {
-      session.stats.wins++;
-      this.updateAccountStats(userId, 'wins');
-    }
-    this.metrics.totalWinsDetected++;
-
-    await incrementTokenWins(userId, session?.guildId || '');
-
-    const prize = this.extractPrize(message);
-
-    this.asyncLogger.info('🏆 AutoJoin: WIN DETECTED (DM)!', { 
-      userId, 
-      prize,
-      worker: this.workerId,
-    });
-
-    await this.sendWinWebhook(message, prize, 'Direct Message', userId);
-    this.emit('giveawayWon', { message, prize, userId, source: 'dm' });
-  }
-
-  // -------------------------------------------------------------------------
-  // Webhooks
-  // -------------------------------------------------------------------------
-
-  private async sendWinWebhook(message: Message, prize: string, sourceName: string, userId: string): Promise<void> {
-    const session = this.findSessionByUserId(userId);
-    const guildId = session?.guildId || '';
-
-    let url: string | null = null;
-    try {
-      url = await getUserWebhook(userId, guildId);
-    } catch {}
-
-    if (!url) url = CONFIG.winWebhookUrl || CONFIG.webhookUrl || null;
-    if (!url) return;
-
-    const guildName = message.guild?.name ?? 'Direct Message';
-    const jumpUrl = message.guild
-      ? `https://discord.com/channels/${message.guild.id}/${message.channel.id}/${message.id}`
-      : null;
-
-    try {
-      await this.http.post(url, {
-        content: '@everyone',
-        username: '🎉 AutoJoin WIN',
-        embeds: [{
-          title: '🏆 GIVEAWAY WIN!',
-          description: jumpUrl ? `[Jump to message](${jumpUrl})` : 'Won via Direct Message',
-          color: 0xFFD700,
-          fields: [
-            { name: '🎁 Prize', value: prize || 'Unknown', inline: false },
-            { name: '🏠 Server', value: guildName, inline: true },
-            { name: '📢 Source', value: sourceName, inline: true },
-            { name: '👤 User', value: `<@${userId}>`, inline: true },
-            { name: '⏰ Won At', value: formatTimestamp(Date.now()), inline: false },
-          ],
-          footer: { text: `AutoJoin • ${url === CONFIG.winWebhookUrl || url === CONFIG.webhookUrl ? 'Global' : 'Personal'} Webhook` },
-          timestamp: new Date().toISOString(),
-        }],
-      }, { timeout: 8000 });
-    } catch (error) {
-      this.asyncLogger.warn('Win webhook failed', { userId, error: formatError(error) });
-    }
-  }
-
-  // -------------------------------------------------------------------------
-  // Stats Tracking
-  // -------------------------------------------------------------------------
-
-  private updateGuildStats(
-    guildId: string, 
-    guildName: string, 
-    stat: 'detected' | 'entered' | 'failed' | 'wins' | 'falsePositives',
-    confidence?: number
-  ): void {
-    if (!this.guildStats.has(guildId)) {
-      this.guildStats.set(guildId, {
-        guildId,
-        guildName,
-        detected: 0,
-        entered: 0,
-        failed: 0,
-        wins: 0,
-        falsePositives: 0,
-        averageConfidence: 0,
-        averageQueueWaitMs: 0,
-      });
-    }
-
-    const stats = this.guildStats.get(guildId)!;
-    stats[stat]++;
-
-    if (confidence !== undefined && stat === 'detected') {
-      stats.averageConfidence = 
-        (stats.averageConfidence * (stats.detected - 1) + confidence) / stats.detected;
-    }
-  }
-
-  private updateAccountStats(
-    userId: string, 
-    stat: 'detected' | 'entered' | 'failed' | 'wins' | 'falsePositives',
-    confidence?: number,
-    detectionMs?: number
-  ): void {
-    if (!this.accountStats.has(userId)) {
-      this.accountStats.set(userId, {
-        userId,
-        detected: 0,
-        entered: 0,
-        failed: 0,
-        wins: 0,
-        falsePositives: 0,
-        averageConfidence: 0,
-        averageDetectionMs: 0,
-        averageQueueWaitMs: 0,
-        reconnectCount: 0,
-      });
-    }
-
-    const stats = this.accountStats.get(userId)!;
-    stats[stat]++;
-
-    if (detectionMs !== undefined && stat === 'detected') {
-      stats.averageDetectionMs = 
-        (stats.averageDetectionMs * (stats.detected - 1) + detectionMs) / stats.detected;
-    }
-  }
-
-  // -------------------------------------------------------------------------
-  // Health Check System
-  // -------------------------------------------------------------------------
-
-  private startHealthChecker(): void {
-    this.healthCheckInterval = setInterval(async () => {
-      if (this.isShuttingDown) return;
-
-      for (const [_, session] of this.sessions) {
-        if (!session.isActive || session.destroyed) continue;
-
-        try {
-          const client = session.client as any;
-          const isConnected = client.isReady() && 
-                             client.ws?.connection?.readyState === 1;
-          
-          if (isConnected) {
-            session.lastHealthCheck = Date.now();
-            session.stallCount = 0;
-          }
-        } catch (error) {
-          this.asyncLogger.error('Health check error', {
-            userId: session.userId,
-            error: formatError(error),
-          });
-        }
-      }
-    }, HEALTH_CHECK_INTERVAL_MS);
-
-    if (this.healthCheckInterval.unref) this.healthCheckInterval.unref();
-  }
-
-  private startStallChecker(): void {
-    this.stallCheckInterval = setInterval(() => {
-      if (this.isShuttingDown) return;
-
-      const now = Date.now();
-      for (const [_, session] of this.sessions) {
-        if (!session.isActive || session.destroyed) continue;
-
-        if (now - session.lastHealthCheck > STALL_TIMEOUT_MS) {
-          session.stallCount++;
-          
-          this.asyncLogger.error('Worker stall detected', {
-            userId: session.userId,
-            sessionId: session.sessionId,
-            stallCount: session.stallCount,
-          });
-
-          if (session.stallCount >= 3) {
-            this.asyncLogger.error('Auto-recovering stalled worker', {
-              userId: session.userId,
-              sessionId: session.sessionId,
-            });
-            
-            this.stopSession(session.userId, session.guildId).then(() => {
-              setTimeout(() => {
-                this.startSession(session.userId, session.guildId);
-              }, 5000);
-            });
-          }
-        }
-      }
-    }, STALL_TIMEOUT_MS / 2);
-
-    if (this.stallCheckInterval.unref) this.stallCheckInterval.unref();
-  }
-
-  // -------------------------------------------------------------------------
-  // Batch Database Writer
-  // -------------------------------------------------------------------------
-
-  private startBatchDbWriter(): void {
-    this.batchDbInterval = setInterval(async () => {
-      if (this.isShuttingDown || this.joinOutcomeBuffer.length === 0) return;
-
-      const outcomes = this.joinOutcomeBuffer.splice(0, this.joinOutcomeBuffer.length);
-      const confidences = this.detectionConfidenceBuffer.splice(0, this.detectionConfidenceBuffer.length);
-
-      try {
-        if (outcomes.length > 0) {
-          await batchSaveJoinOutcomes(outcomes);
-          this.metrics.dbQueries++;
-        }
-        if (confidences.length > 0) {
-          await batchUpdateDetectionConfidence(confidences);
-          this.metrics.dbQueries++;
-        }
-      } catch (error) {
-        this.asyncLogger.error('Batch DB write failed', { error: formatError(error) });
-        this.joinOutcomeBuffer.push(...outcomes.slice(0, 100));
-        this.detectionConfidenceBuffer.push(...confidences.slice(0, 100));
-      }
-    }, BATCH_DB_WRITE_INTERVAL_MS);
-
-    if (this.batchDbInterval.unref) this.batchDbInterval.unref();
-  }
-
-  private startArchiveInterval(): void {
-    this.archiveInterval = setInterval(async () => {
-      if (this.isShuttingDown) return;
-      
-      try {
-        const archived = await archiveOldGiveaways(ARCHIVE_AGE_MS);
-        if (archived > 0) {
-          this.asyncLogger.info(`Archived ${archived} old giveaways`);
-        }
-      } catch (error) {
-        // Silently fail
-      }
-    }, 60 * 60 * 1000);
-
-    if (this.archiveInterval.unref) this.archiveInterval.unref();
-  }
-
-  private startQueuePersister(): void {
-    this.queuePersistInterval = setInterval(() => {
-      if (this.isShuttingDown) return;
-      this.joinQueue.persist().catch(() => {});
-    }, QUEUE_PERSIST_INTERVAL_MS);
-
-    if (this.queuePersistInterval.unref) this.queuePersistInterval.unref();
-  }
-
-  // -------------------------------------------------------------------------
-  // Helpers
-  // -------------------------------------------------------------------------
-
-  private extractCrosspostId(message: Message): string | undefined {
-    const match = (message.content || '').match(/https:\/\/discord\.com\/channels\/(\d+)\/(\d+)\/(\d+)/);
-    if (match) {
-      return `${match[1]}:${match[2]}:${match[3]}`;
-    }
-    
-    if ((message as any).crosspostReference?.messageId) {
-      const ref = (message as any).crosspostReference;
-      return `${ref.guildId || ''}:${ref.channelId}:${ref.messageId}`;
-    }
-    
-    return undefined;
-  }
-
-  private extractPrize(message: Message): string {
-    const embed = message.embeds?.[0];
-    if (embed?.title) return this.cleanText(embed.title);
-    if (embed?.description) return this.cleanText(embed.description);
-    if (message.content) return this.cleanText(message.content);
-    return 'Unknown Prize';
-  }
-
-  private extractAllText(message: Message): string {
-    return [
-      message.content ?? '',
-      ...message.embeds.flatMap(e => [
-        e.title ?? '',
-        e.description ?? '',
-        e.footer?.text ?? '',
-        ...(e.fields ?? []).flatMap(f => [f.name, f.value]),
-      ]),
-    ].join(' ');
-  }
-
-  private extractEndTimestamp(message: Message): number | undefined {
-    const allText = this.extractAllText(message);
-    const match = allText.match(/<t:(\d{10,13})(?::[a-zA-Z])?>/);
-    if (!match?.[1]) return undefined;
-    const raw = parseInt(match[1], 10);
-    const tsMs = raw < 1e12 ? raw * 1000 : raw;
-    return Number.isFinite(tsMs) && tsMs > Date.now() ? tsMs : undefined;
-  }
-
-  private cleanText(text: string): string {
-    return truncate(sanitizeForLog(text), 200);
-  }
-
-  private async fetchMessage(client: Client, channelId: string, messageId: string): Promise<Message | null> {
-    try {
-      const channel = await client.channels.fetch(channelId);
-      if (!channel || !('messages' in channel)) return null;
-      return await (channel as TextChannel).messages.fetch(messageId);
-    } catch {
-      return null;
-    }
-  }
-
-  private makeEntryId(session: UserSession, message: Message): string {
-    return `${session.userId}:${message.channel.id}:${message.id}`;
-  }
-
-  private makeEntryIdFromMessage(userId: string, channelId: string, messageId: string): string {
-    return `${userId}:${channelId}:${messageId}`;
-  }
-
-  private findSessionByUserId(userId: string): UserSession | null {
-    for (const [key, session] of this.sessions) {
-      if (session.userId === userId) {
-        return session;
-      }
-    }
-    return null;
-  }
-
-  // -------------------------------------------------------------------------
-  // Interval Starters
-  // -------------------------------------------------------------------------
-
-  private startSessionRefresher(): void {
-    this.refreshInterval = setInterval(() => {
-      if (!this.isShuttingDown && this.checkMemory()) {
-        this.refreshSessions().catch((error) => {
-          this.asyncLogger.error('Session refresh failed', { error: formatError(error) });
-        });
-      }
-    }, SESSION_REFRESH_INTERVAL_MS);
-    if (this.refreshInterval.unref) this.refreshInterval.unref();
-  }
-
-  private startCleanupInterval(): void {
-    this.cleanupInterval = setInterval(async () => {
-      if (this.isShuttingDown) return;
-      try {
-        for (const [_, session] of this.sessions) {
-          await cleanupAutoJoinEntries(session.userId);
-        }
-      } catch {}
-    }, 5 * 60_000);
-    if (this.cleanupInterval.unref) this.cleanupInterval.unref();
-  }
-
-  private startMemoryCheck(): void {
-    this.memoryCheckInterval = setInterval(() => {
-      if (this.isShuttingDown) return;
-      
-      const mem = this.getMemoryUsage();
-      
-      if (Math.random() < 0.02) {
-        this.asyncLogger.debug('💾 Memory status', {
-          worker: this.workerId,
-          ...mem,
-          sessions: this.sessions.size,
-          cacheSize: this.processedMessages.size,
-        });
-      }
-      
-      this.checkMemory();
-    }, 30_000);
-    if (this.memoryCheckInterval.unref) this.memoryCheckInterval.unref();
-  }
-
-  private startReconnectChecker(): void {
-    this.reconnectCheckInterval = setInterval(() => {
-      if (!this.isShuttingDown && this.checkMemory()) {
-        this.retryFailedSessions().catch((error) => {
-          this.asyncLogger.error('Reconnect check failed', { error: formatError(error) });
-        });
-      }
-    }, RECONNECT_DELAY_MS);
-    if (this.reconnectCheckInterval.unref) this.reconnectCheckInterval.unref();
-  }
-
-  private startCacheCleaner(): void {
-    this.cacheCleanInterval = setInterval(() => {
-      if (this.isShuttingDown) return;
-      
-      const cleaned = [
-        this.processedMessages.clean(),
-        this.processingCache.clean(),
-        this.recentWins.clean(),
-        this.noResponseCooldown.clean(),
-        this.crosspostCache.clean(),
-        this.globalProcessedMessages.clean(),
-      ].reduce((a, b) => a + b, 0);
-      
-      if (cleaned > 0) {
-        this.asyncLogger.debug(`🧹 Cache cleaner: removed ${cleaned} expired entries`, {
-          worker: this.workerId,
-        });
-      }
-    }, 60_000);
-    if (this.cacheCleanInterval.unref) this.cacheCleanInterval.unref();
-  }
-
-  private startMetricsInterval(): void {
-    this.metricsInterval = setInterval(() => {
-      if (this.isShuttingDown) return;
-      this.logStats();
-    }, 5 * 60_000);
-    if (this.metricsInterval.unref) this.metricsInterval.unref();
-  }
-
-  private logStats(): void {
-    const stats = this.getStats();
-    const mem = stats.memory;
-    
-    this.asyncLogger.info('📊 AutoJoin Stats', {
-      worker: this.workerId,
-      sessions: `${stats.activeSessions}/${stats.totalSessions} active`,
-      memory: `${mem.heapUsedMB}MB / 8000MB (${mem.percentageUsed}%)`,
-      detected: stats.totalDetected,
-      entered: stats.totalEntered,
-      wins: stats.totalWins,
-      queue: stats.queue,
-      caches: stats.caches,
-      metrics: stats.metrics,
-      health: stats.healthStatus,
-      circuitBreaker: stats.circuitBreakerState,
-      uptime: `${stats.uptime}m`,
-      activeTraces: stats.correlation.activeTraces,
-    });
-  }
-
-  // -------------------------------------------------------------------------
-  // Stats and Health
-  // -------------------------------------------------------------------------
-
-  getStats() {
-    const sessionStats: Array<{ userId: string; guildId: string; stats: SessionStats }> = [];
-    let active = 0;
-    let totalDetected = 0;
-    let totalEntered = 0;
-    let totalWins = 0;
-    
-    for (const [key, session] of this.sessions) {
-      if (session.isActive && !session.destroyed) active++;
-      sessionStats.push({ 
-        userId: session.userId, 
-        guildId: session.guildId,
-        stats: { ...session.stats } 
-      });
-      totalDetected += session.stats.detected;
-      totalEntered += session.stats.entered;
-      totalWins += session.stats.wins;
-    }
-    
-    const mem = this.getMemoryUsage();
-    const metrics = this.metrics.getMetrics();
-    
-    return {
-      totalSessions: this.sessions.size,
-      activeSessions: active,
-      totalDetected,
-      totalEntered,
-      totalWins,
-      sessionStats,
-      worker: this.workerId,
-      healthStatus: this.healthStatus,
-      circuitBreakerState: this.apiCircuitBreaker.getState(),
-      caches: {
-        processedMessages: this.processedMessages.size,
-        processing: this.processingCache.size,
-        recentWins: this.recentWins.size,
-        noResponseCooldown: this.noResponseCooldown.size,
-        tokenCache: this.tokenManager.getCacheStats(),
-        crosspostCache: this.crosspostCache.size,
-        globalProcessed: this.globalProcessedMessages.size,
-      },
-      memory: {
-        heapUsedMB: mem.heapUsedMB,
-        heapTotalMB: mem.heapTotalMB,
-        rssMB: mem.rssMB,
-        percentageUsed: Math.round((mem.heapUsedMB / 8000) * 100),
-      },
-      metrics: {
-        averageDetectionTime: metrics.averageDetectionTime,
-        averageEntryTime: metrics.averageEntryTime,
-        apiCalls: metrics.apiCalls,
-        apiErrors: metrics.apiErrors,
-        cacheHits: metrics.cacheHits,
-        cacheMisses: metrics.cacheMisses,
-        dbQueries: metrics.dbQueries,
-      },
-      logStats: this.asyncLogger.getStats(),
-      sessionStartPromises: this.sessionStartPromises.size,
-      uptime: Math.round((Date.now() - metrics.startTime) / 1000 / 60),
-      
-      queue: this.joinQueue.getStats(),
-      detection: this.detectionEngine.getStats(),
-      watchlist: this.watchlistManager.getStats(),
-      correlation: {
-        activeTraces: this.correlationTracker.getActiveTraceCount(),
-      },
-      guildStats: Array.from(this.guildStats.values()),
-      accountStats: Array.from(this.accountStats.values()),
-      reconnectCounts: Array.from(this.reconnectCount.entries()).map(([userId, count]) => ({
-        userId,
-        count,
-      })),
-      batchBuffers: {
-        joinOutcomes: this.joinOutcomeBuffer.length,
-        detectionConfidence: this.detectionConfidenceBuffer.length,
-      },
-    };
-  }
-
-  getHealth(): { status: string; details: any } {
-    const stats = this.getStats();
-    return {
-      status: this.healthStatus,
-      details: {
-        sessions: stats.activeSessions,
-        memory: stats.memory,
-        circuitBreaker: stats.circuitBreakerState,
-        queue: stats.queue,
-        uptime: stats.uptime,
-      },
-    };
-  }
-
-  async shutdown(): Promise<void> {
-    if (this.isShuttingDown) {
-      this.asyncLogger.debug('Shutdown already in progress', { worker: this.workerId });
-      return;
-    }
-    
-    this.isShuttingDown = true;
-
-    this.asyncLogger.info('🛑 Shutting down Enhanced AutoJoinManager...', {
-      worker: this.workerId,
-      sessions: this.sessions.size,
-      queueSize: this.joinQueue.getTotalSize(),
-      pendingStarts: this.sessionStartPromises.size,
-      activeTraces: this.correlationTracker.getActiveTraceCount(),
-    });
-
-    // Clear all intervals first
-    [
-      this.refreshInterval, this.cleanupInterval, this.memoryCheckInterval,
-      this.reconnectCheckInterval, this.cacheCleanInterval, this.metricsInterval,
-      this.healthCheckInterval, this.queuePersistInterval, this.stallCheckInterval,
-      this.batchDbInterval, this.archiveInterval,
-    ].forEach(interval => {
-      if (interval) { clearInterval(interval); }
-    });
-
-    // Persist queue state
-    await this.joinQueue.persist();
-
-    // Flush batch buffers
-    if (this.joinOutcomeBuffer.length > 0 || this.detectionConfidenceBuffer.length > 0) {
-      try {
-        await batchSaveJoinOutcomes(this.joinOutcomeBuffer);
-        await batchUpdateDetectionConfidence(this.detectionConfidenceBuffer);
-      } catch {}
-      this.joinOutcomeBuffer = [];
-      this.detectionConfidenceBuffer = [];
-    }
-
-    // Wait for pending session starts
-    if (this.sessionStartPromises.size > 0) {
-      this.asyncLogger.info(`Waiting for ${this.sessionStartPromises.size} pending session starts...`);
-      try {
-        await Promise.race([
-          Promise.allSettled(this.sessionStartPromises.values()),
-          delay(5000),
-        ]);
-      } catch {}
-      this.sessionStartPromises.clear();
-    }
-
-    // Stop all sessions
-    const sessionsToStop = Array.from(this.sessions.values());
-    
-    for (const session of sessionsToStop) {
-      session.destroyed = true;
-      session.isActive = false;
-      
-      if (session.heartbeatInterval) {
-        clearInterval(session.heartbeatInterval);
-        session.heartbeatInterval = undefined;
-      }
-      
-      this.cleanupSessionListeners(session);
-      
-      try {
-        await (session.client as any).destroy();
-      } catch {}
-      
-      this.sessions.delete(this.makeSessionKey(session.userId, session.guildId));
-      this.sessionsByUserId.delete(`${session.userId}:${session.guildId}`);
-      this.tokenManager.clearCache(session.userId, session.guildId);
-    }
-
-    // Clear everything
-    this.sessions.clear();
-    this.sessionsByUserId.clear();
-    this.processedMessages.clear();
-    this.processingCache.clear();
-    this.recentWins.clear();
-    this.noResponseCooldown.clear();
-    this.crosspostCache.clear();
-    this.globalProcessedMessages.clear();
-    this.tokenManager.clearAll();
-    this.sessionStartPromises.clear();
-    this.guildStats.clear();
-    this.accountStats.clear();
-    this.reconnectCount.clear();
-    
-    this.asyncLogger.shutdown();
-    
-    if (global.gc) {
-      global.gc();
-    }
-    
-    this.asyncLogger.info('✅ AutoJoin shutdown complete', { 
-      worker: this.workerId,
-      memory: this.getMemoryUsage(),
-    });
+  guildGiveawaysCache.get(doc.guildId)!.add(key);
+  
+  totalDetectedCount++;
+  dirtyTotal = true;
+  markDirty(key);
+
+  logger.debug('Giveaway inserted', { 
+    component: 'Database', 
+    messageId: g.messageId,
+    prize: g.prize?.substring(0, 50) 
+  });
+
+  return true;
+}
+
+export async function wasNotifiedRecently(
+  messageId: string,
+  channelId: string,
+  cooldownSeconds: number
+): Promise<boolean> {
+  const entry = cache.get(cacheKey(messageId, channelId));
+  if (!entry || !entry.doc.notifiedAt) return false;
+  return Date.now() - entry.doc.notifiedAt < cooldownSeconds * 1000;
+}
+
+export async function markNotified(messageId: string, channelId: string): Promise<void> {
+  const key = cacheKey(messageId, channelId);
+  const entry = cache.get(key);
+  if (entry) {
+    entry.doc.notifiedAt = Date.now();
+    entry.doc.notificationStatus = 'sent';
+    entry.doc.notificationSentAt = Date.now();
+    entry.timestamp = Date.now();
+    entry.version++;
+    markDirty(key);
   }
 }
+
+export async function updateLastSeen(messageId: string, channelId: string): Promise<void> {
+  const key = cacheKey(messageId, channelId);
+  const entry = cache.get(key);
+  if (entry) {
+    entry.doc.lastSeenAt = Date.now();
+    entry.timestamp = Date.now();
+    entry.version++;
+    markDirty(key);
+  }
+}
+
+export async function markEnded(messageId: string, channelId: string): Promise<void> {
+  const key = cacheKey(messageId, channelId);
+  const entry = cache.get(key);
+  if (entry) {
+    entry.doc.status = 'ended';
+    entry.timestamp = Date.now();
+    entry.version++;
+    // Remove from active cache
+    activeGiveawaysCache.delete(key);
+    markDirty(key);
+  }
+}
+
+export async function setNotificationMessageId(
+  giveawayMessageId: string,
+  channelId: string,
+  notificationMessageId: string
+): Promise<void> {
+  const key = cacheKey(giveawayMessageId, channelId);
+  const entry = cache.get(key);
+  if (entry) {
+    entry.doc.notificationMessageId = notificationMessageId;
+    entry.timestamp = Date.now();
+    entry.version++;
+    markDirty(key);
+  }
+}
+
+export async function updateNotificationStatus(
+  messageId: string,
+  channelId: string,
+  fields: {
+    notificationStatus?: string;
+    notificationSentAt?: number;
+    notificationMessageId?: string;
+    notificationError?: string;
+  }
+): Promise<void> {
+  const key = cacheKey(messageId, channelId);
+  const entry = cache.get(key);
+  if (entry) {
+    if (fields.notificationStatus !== undefined) entry.doc.notificationStatus = fields.notificationStatus;
+    if (fields.notificationSentAt !== undefined) entry.doc.notificationSentAt = fields.notificationSentAt;
+    if (fields.notificationMessageId !== undefined) entry.doc.notificationMessageId = fields.notificationMessageId;
+    if (fields.notificationError !== undefined) entry.doc.notificationError = fields.notificationError;
+    entry.timestamp = Date.now();
+    entry.version++;
+    markDirty(key);
+  }
+}
+
+export async function getGiveaway(messageId: string, channelId: string): Promise<GiveawayData | null> {
+  const key = cacheKey(messageId, channelId);
+  const entry = cache.get(key);
+  if (entry) {
+    cacheHits++;
+    return rowToGiveaway(entry.doc);
+  }
+  cacheMisses++;
+  return null;
+}
+
+export async function getActiveGiveaways(limit: number = 50): Promise<GiveawayData[]> {
+  const now = Date.now();
+  const active: StoredGiveaway[] = [];
+  
+  // First try active cache
+  for (const [key, doc] of activeGiveawaysCache) {
+    if (doc.status === 'active' && (doc.endsAt === null || doc.endsAt > now)) {
+      active.push(doc);
+    } else {
+      // Remove stale entries
+      activeGiveawaysCache.delete(key);
+    }
+  }
+  
+  // If we have enough active entries, return them
+  if (active.length >= limit) {
+    return active
+      .sort((a, b) => b.detectedAt - a.detectedAt)
+      .slice(0, limit)
+      .map(rowToGiveaway);
+  }
+  
+  // Otherwise, scan the full cache
+  for (const entry of cache.values()) {
+    const d = entry.doc;
+    if (d.status === 'active' && (d.endsAt === null || d.endsAt > now)) {
+      active.push(d);
+      // Update active cache
+      activeGiveawaysCache.set(cacheKey(d.messageId, d.channelId), d);
+    }
+  }
+  
+  return active
+    .sort((a, b) => b.detectedAt - a.detectedAt)
+    .slice(0, limit)
+    .map(rowToGiveaway);
+}
+
+export async function getGuildGiveaways(guildId: string, limit: number = 50): Promise<GiveawayData[]> {
+  const guildSet = guildGiveawaysCache.get(guildId);
+  if (!guildSet) return [];
+  
+  const giveaways: StoredGiveaway[] = [];
+  for (const key of guildSet) {
+    const entry = cache.get(key);
+    if (entry) {
+      giveaways.push(entry.doc);
+    }
+  }
+  
+  return giveaways
+    .sort((a, b) => b.detectedAt - a.detectedAt)
+    .slice(0, limit)
+    .map(rowToGiveaway);
+}
+
+export async function getAllGiveaways(limit: number = 100): Promise<GiveawayData[]> {
+  return Array.from(cache.values())
+    .map(e => e.doc)
+    .sort((a, b) => b.detectedAt - a.detectedAt)
+    .slice(0, limit)
+    .map(rowToGiveaway);
+}
+
+export async function getStats(): Promise<GiveawayStats> {
+  const now = Date.now();
+  let active = 0;
+  let last: number | null = null;
+  const guildIds = new Set<string>();
+  
+  // Use active cache for active count
+  active = activeGiveawaysCache.size;
+  
+  // Get guild stats and last detected
+  for (const entry of cache.values()) {
+    const d = entry.doc;
+    guildIds.add(d.guildId);
+    if (last === null || d.detectedAt > last) last = d.detectedAt;
+  }
+
+  return {
+    totalDetected: totalDetectedCount,
+    activeGiveaways: active,
+    serversWithGiveaways: guildIds.size,
+    lastDetected: last,
+  };
+}
+
+export async function resetDatabase(): Promise<void> {
+  cache.clear();
+  activeGiveawaysCache.clear();
+  guildGiveawaysCache.clear();
+  totalDetectedCount = 0;
+  dirtyTotal = false;
+  dirtyKeys.clear();
+  pendingDeletes.clear();
+
+  if (connected) {
+    await giveawaysCol.deleteMany({});
+    await countersCol.updateOne(
+      { _id: 'total_detected' }, 
+      { $set: { total: 0, lastUpdated: Date.now() } }, 
+      { upsert: true }
+    );
+  }
+
+  logger.warn('Database reset', { component: 'Database' });
+}
+
+export async function cleanupOldGiveaways(days: number = 30): Promise<number> {
+  const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+  let removed = 0;
+  
+  for (const [key, entry] of cache) {
+    const d = entry.doc;
+    if (d.status !== 'active' && d.detectedAt < cutoff) {
+      cache.delete(key);
+      activeGiveawaysCache.delete(key);
+      const guildSet = guildGiveawaysCache.get(d.guildId);
+      if (guildSet) {
+        guildSet.delete(key);
+        if (guildSet.size === 0) {
+          guildGiveawaysCache.delete(d.guildId);
+        }
+      }
+      dirtyKeys.delete(key);
+      removed++;
+    }
+  }
+  
+  if (removed > 0) {
+    logger.info(`Cleaned up ${removed} old giveaways`, { component: 'Database' });
+  }
+  
+  return removed;
+}
+
+export async function purgeEndedGiveaways(): Promise<GiveawayData[]> {
+  const now = Date.now();
+  const removed: GiveawayData[] = [];
+
+  for (const [key, entry] of cache) {
+    const d = entry.doc;
+    const isRunning = d.status === 'active' && (d.endsAt === null || d.endsAt > now);
+    if (!isRunning) {
+      removed.push(rowToGiveaway(d));
+      cache.delete(key);
+      activeGiveawaysCache.delete(key);
+      const guildSet = guildGiveawaysCache.get(d.guildId);
+      if (guildSet) {
+        guildSet.delete(key);
+        if (guildSet.size === 0) {
+          guildGiveawaysCache.delete(d.guildId);
+        }
+      }
+      dirtyKeys.delete(key);
+      pendingDeletes.add(d.messageId);
+    }
+  }
+
+  if (removed.length > 0) {
+    scheduleSync();
+    logger.info(`Purged ${removed.length} expired giveaways`, { component: 'Database' });
+  }
+
+  return removed;
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+function rowToGiveaway(row: StoredGiveaway): GiveawayData {
+  return {
+    messageId: row.messageId,
+    channelId: row.channelId,
+    guildId: row.guildId,
+    guildName: row.guildName,
+    channelName: row.channelName,
+    authorId: row.authorId,
+    prize: row.prize,
+    detectedAt: row.detectedAt,
+    endsAt: row.endsAt,
+    status: row.status,
+    notifiedAt: row.notifiedAt,
+    lastSeenAt: row.lastSeenAt,
+    notificationMessageId: row.notificationMessageId,
+    ...(row.notificationStatus && { notificationStatus: row.notificationStatus }),
+    ...(row.notificationSentAt && { notificationSentAt: row.notificationSentAt }),
+    ...(row.notificationError && { notificationError: row.notificationError }),
+  };
+}
+
+// ============================================================================
+// Public API - Watchlist Management
+// ============================================================================
+
+export async function addItem(userId: string, item: string): Promise<boolean> {
+  if (!userId || !item) {
+    logger.warn('Invalid watchlist item', { component: 'Database', userId, item });
+    return false;
+  }
+  
+  await ensureConnected();
+  
+  const trimmedItem = item.toLowerCase().trim();
+  if (!trimmedItem) return false;
+  
+  const result = await watchlistCol.updateOne(
+    { userId },
+    { 
+      $addToSet: { items: trimmedItem },
+      $set: { updatedAt: Date.now() },
+      $setOnInsert: { createdAt: Date.now() }
+    },
+    { upsert: true }
+  );
+  
+  return result.modifiedCount > 0 || result.upsertedCount > 0;
+}
+
+export async function removeItem(userId: string, item: string): Promise<boolean> {
+  if (!userId || !item) return false;
+  
+  await ensureConnected();
+  
+  const trimmedItem = item.toLowerCase().trim();
+  if (!trimmedItem) return false;
+  
+  const result = await watchlistCol.updateOne(
+    { userId },
+    { $pull: { items: trimmedItem } }
+  );
+  
+  return result.modifiedCount > 0;
+}
+
+export async function getItems(userId: string): Promise<string[]> {
+  if (!userId) return [];
+  
+  await ensureConnected();
+  
+  const doc = await watchlistCol.findOne({ userId });
+  return doc?.items || [];
+}
+
+export async function getAllWatchlists(): Promise<UserWatchlist[]> {
+  await ensureConnected();
+  
+  try {
+    return await watchlistCol.find({}).toArray();
+  } catch (err) {
+    logger.error('Failed to get watchlists', { 
+      component: 'Database',
+      error: err instanceof Error ? err.message : String(err) 
+    });
+    return [];
+  }
+}
+
+export async function clearItems(userId: string): Promise<void> {
+  if (!userId) return;
+  
+  await ensureConnected();
+  
+  await watchlistCol.updateOne(
+    { userId },
+    { $set: { items: [], updatedAt: Date.now() } }
+  );
+}
+
+// ============================================================================
+// Public API - License System
+// ============================================================================
+
+export async function createLicenseKey(key: string, createdBy: string): Promise<void> {
+  if (!key || !createdBy) {
+    throw new Error('Key and createdBy are required');
+  }
+  
+  await ensureConnected();
+  
+  await licenseKeysCol.insertOne({
+    key,
+    used: false,
+    usedBy: null,
+    createdAt: Date.now(),
+    createdBy,
+  });
+}
+
+export async function getLicenseKey(key: string): Promise<LicenseKey | null> {
+  if (!key) return null;
+  
+  await ensureConnected();
+  return licenseKeysCol.findOne({ key });
+}
+
+export async function validateLicenseKey(key: string): Promise<{
+  valid: boolean;
+  error?: string;
+}> {
+  if (!key) {
+    return { valid: false, error: 'License key is required.' };
+  }
+  
+  await ensureConnected();
+
+  const license = await licenseKeysCol.findOne({ key });
+  if (!license) {
+    return { valid: false, error: 'Invalid license key.' };
+  }
+
+  if (license.used) {
+    return { valid: false, error: 'This license key has already been used.' };
+  }
+
+  return { valid: true };
+}
+
+export async function useLicenseKey(key: string, userId: string): Promise<{
+  success: boolean;
+  error?: string;
+}> {
+  if (!key || !userId) {
+    return { success: false, error: 'Key and userId are required.' };
+  }
+  
+  await ensureConnected();
+
+  // Use a session for atomic operation
+  const session = client.startSession();
+  
+  try {
+    let result;
+    await session.withTransaction(async () => {
+      const validation = await validateLicenseKey(key);
+      if (!validation.valid) {
+        throw new Error(validation.error);
+      }
+
+      result = await licenseKeysCol.updateOne(
+        { key },
+        { $set: { used: true, usedBy: userId } },
+        { session }
+      );
+    });
+    
+    return { success: result!.modifiedCount > 0 };
+  } catch (err) {
+    const errorMsg = err instanceof Error ? err.message : String(err);
+    return { success: false, error: errorMsg };
+  } finally {
+    await session.endSession();
+  }
+}
+
+export async function listLicenseKeys(limit: number = 50): Promise<LicenseKey[]> {
+  await ensureConnected();
+  return licenseKeysCol.find({}).sort({ createdAt: -1 }).limit(Math.min(limit, 100)).toArray();
+}
+
+export async function getLicenseStats(): Promise<{
+  total: number;
+  used: number;
+  unused: number;
+}> {
+  await ensureConnected();
+  const total = await licenseKeysCol.countDocuments();
+  const used = await licenseKeysCol.countDocuments({ used: true });
+  return { total, used, unused: total - used };
+}
+
+// ============================================================================
+// Public API - Premium User Tracking
+// ============================================================================
+
+export async function setPremiumUser(
+  userId: string,
+  guildId: string,
+  source: 'key' | 'booster' | 'manual',
+  licenseKey?: string
+): Promise<void> {
+  if (!userId || !guildId) {
+    throw new Error('userId and guildId are required');
+  }
+  
+  await ensureConnected();
+
+  const updateData: Partial<PremiumUser> = {
+    userId,
+    guildId,
+    isPremium: true,
+    source,
+    activatedAt: Date.now(),
+    expiresAt: null,
+    lastChecked: Date.now(),
+    version: 1,
+  };
+
+  if (licenseKey) {
+    updateData.licenseKey = licenseKey;
+  }
+
+  await premiumUsersCol.updateOne(
+    { userId, guildId },
+    { $set: updateData },
+    { upsert: true }
+  );
+
+  logger.debug('Premium user set', { userId, guildId, source });
+}
+
+export async function removePremiumUser(
+  userId: string,
+  guildId: string
+): Promise<void> {
+  if (!userId || !guildId) return;
+  
+  await ensureConnected();
+
+  await premiumUsersCol.updateOne(
+    { userId, guildId },
+    {
+      $set: {
+        isPremium: false,
+        lastChecked: Date.now(),
+        version: { $inc: 1 },
+      }
+    }
+  );
+
+  logger.debug('Premium user removed', { userId, guildId });
+}
+
+export async function getPremiumUser(
+  userId: string,
+  guildId: string
+): Promise<PremiumUser | null> {
+  if (!userId || !guildId) return null;
+  
+  await ensureConnected();
+  return premiumUsersCol.findOne({ userId, guildId });
+}
+
+export async function isPremiumUser(
+  userId: string,
+  guildId: string
+): Promise<boolean> {
+  if (!userId || !guildId) return false;
+  
+  await ensureConnected();
+  const user = await premiumUsersCol.findOne({ userId, guildId, isPremium: true });
+  return !!user;
+}
+
+export async function getAllPremiumUsers(guildId: string): Promise<PremiumUser[]> {
+  if (!guildId) return [];
+  
+  await ensureConnected();
+  return premiumUsersCol.find({
+    guildId,
+    isPremium: true,
+  }).toArray();
+}
+
+export async function getAllPremiumUsersAllGuilds(): Promise<PremiumUser[]> {
+  await ensureConnected();
+  return premiumUsersCol.find({
+    isPremium: true,
+  }).toArray();
+}
+
+export async function getPremiumUsersBySource(
+  guildId: string,
+  source: 'key' | 'booster' | 'manual'
+): Promise<PremiumUser[]> {
+  if (!guildId) return [];
+  
+  await ensureConnected();
+  return premiumUsersCol.find({
+    guildId,
+    isPremium: true,
+    source,
+  }).toArray();
+}
+
+export async function getPremiumStats(guildId: string): Promise<{
+  total: number;
+  byKey: number;
+  byBooster: number;
+  byManual: number;
+}> {
+  if (!guildId) {
+    return { total: 0, byKey: 0, byBooster: 0, byManual: 0 };
+  }
+  
+  await ensureConnected();
+
+  const total = await premiumUsersCol.countDocuments({ guildId, isPremium: true });
+  const byKey = await premiumUsersCol.countDocuments({ guildId, isPremium: true, source: 'key' });
+  const byBooster = await premiumUsersCol.countDocuments({ guildId, isPremium: true, source: 'booster' });
+  const byManual = await premiumUsersCol.countDocuments({ guildId, isPremium: true, source: 'manual' });
+
+  return { total, byKey, byBooster, byManual };
+}
+
+// ============================================================================
+// Public API - Auto Joiner Token & Webhook Management
+// ============================================================================
+
+export async function updateUserToken(
+  userId: string,
+  guildId: string,
+  encryptedToken: string,
+  label: string
+): Promise<void> {
+  if (!userId || !guildId || !encryptedToken) {
+    throw new Error('userId, guildId, and encryptedToken are required');
+  }
+  
+  await ensureConnected();
+
+  await premiumUsersCol.updateOne(
+    { userId, guildId },
+    {
+      $set: {
+        token: encryptedToken,
+        tokenLabel: label || 'Unnamed',
+        tokenAddedAt: Date.now(),
+        tokenLastUsed: null,
+        tokenEntries: 0,
+        tokenWins: 0,
+        tokenActive: true,
+        lastChecked: Date.now(),
+        version: { $inc: 1 },
+      }
+    },
+    { upsert: true }
+  );
+
+  logger.debug('User token updated', { userId, guildId, label });
+}
+
+export async function updateUserWebhook(
+  userId: string,
+  guildId: string,
+  webhookUrl: string
+): Promise<void> {
+  if (!userId || !guildId || !webhookUrl) {
+    throw new Error('userId, guildId, and webhookUrl are required');
+  }
+  
+  await ensureConnected();
+
+  await premiumUsersCol.updateOne(
+    { userId, guildId },
+    {
+      $set: {
+        webhookUrl: webhookUrl,
+        webhookAddedAt: Date.now(),
+        webhookLastUsed: null,
+        lastChecked: Date.now(),
+        version: { $inc: 1 },
+      }
+    },
+    { upsert: true }
+  );
+
+  logger.debug('User webhook updated', { userId, guildId });
+}
+
+export async function getUserToken(
+  userId: string,
+  guildId: string
+): Promise<{ token: string | null; label: string | null }> {
+  if (!userId || !guildId) {
+    return { token: null, label: null };
+  }
+  
+  await ensureConnected();
+  const user = await premiumUsersCol.findOne({ userId, guildId });
+  return {
+    token: user?.token || null,
+    label: user?.tokenLabel || null,
+  };
+}
+
+export async function getUserWebhook(
+  userId: string,
+  guildId: string
+): Promise<string | null> {
+  if (!userId || !guildId) return null;
+  
+  await ensureConnected();
+  const user = await premiumUsersCol.findOne({ userId, guildId });
+  return user?.webhookUrl || null;
+}
+
+export async function incrementTokenEntries(
+  userId: string,
+  guildId: string
+): Promise<void> {
+  if (!userId || !guildId) return;
+  
+  await ensureConnected();
+  await premiumUsersCol.updateOne(
+    { userId, guildId },
+    { $inc: { tokenEntries: 1, version: 1 } }
+  );
+}
+
+export async function incrementTokenWins(
+  userId: string,
+  guildId: string
+): Promise<void> {
+  if (!userId || !guildId) return;
+  
+  await ensureConnected();
+  await premiumUsersCol.updateOne(
+    { userId, guildId },
+    { $inc: { tokenWins: 1, version: 1 } }
+  );
+}
+
+export async function updateTokenLastUsed(
+  userId: string,
+  guildId: string
+): Promise<void> {
+  if (!userId || !guildId) return;
+  
+  await ensureConnected();
+  await premiumUsersCol.updateOne(
+    { userId, guildId },
+    { $set: { tokenLastUsed: Date.now(), version: { $inc: 1 } } }
+  );
+}
+
+export async function setTokenActive(
+  userId: string,
+  guildId: string,
+  active: boolean
+): Promise<void> {
+  if (!userId || !guildId) return;
+  
+  await ensureConnected();
+  await premiumUsersCol.updateOne(
+    { userId, guildId },
+    { $set: { tokenActive: active, version: { $inc: 1 } } }
+  );
+}
+
+// ============================================================================
+// Public API - AutoJoin Entries
+// ============================================================================
+
+export async function getAutoJoinEntriesCollection(): Promise<Collection<AutoJoinEntry>> {
+  await ensureConnected();
+  return autoJoinEntriesCol;
+}
+
+export async function saveAutoJoinEntry(entry: Omit<AutoJoinEntry, '_id'>): Promise<void> {
+  if (!entry.userId || !entry.messageId || !entry.channelId) {
+    throw new Error('userId, messageId, and channelId are required');
+  }
+  
+  await ensureConnected();
+  
+  const entryWithId: AutoJoinEntry = {
+    ...entry,
+    _id: `${entry.userId}:${entry.channelId}:${entry.messageId}`,
+  };
+  
+  await autoJoinEntriesCol.insertOne(entryWithId);
+}
+
+export async function getAutoJoinEntry(
+  userId: string,
+  messageId: string,
+  channelId: string
+): Promise<AutoJoinEntry | null> {
+  if (!userId || !messageId || !channelId) return null;
+  
+  await ensureConnected();
+  const entryId = `${userId}:${channelId}:${messageId}`;
+  return autoJoinEntriesCol.findOne({ _id: entryId });
+}
+
+export async function updateAutoJoinEntryStatus(
+  userId: string,
+  messageId: string,
+  channelId: string,
+  status: 'pending' | 'attempting' | 'success' | 'failed' | 'skipped',
+  updates?: Partial<Omit<AutoJoinEntry, '_id' | 'userId' | 'messageId' | 'channelId'>>
+): Promise<void> {
+  if (!userId || !messageId || !channelId) return;
+  
+  await ensureConnected();
+  const entryId = `${userId}:${channelId}:${messageId}`;
+  await autoJoinEntriesCol.updateOne(
+    { _id: entryId },
+    { $set: { status, ...updates } }
+  );
+}
+
+export async function deleteAutoJoinEntry(
+  userId: string,
+  messageId: string,
+  channelId: string
+): Promise<void> {
+  if (!userId || !messageId || !channelId) return;
+  
+  await ensureConnected();
+  const entryId = `${userId}:${channelId}:${messageId}`;
+  await autoJoinEntriesCol.deleteOne({ _id: entryId });
+}
+
+export async function cleanupAutoJoinEntries(userId: string): Promise<number> {
+  if (!userId) return 0;
+  
+  await ensureConnected();
+  const cutoff = Date.now() - 2 * 60 * 60 * 1000;
+  const result = await autoJoinEntriesCol.deleteMany({
+    userId,
+    status: { $in: ['success', 'failed', 'skipped'] },
+    detectedAt: { $lt: cutoff }
+  });
+  return result.deletedCount || 0;
+}
+
+export async function getPendingAutoJoinEntries(userId: string): Promise<AutoJoinEntry[]> {
+  if (!userId) return [];
+  
+  await ensureConnected();
+  return autoJoinEntriesCol.find({
+    userId,
+    status: { $in: ['pending', 'attempting'] }
+  }).toArray();
+}
+
+// ============================================================================
+// Public API - Booster Premium Tracking
+// ============================================================================
+
+export async function setBoosterPremium(
+  userId: string,
+  guildId: string,
+  isBooster: boolean
+): Promise<void> {
+  if (!userId || !guildId) {
+    throw new Error('userId and guildId are required');
+  }
+  
+  await ensureConnected();
+
+  await boosterPremiumCol.updateOne(
+    { userId, guildId },
+    {
+      $set: {
+        userId,
+        guildId,
+        isBooster,
+        premiumAssigned: isBooster,
+        assignedAt: isBooster ? Date.now() : 0,
+        lastChecked: Date.now(),
+        version: { $inc: 1 },
+      }
+    },
+    { upsert: true }
+  );
+}
+
+export async function getBoosterPremium(
+  userId: string,
+  guildId: string
+): Promise<BoosterPremium | null> {
+  if (!userId || !guildId) return null;
+  
+  await ensureConnected();
+  return boosterPremiumCol.findOne({ userId, guildId });
+}
+
+export async function getActiveBoosters(guildId: string): Promise<BoosterPremium[]> {
+  if (!guildId) return [];
+  
+  await ensureConnected();
+  return boosterPremiumCol.find({
+    guildId,
+    isBooster: true,
+    premiumAssigned: true,
+  }).toArray();
+}
+
+export async function removeBoosterPremium(
+  userId: string,
+  guildId: string
+): Promise<void> {
+  if (!userId || !guildId) return;
+  
+  await ensureConnected();
+  await boosterPremiumCol.updateOne(
+    { userId, guildId },
+    {
+      $set: {
+        isBooster: false,
+        premiumAssigned: false,
+        lastChecked: Date.now(),
+        version: { $inc: 1 },
+      }
+    }
+  );
+}
+
+export async function updateBoosterPremiumStatus(
+  userId: string,
+  guildId: string,
+  isBooster: boolean
+): Promise<{
+  shouldHavePremium: boolean;
+  currentStatus: boolean;
+}> {
+  if (!userId || !guildId) {
+    throw new Error('userId and guildId are required');
+  }
+  
+  await ensureConnected();
+
+  const record = await getBoosterPremium(userId, guildId);
+
+  if (!record) {
+    await setBoosterPremium(userId, guildId, isBooster);
+    return {
+      shouldHavePremium: isBooster,
+      currentStatus: false,
+    };
+  }
+
+  const shouldHavePremium = isBooster;
+
+  if (record.isBooster !== isBooster) {
+    await setBoosterPremium(userId, guildId, isBooster);
+  }
+
+  return {
+    shouldHavePremium,
+    currentStatus: record.premiumAssigned,
+  };
+}
+
+export async function getBoosterPremiumStats(guildId: string): Promise<{
+  total: number;
+  withPremium: number;
+  withoutPremium: number;
+}> {
+  if (!guildId) {
+    return { total: 0, withPremium: 0, withoutPremium: 0 };
+  }
+  
+  await ensureConnected();
+
+  const total = await boosterPremiumCol.countDocuments({ guildId, isBooster: true });
+  const withPremium = await boosterPremiumCol.countDocuments({
+    guildId,
+    isBooster: true,
+    premiumAssigned: true,
+  });
+
+  return {
+    total,
+    withPremium,
+    withoutPremium: total - withPremium,
+  };
+}
+
+// ============================================================================
+// Shutdown & Cleanup
+// ============================================================================
+
+export async function closeDb(): Promise<void> {
+  isShuttingDown = true;
+  
+  logger.info('Closing database connection...', { component: 'Database' });
+  
+  // Clear intervals
+  clearInterval(cleanupInterval);
+  clearInterval(consistencyInterval);
+  
+  // Flush pending changes
+  if (syncTimeout) {
+    clearTimeout(syncTimeout);
+    syncTimeout = null;
+  }
+  
+  await flushSync();
+
+  // Close MongoDB connection
+  if (client) {
+    try {
+      await client.close();
+    } catch (err) {
+      logger.error('Error closing MongoDB connection', { 
+        component: 'Database',
+        error: err instanceof Error ? err.message : String(err) 
+      });
+    }
+    connected = false;
+  }
+  
+  // Clear caches
+  cache.clear();
+  activeGiveawaysCache.clear();
+  guildGiveawaysCache.clear();
+  dirtyKeys.clear();
+  pendingDeletes.clear();
+  
+  logger.info('Database connection closed', { component: 'Database' });
+}
+
+// Export cache stats for monitoring
+export function getDatabaseStats() {
+  return {
+    cache: getCacheStats(),
+    totalDetected: totalDetectedCount,
+    connected,
+    activeGiveaways: activeGiveawaysCache.size,
+    guilds: guildGiveawaysCache.size,
+    dirtyKeys: dirtyKeys.size,
+    pendingDeletes: pendingDeletes.size,
+    isSyncing,
+    isShuttingDown,
+  };
+}
+
+// Handle process exit
+process.on('SIGTERM', async () => {
+  logger.info('SIGTERM received, closing database...', { component: 'Database' });
+  await closeDb();
+});
+
+process.on('SIGINT', async () => {
+  logger.info('SIGINT received, closing database...', { component: 'Database' });
+  await closeDb();
+});
+
+// ============================================================================
+// Initialization
+// ============================================================================
+
+// Auto-connect on import
+connect().catch((err) => {
+  logger.error('Initial connection failed', { 
+    component: 'Database', 
+    error: err instanceof Error ? err.message : String(err) 
+  });
+});
+
+export default {
+  // Giveaway functions
+  getDb,
+  getTotalDetected,
+  insertGiveaway,
+  wasNotifiedRecently,
+  markNotified,
+  updateLastSeen,
+  markEnded,
+  setNotificationMessageId,
+  updateNotificationStatus,
+  getGiveaway,
+  getActiveGiveaways,
+  getGuildGiveaways,
+  getAllGiveaways,
+  getStats,
+  resetDatabase,
+  cleanupOldGiveaways,
+  purgeEndedGiveaways,
+  
+  // Watchlist functions
+  addItem,
+  removeItem,
+  getItems,
+  getAllWatchlists,
+  clearItems,
+  
+  // License functions
+  createLicenseKey,
+  getLicenseKey,
+  validateLicenseKey,
+  useLicenseKey,
+  listLicenseKeys,
+  getLicenseStats,
+  
+  // Premium functions
+  setPremiumUser,
+  removePremiumUser,
+  getPremiumUser,
+  isPremiumUser,
+  getAllPremiumUsers,
+  getAllPremiumUsersAllGuilds,
+  getPremiumUsersBySource,
+  getPremiumStats,
+  
+  // Token & Webhook functions
+  updateUserToken,
+  updateUserWebhook,
+  getUserToken,
+  getUserWebhook,
+  incrementTokenEntries,
+  incrementTokenWins,
+  updateTokenLastUsed,
+  setTokenActive,
+  
+  // Auto-join functions
+  getAutoJoinEntriesCollection,
+  saveAutoJoinEntry,
+  getAutoJoinEntry,
+  updateAutoJoinEntryStatus,
+  deleteAutoJoinEntry,
+  cleanupAutoJoinEntries,
+  getPendingAutoJoinEntries,
+  
+  // Booster functions
+  setBoosterPremium,
+  getBoosterPremium,
+  getActiveBoosters,
+  removeBoosterPremium,
+  updateBoosterPremiumStatus,
+  getBoosterPremiumStats,
+  
+  // Admin functions
+  closeDb,
+  getDatabaseStats,
+  resyncCache,
+};
