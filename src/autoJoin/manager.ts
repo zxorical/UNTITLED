@@ -1,13 +1,14 @@
 /**
  * @module autoJoin/manager
  * 
- * GiveawayManager - Production stable
+ * AutoJoinManager - Production stable
  * 
  * Key features:
  * - LRU caches (bounded)
  * - Global queue (shared across managers)
  * - Aggressive Discord cache clearing
  * - Clean shutdown with event removal
+ * - Memory-stable even with high message volume
  */
 
 import { Client, Message, TextChannel, Options } from 'discord.js-selfbot-v13';
@@ -53,6 +54,8 @@ const http: AxiosInstance = axios.create({
 // Types
 // ---------------------------------------------------------------------------
 
+type EntryStatus = 'pending' | 'attempting' | 'success' | 'failed' | 'skipped' | 'queued' | 'dead_letter';
+
 interface GiveawayEntry {
   entryId: string;
   userId: string;
@@ -66,7 +69,7 @@ interface GiveawayEntry {
   buttonCustomId?: string;
   detectedAt: number;
   endsAt?: number;
-  status: 'pending' | 'attempting' | 'success' | 'failed' | 'skipped';
+  status: EntryStatus;
   attempts: number;
   correlationId: string;
 }
@@ -75,6 +78,17 @@ interface GiveawayButton {
   customId: string;
   label: string;
   disabled: boolean;
+}
+
+interface GiveawayStats {
+  detected: number;
+  succeeded: number;
+  failed: number;
+  skipped: number;
+  duplicates: number;
+  wins: number;
+  started: number;
+  lastSuccess?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -144,7 +158,7 @@ class GlobalQueue {
   private active = 0;
   private running = false;
 
-  enqueue(manager: GiveawayManager, entry: GiveawayEntry): void {
+  enqueue(manager: AutoJoinManager, entry: GiveawayEntry): void {
     if (this.queue.length >= MAX_QUEUE_SIZE) {
       this.queue.shift();
     }
@@ -158,7 +172,7 @@ class GlobalQueue {
 
     while (this.queue.length > 0 && this.active < MAX_CONCURRENT) {
       const item = this.queue.shift()!;
-      const manager = GiveawayManager.getManager(item.managerId);
+      const manager = AutoJoinManager.getManager(item.managerId);
       
       if (!manager || manager.isShuttingDown()) {
         continue;
@@ -222,15 +236,15 @@ const rateLimiter = new TokenBucket();
 // ---------------------------------------------------------------------------
 
 class CleanupService {
-  private managers: Set<GiveawayManager> = new Set();
+  private managers: Set<AutoJoinManager> = new Set();
   private timer: NodeJS.Timeout | null = null;
 
-  register(manager: GiveawayManager): void {
+  register(manager: AutoJoinManager): void {
     this.managers.add(manager);
     this.start();
   }
 
-  unregister(manager: GiveawayManager): void {
+  unregister(manager: AutoJoinManager): void {
     this.managers.delete(manager);
     if (this.managers.size === 0) this.stop();
   }
@@ -257,11 +271,11 @@ class CleanupService {
 const cleanup = new CleanupService();
 
 // ---------------------------------------------------------------------------
-// GiveawayManager
+// AutoJoinManager
 // ---------------------------------------------------------------------------
 
-export class GiveawayManager extends EventEmitter {
-  private static instances = new Map<string, GiveawayManager>();
+export class AutoJoinManager extends EventEmitter {
+  private static instances = new Map<string, AutoJoinManager>();
 
   private readonly client: Client;
   private readonly userId: string;
@@ -270,14 +284,20 @@ export class GiveawayManager extends EventEmitter {
   private readonly label: string;
   private readonly id: string;
 
-  // LRU caches
+  // LRU caches - bounded, never grow unbounded
   private processed = new Map<string, number>();
   private dbChecked = new Map<string, number>();
   private wins = new Map<string, number>();
   private entries = new Map<string, GiveawayEntry>();
   private processing = new Set<string>();
 
-  private stats = {
+  // Channel tracking for no-monitored-channels optimization
+  private channelCheckCache = new Map<string, number>();
+  private processedCount = 0;
+  private budgetReset = Date.now();
+  private readonly processBudget = 200; // Max messages per minute per manager
+
+  private stats: GiveawayStats = {
     detected: 0,
     succeeded: 0,
     failed: 0,
@@ -318,7 +338,7 @@ export class GiveawayManager extends EventEmitter {
     guildId: string,
     token: string,
     label = 'main'
-  ): GiveawayManager {
+  ): AutoJoinManager {
     const id = `${userId}:${guildId}`;
     const existing = this.instances.get(id);
     if (existing && !existing.shuttingDown) return existing;
@@ -328,13 +348,17 @@ export class GiveawayManager extends EventEmitter {
       this.instances.delete(id);
     }
 
-    const manager = new GiveawayManager(client, userId, guildId, token, label);
+    const manager = new AutoJoinManager(client, userId, guildId, token, label);
     this.instances.set(id, manager);
     return manager;
   }
 
-  static getManager(id: string): GiveawayManager | undefined {
+  static getManager(id: string): AutoJoinManager | undefined {
     return this.instances.get(id);
+  }
+
+  static getActiveManagers(): number {
+    return this.instances.size;
   }
 
   // ---------------------------------------------------------------------------
@@ -343,6 +367,7 @@ export class GiveawayManager extends EventEmitter {
 
   getId(): string { return this.id; }
   isShuttingDown(): boolean { return this.shuttingDown; }
+  getLabel(): string { return this.label; }
 
   async handleMessage(message: Message): Promise<void> {
     if (!this.shouldProcess(message)) return;
@@ -396,6 +421,7 @@ export class GiveawayManager extends EventEmitter {
         }
 
         this.stats.succeeded++;
+        this.stats.lastSuccess = Date.now();
         await this.markStatus(entry, 'success');
         await incrementTokenEntries(this.userId, this.guildId);
         await updateTokenLastUsed(this.userId, this.guildId);
@@ -434,11 +460,68 @@ export class GiveawayManager extends EventEmitter {
     if (message.author?.id === this.client.user?.id) return false;
     if (this.shuttingDown) return false;
     
-    if (CONFIG.monitoredChannels.length > 0 &&
-        !CONFIG.monitoredChannels.includes(message.channel.id)) {
-      return false;
+    // No monitored channels - scan everything with optimizations
+    const hasMonitoredChannels = CONFIG.monitoredChannels?.length > 0;
+    
+    if (hasMonitoredChannels) {
+      // Only process monitored channels
+      if (!CONFIG.monitoredChannels.includes(message.channel.id)) {
+        return false;
+      }
+    } else {
+      // ============================================================
+      // 🔥 OPTIMIZATION: No monitored channels - smart filtering
+      // ============================================================
+      
+      // 1. Skip non-bot messages without giveaway keywords (cheap check)
+      if (!message.author?.bot) {
+        const content = (message.content || '').toLowerCase();
+        const hasKeyword = content.includes('giveaway') || 
+                          content.includes('raffle') || 
+                          content.includes('prize') ||
+                          content.includes('win') ||
+                          content.includes('🎉') ||
+                          content.includes('🎁');
+        if (!hasKeyword) {
+          return false; // Skip non-giveaway messages from users
+        }
+      }
+      
+      // 2. Skip known spam channels (configurable)
+      const channelName = (message.channel as TextChannel).name?.toLowerCase() || '';
+      const spamNames = ['spam', 'bot-commands', 'general', 'chat', 'memes', 'shitpost'];
+      if (spamNames.some(name => channelName.includes(name))) {
+        return false;
+      }
+      
+      // 3. Check if we've recently scanned this channel
+      const now = Date.now();
+      const lastCheck = this.channelCheckCache.get(message.channel.id) || 0;
+      if (now - lastCheck < 5000) { // 5 second cooldown per channel
+        return false;
+      }
+      this.channelCheckCache.set(message.channel.id, now);
+      
+      // 4. Budget check - limit processing per minute
+      if (!this.hasProcessingBudget()) {
+        return false;
+      }
     }
+    
     return true;
+  }
+
+  private hasProcessingBudget(): boolean {
+    const now = Date.now();
+    if (now - this.budgetReset > 60000) {
+      this.processedCount = 0;
+      this.budgetReset = now;
+    }
+    const hasBudget = this.processedCount < this.processBudget;
+    if (hasBudget) {
+      this.processedCount++;
+    }
+    return hasBudget;
   }
 
   private isDuplicate(id: string): boolean {
@@ -553,6 +636,7 @@ export class GiveawayManager extends EventEmitter {
       account: this.label,
       prize: truncate(entry.prize, 60),
       guild: entry.guildName,
+      channel: entry.channelName,
     });
 
     this.emit('giveawayDetected', entry);
@@ -616,7 +700,7 @@ export class GiveawayManager extends EventEmitter {
 
   private async markStatus(
     entry: GiveawayEntry,
-    status: string,
+    status: EntryStatus,
     error?: string
   ): Promise<void> {
     await updateAutoJoinEntryStatus(
@@ -785,7 +869,7 @@ export class GiveawayManager extends EventEmitter {
   }
 
   // ---------------------------------------------------------------------------
-  // LRU Caches
+  // LRU Caches - Bounded
   // ---------------------------------------------------------------------------
 
   private addProcessed(id: string): void {
@@ -820,17 +904,26 @@ export class GiveawayManager extends EventEmitter {
     for (const [k, t] of this.wins) {
       if (t < cutoff) this.wins.delete(k);
     }
+    for (const [k, t] of this.channelCheckCache) {
+      if (t < cutoff) this.channelCheckCache.delete(k);
+    }
   }
 
   sweepCache(): void {
     try {
+      // Sweep channels - keep only recent ones
       if (this.client.channels?.cache) {
         const before = this.client.channels.cache.size;
         this.client.channels.cache.sweep(
           (c: any) => (c?.createdTimestamp || 0) < Date.now() - 300000
         );
+        const swept = before - this.client.channels.cache.size;
+        if (swept > 0) {
+          logger.debug(`Swept ${swept} channels`, { account: this.label });
+        }
       }
       
+      // Sweep users - keep only self and a few recent
       const selfId = this.client.user?.id;
       if (this.client.users?.cache && selfId) {
         this.client.users.cache.sweep((u: any) => u.id !== selfId);
@@ -840,6 +933,13 @@ export class GiveawayManager extends EventEmitter {
             this.client.users.cache.delete(keys[i]);
           }
         }
+      }
+      
+      // Sweep guilds - keep only recent
+      if (this.client.guilds?.cache) {
+        this.client.guilds.cache.sweep(
+          (g: any) => (g?.joinedTimestamp || 0) < Date.now() - 300000
+        );
       }
     } catch {}
   }
@@ -888,14 +988,20 @@ export class GiveawayManager extends EventEmitter {
     this.shuttingDown = true;
 
     cleanup.unregister(this);
-    GiveawayManager.instances.delete(this.id);
+    AutoJoinManager.instances.delete(this.id);
 
+    // Clear all caches
     this.entries.clear();
     this.processing.clear();
     this.processed.clear();
     this.dbChecked.clear();
     this.wins.clear();
+    this.channelCheckCache.clear();
 
+    // Clear Discord caches one last time
+    this.sweepCache();
+
+    // Remove all event listeners
     this.removeAllListeners();
 
     logger.info('Shutdown complete', { account: this.label });
@@ -905,14 +1011,59 @@ export class GiveawayManager extends EventEmitter {
   // Stats
   // ---------------------------------------------------------------------------
 
-  getStats() {
+  getStats(): GiveawayStats & { 
+    entries: number;
+    processed: number;
+    queue: { length: number; active: number };
+    channelCache: number;
+  } {
     return {
       ...this.stats,
       entries: this.entries.size,
       processed: this.processed.size,
+      channelCache: this.channelCheckCache.size,
       queue: globalQueue.stats,
     };
   }
+
+  static getGlobalStats(): {
+    managers: number;
+    queue: { length: number; active: number };
+  } {
+    return {
+      managers: this.instances.size,
+      queue: globalQueue.stats,
+    };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Memory Diagnosis
+  // ---------------------------------------------------------------------------
+
+  diagnoseMemory(): void {
+    const mem = process.memoryUsage();
+    
+    logger.info('📊 Memory Diagnosis', {
+      account: this.label,
+      heapUsed: Math.round(mem.heapUsed / 1024 / 1024) + 'MB',
+      heapTotal: Math.round(mem.heapTotal / 1024 / 1024) + 'MB',
+      rss: Math.round(mem.rss / 1024 / 1024) + 'MB',
+      processed: this.processed.size,
+      dbChecked: this.dbChecked.size,
+      entries: this.entries.size,
+      wins: this.wins.size,
+      channelCache: this.channelCheckCache.size,
+      queue: globalQueue.stats.length,
+      channels: this.client.channels?.cache?.size || 0,
+      guilds: this.client.guilds?.cache?.size || 0,
+      users: this.client.users?.cache?.size || 0,
+    });
+  }
 }
 
-export const getQueueStats = () => globalQueue.stats;
+// ---------------------------------------------------------------------------
+// Exports
+// ---------------------------------------------------------------------------
+
+export type { GiveawayEntry, GiveawayButton, GiveawayStats, EntryStatus };
+export { globalQueue };
