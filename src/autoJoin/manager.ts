@@ -1,29 +1,14 @@
 /**
  * @module autoJoin/manager
  * 
- * Premium AutoJoiner - PRODUCTION GRADE - 8GB RAM OPTIMIZED
+ * Premium AutoJoiner - PRODUCTION GRADE - MEMORY SAFE
  * 
- * Features:
- * 1. Auto-join giveaways using user-provided tokens
- * 2. Button-only entry (no reaction support)
- * 3. Win detection with webhook notifications
- * 4. LRU caches for memory management
- * 5. Async non-blocking logger
- * 6. Circuit breaker for API protection
- * 7. Connection pooling for HTTP
- * 8. O(1) session lookups
- * 9. Memory monitoring with auto-cleanup
- * 10. Event listener cleanup
- * 11. Rate limiting per session
- * 12. Auto-reconnect with backoff
- * 13. Worker-based scaling
- * 14. Redis-ready architecture
- * 15. Health check endpoints
- * 16. Metrics collection
- * 17. Graceful shutdown
- * 18. Session persistence
- * 19. Duplicate detection
- * 20. Smart button detection
+ * FIXES:
+ * 1. Heartbeat reconnect path - clear old interval before starting new session
+ * 2. stopSession / heartbeat race - track session IDs to prevent detached timers
+ * 3. sessionStartPromises cleanup on shutdown - check isShuttingDown before finalizing
+ * 4. getStats() - avoid full Map copy on every call
+ * 5. Proper session ID tracking for cleanup
  */
 
 import { Client, Message, TextChannel, ClientOptions } from 'discord.js-selfbot-v13';
@@ -105,6 +90,9 @@ interface UserSession {
     error?: (error: Error) => void;
     disconnect?: () => void;
   };
+  // Unique ID to track session versions
+  sessionId: string;
+  destroyed: boolean;
 }
 
 interface SessionStats {
@@ -113,29 +101,6 @@ interface SessionStats {
   failed: number;
   wins: number;
   lastEntryAt?: number;
-}
-
-interface ManagerMetrics {
-  totalMessagesProcessed: number;
-  totalGiveawaysDetected: number;
-  totalEntriesAttempted: number;
-  totalEntriesSucceeded: number;
-  totalEntriesFailed: number;
-  totalWinsDetected: number;
-  averageDetectionTime: number;
-  averageEntryTime: number;
-  apiCalls: number;
-  apiErrors: number;
-  cacheHits: number;
-  cacheMisses: number;
-  dbQueries: number;
-  memoryUsage: {
-    heapUsed: number;
-    heapTotal: number;
-    rss: number;
-  };
-  startTime: number;
-  lastStatsReset: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -150,19 +115,12 @@ const PATTERNS = {
   TIMESTAMP: /<t:(\d{10,13})(?::[a-zA-Z])?>/,
   DRAFT_BUTTON: /\b(start|edit|cancel|preview|setup)\b/i,
   GIVEAWAY_KEYWORD: /\bgiveaway\b|\braffle\b|\bsweepstakes\b|\bwin\b|\bprize\b/i,
-  INVITE: /(?:https?:\/\/)?(?:discord\.gg|discord\.com\/invite)\/([a-zA-Z0-9-]{2,20})/i,
-  MESSAGE_URL: /https?:\/\/discord\.com\/channels\/(\d+)\/(\d+)\/(\d+)/i,
 } as const;
 
 const KNOWN_GIVEAWAY_BOT_IDS: ReadonlySet<string> = new Set([
-  '294882584201003009', // GiveawayBot
-  '739448630517039104', // GiveawayBoat
-  '515195524879237130',
-  '235148962103951360',
-  '282859044593598464',
-  '270904126974590976',
-  '508391840525975553',
-  '530082442967646230', // Giveaway Boat
+  '294882584201003009', '739448630517039104', '515195524879237130',
+  '235148962103951360', '282859044593598464', '270904126974590976',
+  '508391840525975553', '530082442967646230',
 ]);
 
 const TRUSTED_ENTRY_CUSTOM_IDS: ReadonlySet<string> = new Set([
@@ -189,7 +147,7 @@ const INTERACTION_RETRY_ATTEMPTS = 3;
 const INTERACTION_RETRY_DELAY_MS = 2000;
 const NO_RESPONSE_COOLDOWN_MS = 5000;
 
-// 8GB RAM Cache sizes
+// Cache sizes
 const CACHE_PROCESSED_MESSAGES = 2000;
 const CACHE_MAX_PROCESSING = 500;
 const CACHE_MAX_WINS = 100;
@@ -286,22 +244,6 @@ class LRUCache<K, V> {
       }
     }
     return removed;
-  }
-
-  entries(): IterableIterator<[K, V]> {
-    const entries: [K, V][] = [];
-    for (const [key, entry] of this.cache) {
-      entries.push([key, entry.value]);
-    }
-    return entries[Symbol.iterator]();
-  }
-
-  toJSON(): Record<string, any> {
-    const obj: Record<string, any> = {};
-    for (const [key, entry] of this.cache) {
-      obj[String(key)] = entry.value;
-    }
-    return obj;
   }
 }
 
@@ -402,7 +344,6 @@ class CircuitBreaker {
   ) {}
 
   async execute<T>(fn: () => Promise<T>): Promise<T> {
-    // Auto-decay failures
     if (this.failures > 0 && Date.now() - this.lastFailureTime > 60000) {
       this.failures = Math.max(0, this.failures - 1);
     }
@@ -608,7 +549,7 @@ class MetricsCollector {
     return Math.round(this.apiLatencies.reduce((a, b) => a + b, 0) / this.apiLatencies.length);
   }
 
-  getMetrics(): ManagerMetrics {
+  getMetrics() {
     const mem = process.memoryUsage();
     return {
       totalMessagesProcessed: this.totalMessagesProcessed,
@@ -688,6 +629,7 @@ export class AutoJoinManager extends EventEmitter {
   private workerId: string;
   private memoryWarningLogged = false;
   private healthStatus: 'healthy' | 'warning' | 'critical' = 'healthy';
+  private sessionIdCounter = 0;
 
   // HTTP client with connection pooling
   private readonly http: AxiosInstance;
@@ -763,7 +705,6 @@ export class AutoJoinManager extends EventEmitter {
   private checkMemory(): boolean {
     const mem = this.getMemoryUsage();
     
-    // Update health status
     if (mem.heapUsedMB > MEMORY_MAX_THRESHOLD_MB) {
       this.healthStatus = 'critical';
     } else if (mem.heapUsedMB > MEMORY_CRITICAL_THRESHOLD_MB) {
@@ -772,7 +713,6 @@ export class AutoJoinManager extends EventEmitter {
       this.healthStatus = 'healthy';
     }
     
-    // Critical - force cleanup and restart
     if (mem.heapUsedMB > MEMORY_MAX_THRESHOLD_MB) {
       this.asyncLogger.error('🚨 CRITICAL: Memory exceeded limit', {
         worker: this.workerId,
@@ -784,7 +724,6 @@ export class AutoJoinManager extends EventEmitter {
       return false;
     }
     
-    // Critical threshold - aggressive cleanup
     if (mem.heapUsedMB > MEMORY_CRITICAL_THRESHOLD_MB) {
       this.asyncLogger.warn('⚠️ Memory critical, aggressive cleanup', {
         worker: this.workerId,
@@ -794,7 +733,6 @@ export class AutoJoinManager extends EventEmitter {
       return true;
     }
     
-    // Warning threshold - normal cleanup
     if (mem.heapUsedMB > MEMORY_WARNING_THRESHOLD_MB) {
       if (!this.memoryWarningLogged) {
         this.asyncLogger.warn('⚠️ Memory warning threshold reached', {
@@ -803,7 +741,6 @@ export class AutoJoinManager extends EventEmitter {
         });
         this.memoryWarningLogged = true;
       }
-      // Clean caches
       this.processedMessages.clean();
       this.processingCache.clean();
       this.recentWins.clean();
@@ -826,7 +763,6 @@ export class AutoJoinManager extends EventEmitter {
       this.sessionStartPromises.clear();
     }
     
-    // Force GC
     if (global.gc) {
       global.gc();
     }
@@ -841,7 +777,6 @@ export class AutoJoinManager extends EventEmitter {
   private forceCleanup(): void {
     this.aggressiveCleanup();
     
-    // Stop some sessions to free memory
     const mem = this.getMemoryUsage();
     if (mem.heapUsedMB > MEMORY_CRITICAL_THRESHOLD_MB && this.sessions.size > 1) {
       const toStop = Math.floor(this.sessions.size * 0.3);
@@ -880,7 +815,6 @@ export class AutoJoinManager extends EventEmitter {
       
       const usersToStart = validUsers.slice(0, MAX_SESSIONS_PER_WORKER);
 
-      // Start sessions in parallel with concurrency limit
       const concurrencyLimit = 3;
       let started = 0;
       let failed = 0;
@@ -993,7 +927,6 @@ export class AutoJoinManager extends EventEmitter {
         return false;
       }
 
-      // ClientOptions for discord.js-selfbot-v13
       const clientOptions: ClientOptions = {
         messageCacheLifetime: 60,
         messageSweepInterval: 300,
@@ -1005,6 +938,10 @@ export class AutoJoinManager extends EventEmitter {
       };
 
       const client = new Client(clientOptions);
+      
+      // Generate unique session ID
+      this.sessionIdCounter++;
+      const sessionId = `${userId}-${Date.now()}-${this.sessionIdCounter}`;
       
       const session: UserSession = {
         client,
@@ -1018,6 +955,8 @@ export class AutoJoinManager extends EventEmitter {
         maxReconnectAttempts: MAX_RECONNECT_ATTEMPTS,
         rateLimiter: new TokenBucket(5, 5000),
         listeners: {},
+        sessionId,
+        destroyed: false,
       };
 
       this.registerEvents(session);
@@ -1026,6 +965,18 @@ export class AutoJoinManager extends EventEmitter {
       await this.waitForReady(client);
       
       this.tokenManager.clearCache(userId, guildId);
+
+      // CHECK: If shutting down, don't add the session
+      if (this.isShuttingDown) {
+        this.asyncLogger.warn('Shutdown in progress, destroying newly created session', {
+          userId,
+          sessionId: session.sessionId,
+        });
+        try {
+          await client.destroy();
+        } catch {}
+        return false;
+      }
 
       this.sessions.set(sessionKey, session);
       this.sessionsByUserId.set(userId, session);
@@ -1040,6 +991,7 @@ export class AutoJoinManager extends EventEmitter {
         username: client.user?.username,
         guilds: client.guilds.cache.size,
         worker: this.workerId,
+        sessionId: session.sessionId,
         memory: this.getMemoryUsage(),
       });
 
@@ -1084,30 +1036,62 @@ export class AutoJoinManager extends EventEmitter {
     });
   }
 
+  // -------------------------------------------------------------------------
+  // FIX #1: startHeartbeat - Clear old interval before reconnect
+  // -------------------------------------------------------------------------
+
   private startHeartbeat(session: UserSession): void {
     if (session.heartbeatInterval) {
       clearInterval(session.heartbeatInterval);
+      session.heartbeatInterval = undefined;
     }
 
     session.heartbeatInterval = setInterval(() => {
-      if (this.isShuttingDown || !session.isActive) return;
+      // Check if this session is still valid
+      if (this.isShuttingDown || !session.isActive || session.destroyed) return;
 
       try {
         const client = session.client as any;
         if (!client.isReady()) throw new Error('Client not ready');
         if (client.ws?.connection?.readyState !== 1) throw new Error('WebSocket not open');
       } catch (error) {
+        // FIX: Clear the old heartbeat BEFORE starting reconnect
+        if (session.heartbeatInterval) {
+          clearInterval(session.heartbeatInterval);
+          session.heartbeatInterval = undefined;
+        }
+        
         if (session.reconnectAttempts < session.maxReconnectAttempts) {
           session.reconnectAttempts++;
           this.asyncLogger.debug('Attempting reconnect', {
             userId: session.userId,
             attempt: session.reconnectAttempts,
+            oldSessionId: session.sessionId,
           });
-          (session.client as any).destroy();
+          
+          // Destroy old client
+          try {
+            (session.client as any).destroy();
+          } catch {}
           this.cleanupSessionListeners(session);
+          
+          // Mark as destroyed to prevent any further use
+          session.destroyed = true;
+          
+          // Start new session - this will create a new session object
           this._startSessionInternal(session.userId, session.guildId)
             .then(success => {
-              if (success) session.reconnectAttempts = 0;
+              if (success) {
+                // Find the new session and reset reconnect attempts
+                const newSession = this.sessionsByUserId.get(session.userId);
+                if (newSession) {
+                  newSession.reconnectAttempts = 0;
+                  this.asyncLogger.debug('Reconnect successful', {
+                    userId: session.userId,
+                    newSessionId: newSession.sessionId,
+                  });
+                }
+              }
             })
             .catch(() => {});
         } else {
@@ -1158,14 +1142,21 @@ export class AutoJoinManager extends EventEmitter {
     }
   }
 
+  // -------------------------------------------------------------------------
+  // FIX #2: stopSession - Handle race conditions with heartbeat
+  // -------------------------------------------------------------------------
+
   async stopSession(userId: string, guildId: string): Promise<void> {
     const sessionKey = this.makeSessionKey(userId);
     const session = this.sessions.get(sessionKey);
     if (!session) return;
 
+    // Mark as destroyed immediately to prevent any further use
+    session.destroyed = true;
+    session.isActive = false;
+
     try {
-      session.isActive = false;
-      
+      // Clear heartbeat FIRST - prevent any new callbacks
       if (session.heartbeatInterval) {
         clearInterval(session.heartbeatInterval);
         session.heartbeatInterval = undefined;
@@ -1173,11 +1164,12 @@ export class AutoJoinManager extends EventEmitter {
       
       this.cleanupSessionListeners(session);
       
-      await Promise.race([
-        (session.client as any).destroy(),
-        delay(5000),
-      ]);
+      // Destroy client
+      try {
+        await (session.client as any).destroy();
+      } catch {}
       
+      // Remove from maps
       this.sessions.delete(sessionKey);
       this.sessionsByUserId.delete(userId);
       this.tokenManager.clearCache(userId, guildId);
@@ -1187,6 +1179,7 @@ export class AutoJoinManager extends EventEmitter {
       this.asyncLogger.info('⏹️ AutoJoin session stopped', { 
         userId, 
         guildId,
+        sessionId: session.sessionId,
         memory: this.getMemoryUsage(),
       });
       
@@ -1221,6 +1214,11 @@ export class AutoJoinManager extends EventEmitter {
       client.off('disconnect', listeners.disconnect);
       delete listeners.disconnect;
     }
+    
+    // Remove all listeners from client as safety net
+    try {
+      client.removeAllListeners();
+    } catch {}
   }
 
   async refreshSessions(): Promise<void> {
@@ -1279,16 +1277,21 @@ export class AutoJoinManager extends EventEmitter {
     }
   }
 
+  // -------------------------------------------------------------------------
+  // FIX #4: getStats - Avoid full Map copy on every call
+  // -------------------------------------------------------------------------
+
   getStats() {
-    const stats = new Map<string, SessionStats>();
+    // Build stats without creating a full Map copy
+    const sessionStats: Array<{ userId: string; stats: SessionStats }> = [];
     let active = 0;
     let totalDetected = 0;
     let totalEntered = 0;
     let totalWins = 0;
     
     for (const [key, session] of this.sessions) {
-      if (session.isActive) active++;
-      stats.set(key, { ...session.stats });
+      if (session.isActive && !session.destroyed) active++;
+      sessionStats.push({ userId: session.userId, stats: { ...session.stats } });
       totalDetected += session.stats.detected;
       totalEntered += session.stats.entered;
       totalWins += session.stats.wins;
@@ -1303,7 +1306,7 @@ export class AutoJoinManager extends EventEmitter {
       totalDetected,
       totalEntered,
       totalWins,
-      sessionStats: stats,
+      sessionStats, // Array instead of Map
       worker: this.workerId,
       healthStatus: this.healthStatus,
       circuitBreakerState: this.apiCircuitBreaker.getState(),
@@ -1331,7 +1334,7 @@ export class AutoJoinManager extends EventEmitter {
       },
       logStats: this.asyncLogger.getStats(),
       sessionStartPromises: this.sessionStartPromises.size,
-      uptime: Math.round((Date.now() - metrics.startTime) / 1000 / 60), // minutes
+      uptime: Math.round((Date.now() - metrics.startTime) / 1000 / 60),
     };
   }
 
@@ -1348,27 +1351,75 @@ export class AutoJoinManager extends EventEmitter {
     };
   }
 
+  // -------------------------------------------------------------------------
+  // FIX #3: shutdown - Properly cancel mid-flight session starts
+  // -------------------------------------------------------------------------
+
   async shutdown(): Promise<void> {
+    if (this.isShuttingDown) {
+      this.asyncLogger.debug('Shutdown already in progress', { worker: this.workerId });
+      return;
+    }
+    
     this.isShuttingDown = true;
 
     this.asyncLogger.info('🛑 Shutting down AutoJoinManager...', {
       worker: this.workerId,
       sessions: this.sessions.size,
+      pendingStarts: this.sessionStartPromises.size,
     });
 
-    // Clear all intervals
+    // Clear all intervals first
     [this.refreshInterval, this.cleanupInterval, this.memoryCheckInterval, 
      this.reconnectCheckInterval, this.cacheCleanInterval, this.metricsInterval]
       .forEach(interval => {
         if (interval) { clearInterval(interval); }
       });
 
-    // Stop all sessions
-    const stopPromises: Promise<void>[] = [];
-    for (const [key, session] of this.sessions) {
-      stopPromises.push(this.stopSession(session.userId, session.guildId));
+    // Wait for pending session starts to complete or timeout
+    if (this.sessionStartPromises.size > 0) {
+      this.asyncLogger.info(`Waiting for ${this.sessionStartPromises.size} pending session starts...`, {
+        worker: this.workerId,
+      });
+      
+      try {
+        await Promise.race([
+          Promise.allSettled(this.sessionStartPromises.values()),
+          delay(5000),
+        ]);
+      } catch {}
+      
+      // Clear any remaining promises
+      this.sessionStartPromises.clear();
     }
-    await Promise.all(stopPromises);
+
+    // Stop all sessions - use a copy of the sessions map
+    const sessionsToStop = Array.from(this.sessions.values());
+    const stopPromises: Promise<void>[] = [];
+    
+    for (const session of sessionsToStop) {
+      // Mark as destroyed to prevent any further use
+      session.destroyed = true;
+      session.isActive = false;
+      
+      // Clear heartbeat
+      if (session.heartbeatInterval) {
+        clearInterval(session.heartbeatInterval);
+        session.heartbeatInterval = undefined;
+      }
+      
+      this.cleanupSessionListeners(session);
+      
+      try {
+        await (session.client as any).destroy();
+      } catch {}
+      
+      this.sessions.delete(this.makeSessionKey(session.userId));
+      this.sessionsByUserId.delete(session.userId);
+      this.tokenManager.clearCache(session.userId, session.guildId);
+    }
+
+    await Promise.allSettled(stopPromises);
 
     // Clear everything
     this.sessions.clear();
@@ -1400,7 +1451,7 @@ export class AutoJoinManager extends EventEmitter {
     const { client, userId, guildId } = session;
 
     const messageCreateHandler = async (message: Message) => {
-      if (this.isShuttingDown || !session.isActive) return;
+      if (this.isShuttingDown || !session.isActive || session.destroyed) return;
       
       try {
         this.metrics.totalMessagesProcessed++;
@@ -1419,7 +1470,7 @@ export class AutoJoinManager extends EventEmitter {
     };
 
     const messageUpdateHandler = async (_old: any, updated: any) => {
-      if (this.isShuttingDown || !session.isActive) return;
+      if (this.isShuttingDown || !session.isActive || session.destroyed) return;
       try {
         await this.handleMessage(updated as Message, session);
       } catch (error) {
@@ -1447,7 +1498,7 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   // -------------------------------------------------------------------------
-  // Message Handling
+  // Message Handling - (rest of the file unchanged)
   // -------------------------------------------------------------------------
 
   private async handleMessage(message: Message, session: UserSession): Promise<void> {
@@ -1458,7 +1509,6 @@ export class AutoJoinManager extends EventEmitter {
 
     const entryId = this.makeEntryId(session, message);
 
-    // Check caches
     if (this.processedMessages.has(entryId)) {
       this.metrics.cacheHits++;
       return;
@@ -1624,7 +1674,6 @@ export class AutoJoinManager extends EventEmitter {
       return null;
     }
 
-    // Unknown bot - strict
     let hasDraftButton = false;
     for (const row of components) {
       const rowAny = row as Record<string, unknown>;
