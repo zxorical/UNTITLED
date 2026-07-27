@@ -11,7 +11,7 @@
  * - Memory-stable even with high message volume
  */
 
-import { Client, Message, TextChannel, Options } from 'discord.js-selfbot-v13';
+import { Client, Message, TextChannel } from 'discord.js-selfbot-v13';
 import { EventEmitter } from 'events';
 import axios, { AxiosInstance } from 'axios';
 import https from 'https';
@@ -56,7 +56,7 @@ const http: AxiosInstance = axios.create({
 
 type EntryStatus = 'pending' | 'attempting' | 'success' | 'failed' | 'skipped' | 'queued' | 'dead_letter';
 
-interface GiveawayEntry {
+export interface GiveawayEntry {
   entryId: string;
   userId: string;
   messageId: string;
@@ -74,13 +74,13 @@ interface GiveawayEntry {
   correlationId: string;
 }
 
-interface GiveawayButton {
+export interface GiveawayButton {
   customId: string;
   label: string;
   disabled: boolean;
 }
 
-interface GiveawayStats {
+export interface GiveawayStats {
   detected: number;
   succeeded: number;
   failed: number;
@@ -309,27 +309,79 @@ export class AutoJoinManager extends EventEmitter {
 
   private shuttingDown = false;
 
-  private constructor(
-    client: Client,
-    userId: string,
-    guildId: string,
-    token: string,
-    label: string
+  // ============================================================
+  // FIX: Public constructor - allows controller instantiation
+  // ============================================================
+  constructor(
+    client?: Client,
+    userId?: string,
+    guildId?: string,
+    token?: string,
+    label?: string
   ) {
     super();
+    
+    // If no client provided, this is a "controller" instance
+    // It manages other sessions but doesn't have its own client
+    if (!client) {
+      this.client = null as any;
+      this.userId = '';
+      this.guildId = '';
+      this.token = '';
+      this.label = 'controller';
+      this.id = 'controller';
+      
+      // Initialize empty caches
+      this.processed = new Map();
+      this.dbChecked = new Map();
+      this.wins = new Map();
+      this.entries = new Map();
+      this.processing = new Set();
+      this.channelCheckCache = new Map();
+      this.stats = {
+        detected: 0,
+        succeeded: 0,
+        failed: 0,
+        skipped: 0,
+        duplicates: 0,
+        wins: 0,
+        started: Date.now(),
+      };
+      
+      return;
+    }
+    
+    // Normal session initialization
     this.client = client;
-    this.userId = userId;
-    this.guildId = guildId;
-    this.token = token;
-    this.label = label;
+    this.userId = userId!;
+    this.guildId = guildId!;
+    this.token = token!;
+    this.label = label || 'main';
     this.id = `${userId}:${guildId}`;
+
+    // Initialize caches
+    this.processed = new Map();
+    this.dbChecked = new Map();
+    this.wins = new Map();
+    this.entries = new Map();
+    this.processing = new Set();
+    this.channelCheckCache = new Map();
+    this.stats = {
+      detected: 0,
+      succeeded: 0,
+      failed: 0,
+      skipped: 0,
+      duplicates: 0,
+      wins: 0,
+      started: Date.now(),
+    };
 
     cleanup.register(this);
     this.sweepCache();
   }
 
   // ---------------------------------------------------------------------------
-  // Factory
+  // Factory - For creating session instances
   // ---------------------------------------------------------------------------
 
   static create(
@@ -361,6 +413,41 @@ export class AutoJoinManager extends EventEmitter {
     return this.instances.size;
   }
 
+  static getGlobalStats(): {
+    managers: number;
+    queue: { length: number; active: number };
+    managerIds: string[];
+  } {
+    return {
+      managers: this.instances.size,
+      queue: globalQueue.stats,
+      managerIds: Array.from(this.instances.keys()),
+    };
+  }
+
+  // ============================================================
+  // FIX: Get stats with managers for controller
+  // ============================================================
+  getStatsWithManagers(): {
+    stats: GiveawayStats & {
+      entries: number;
+      processed: number;
+      queue: { length: number; active: number };
+      channelCache: number;
+    };
+    managers: number;
+    managersList: string[];
+  } {
+    const stats = this.getStats();
+    const managerIds = Array.from(AutoJoinManager.instances.keys());
+    
+    return {
+      stats,
+      managers: AutoJoinManager.instances.size,
+      managersList: managerIds,
+    };
+  }
+
   // ---------------------------------------------------------------------------
   // Public API
   // ---------------------------------------------------------------------------
@@ -368,6 +455,126 @@ export class AutoJoinManager extends EventEmitter {
   getId(): string { return this.id; }
   isShuttingDown(): boolean { return this.shuttingDown; }
   getLabel(): string { return this.label; }
+
+  // ============================================================
+  // FIX: startAllSessions - For controller instance
+  // ============================================================
+  async startAllSessions(): Promise<void> {
+    if (this.id !== 'controller') {
+      logger.warn('startAllSessions called on non-controller instance', {
+        id: this.id,
+        label: this.label,
+      });
+      return;
+    }
+
+    logger.info('AutoJoinManager: Starting all sessions...', { component: 'AutoJoin' });
+    
+    try {
+      const { getAllPremiumUsersAllGuilds, setTokenActive } = await import('../database.js');
+      const premiumUsers = await getAllPremiumUsersAllGuilds();
+      
+      let started = 0;
+      let failed = 0;
+      
+      for (const user of premiumUsers) {
+        if (!user.token) {
+          failed++;
+          continue;
+        }
+        
+        try {
+          const client = new Client();
+          client.setMaxListeners(50);
+          
+          await client.login(user.token);
+          await this.waitForClientReady(client, user.token);
+          
+          const manager = AutoJoinManager.create(
+            client,
+            user.userId,
+            user.guildId,
+            user.token,
+            user.tokenLabel || 'main'
+          );
+          
+          started++;
+          
+          client.on('messageCreate', (message) => {
+            if (!this.shuttingDown) {
+              manager.handleMessage(message).catch(() => {});
+              manager.handleWin(message).catch(() => {});
+            }
+          });
+          
+          client.on('messageCreate', (message) => {
+            if (!message.guild && !this.shuttingDown) {
+              manager.handleDmWin(message).catch(() => {});
+            }
+          });
+          
+          await setTokenActive(user.userId, user.guildId, true);
+          
+          logger.info('✅ Premium session started', {
+            userId: user.userId,
+            label: user.tokenLabel || 'main',
+          });
+          
+        } catch (error) {
+          failed++;
+          logger.error('Failed to start premium session', {
+            userId: user.userId,
+            error: formatError(error),
+          });
+          await setTokenActive(user.userId, user.guildId, false);
+        }
+      }
+      
+      logger.info(`AutoJoinManager: ${started} sessions started, ${failed} failed`, {
+        component: 'AutoJoin',
+      });
+      
+    } catch (error) {
+      logger.error('AutoJoinManager: Failed to start sessions', {
+        error: formatError(error),
+      });
+    }
+  }
+
+  private async waitForClientReady(client: Client, token: string): Promise<void> {
+    return new Promise((resolve, reject) => {
+      let resolved = false;
+      
+      const readyHandler = () => {
+        if (resolved) return;
+        resolved = true;
+        cleanup();
+        resolve();
+      };
+      
+      const errorHandler = (err: Error) => {
+        if (resolved) return;
+        resolved = true;
+        cleanup();
+        reject(err);
+      };
+      
+      const cleanup = () => {
+        client.off('ready', readyHandler);
+        client.off('error', errorHandler);
+      };
+      
+      client.once('ready', readyHandler);
+      client.once('error', errorHandler);
+      
+      client.login(token).catch((err) => {
+        if (resolved) return;
+        resolved = true;
+        cleanup();
+        reject(err);
+      });
+    });
+  }
 
   async handleMessage(message: Message): Promise<void> {
     if (!this.shouldProcess(message)) return;
@@ -1011,7 +1218,7 @@ export class AutoJoinManager extends EventEmitter {
   // Stats
   // ---------------------------------------------------------------------------
 
-  getStats(): GiveawayStats & { 
+  getStats(): GiveawayStats & {
     entries: number;
     processed: number;
     queue: { length: number; active: number };
@@ -1022,16 +1229,6 @@ export class AutoJoinManager extends EventEmitter {
       entries: this.entries.size,
       processed: this.processed.size,
       channelCache: this.channelCheckCache.size,
-      queue: globalQueue.stats,
-    };
-  }
-
-  static getGlobalStats(): {
-    managers: number;
-    queue: { length: number; active: number };
-  } {
-    return {
-      managers: this.instances.size,
       queue: globalQueue.stats,
     };
   }
@@ -1065,5 +1262,4 @@ export class AutoJoinManager extends EventEmitter {
 // Exports
 // ---------------------------------------------------------------------------
 
-export type { GiveawayEntry, GiveawayButton, GiveawayStats, EntryStatus };
 export { globalQueue };
