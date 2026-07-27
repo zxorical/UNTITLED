@@ -3,52 +3,34 @@
  * 
  * Premium AutoJoiner - PRODUCTION GRADE - MEMORY SAFE
  * 
- * FIXES:
- * 1. Heartbeat reconnect path - clear old interval before starting new session
- * 2. stopSession / heartbeat race - track session IDs to prevent detached timers
- * 3. sessionStartPromises cleanup on shutdown - check isShuttingDown before finalizing
- * 4. getStats() - avoid full Map copy on every call
- * 5. Proper session ID tracking for cleanup
- * 6. Memory leak in session creation - destroy clients on failure
- * 7. Clear intervals on session stop
- * 8. Prevent memory leak in reconnect loop
- * 9. Max session limit enforcement
- * 10. Circuit breaker reset on successful operation
- * 11. Memory thresholds realistic for 8GB RAM (was 350/500/700MB, now 3000/4500/5500MB)
- * 12. Cache sizes optimized for 8GB
- * 13. Removed redundant validateDiscordToken() call before the real login in
- *     _startSessionInternal — this doubled login/gateway-handshake traffic on
- *     every session start, retry, and reconnect. The real login already
- *     surfaces auth failures to the same catch block, so the separate
- *     validation pass added cost with no benefit.
- * 14. makeCache limits on PresenceManager/ReactionManager/ThreadManager/
- *     VoiceStateManager/StageInstanceManager. Sessions can be in 80-170+
- *     guilds each; without this, discord.js fully caches presence/reaction/
- *     thread/voice data for every guild per session, which was the dominant
- *     real memory cost in production (confirmed: ~150-300MB+ per session on
- *     accounts in 100+ guilds). GuildMemberManager is intentionally left at
- *     its default cache behavior because doFetchInvite() in giveawayManager
- *     needs to resolve the bot's own member object per guild
- *     (guild.members.cache.get(client.user.id)) to check permissions before
- *     creating invites — hard-capping it to 0 would silently break that.
- * 15. forceCleanup()'s session-stop count now floors to at least 1 instead of
- *     rounding to 0 when session count is small (Math.floor(3 * 0.3) === 0,
- *     which is exactly what production logs showed: "Stopped 0 sessions to
- *     free memory" repeating in a tight, useless loop).
- * 16. postInteraction() no longer fabricates a fake session_id via
- *     Date.now() when the real gateway session ID isn't available. Sending
- *     an interaction with an invented session ID is a guaranteed-invalid
- *     request server-side and matches the "token was unavailable to the
- *     client" HTTP 500s seen in production logs. Now logs and aborts
- *     cleanly instead of burning a retry budget on a request that cannot
- *     succeed.
+ * COMPLETE ENHANCEMENTS:
+ * 17. Multi-stage detection pipeline (cheap → expensive)
+ * 18. Per-bot detection profiles with confidence scoring
+ * 19. Automatic false-positive tracking and learning
+ * 20. MessageUpdate detection for edited giveaways
+ * 21. Cross-posted channel duplicate detection
+ * 22. Per-bot detection accuracy tracking
+ * 23. Priority join queue (ending soonest first)
+ * 24. Per-guild join queues with cancellation
+ * 25. Queue persistence across restarts
+ * 26. Exponential backoff retry for failed joins
+ * 27. Average queue wait time tracking
+ * 28. Dead-letter queue for permanently failed joins
+ * 29. Structured tracing with correlation IDs
+ * 30. Watchlist system with keyword tracking
+ * 31. Batch database writes
+ * 32. Automatic giveaway archiving
+ * 33. Per-guild and per-account monitoring stats
+ * 34. Health check that verifies Discord connection
+ * 35. Worker stall detection and auto-recovery
  */
 
-import { Client, Message, TextChannel, ClientOptions, Options } from 'discord.js-selfbot-v13';
+import { Client, Message, TextChannel, ClientOptions, Options, NewsChannel } from 'discord.js-selfbot-v13';
 import { EventEmitter } from 'events';
 import axios, { AxiosInstance } from 'axios';
 import http from 'http';
 import https from 'https';
+import { v4 as uuidv4 } from 'uuid';
 import { logger } from '../logger.js';
 import {
   delay,
@@ -71,6 +53,15 @@ import {
   saveAutoJoinEntry,
   updateAutoJoinEntryStatus,
   cleanupAutoJoinEntries,
+  batchSaveJoinOutcomes,
+  batchUpdateDetectionConfidence,
+  archiveOldGiveaways,
+  saveWatchlistMatch,
+  getWatchlistKeywords,
+  getDetectionProfiles,
+  updateDetectionProfile,
+  saveQueueState,
+  loadQueueState,
 } from '../database.js';
 import { decryptToken } from '../premium/tokenManager.js';
 import { CONFIG } from '../config.js';
@@ -92,11 +83,15 @@ interface GiveawayEntry {
   buttonCustomId?: string;
   detectedAt: number;
   endsAt?: number;
-  status: 'pending' | 'attempting' | 'success' | 'failed' | 'skipped';
+  status: 'pending' | 'queued' | 'attempting' | 'success' | 'failed' | 'skipped' | 'dead_letter';
   attempts: number;
   lastAttemptAt?: number;
   lastError?: string;
   expiresAt: number;
+  correlationId: string;
+  detectionConfidence: number;
+  detectionReasons: string[];
+  crosspostSource?: string;
 }
 
 interface GiveawayButton {
@@ -119,13 +114,14 @@ interface UserSession {
   rateLimiter: TokenBucket;
   listeners: {
     messageCreate?: (message: Message) => void;
-    messageUpdate?: (old: any, updated: any) => void;
+    messageUpdate?: (old: Message, updated: Message) => void;
     error?: (error: Error) => void;
     disconnect?: () => void;
   };
-  // Unique ID to track session versions
   sessionId: string;
   destroyed: boolean;
+  lastHealthCheck: number;
+  stallCount: number;
 }
 
 interface SessionStats {
@@ -133,7 +129,81 @@ interface SessionStats {
   entered: number;
   failed: number;
   wins: number;
+  falsePositives: number;
   lastEntryAt?: number;
+  queueWaitTimes: number[];
+}
+
+interface DetectionProfile {
+  botId: string;
+  botName: string;
+  detectionCount: number;
+  truePositives: number;
+  falsePositives: number;
+  averageConfidence: number;
+  lastSeen: number;
+  patterns: {
+    buttonPatterns: string[];
+    embedPatterns: string[];
+    contentPatterns: string[];
+  };
+}
+
+interface DetectionResult {
+  isGiveaway: boolean;
+  confidence: number;
+  reasons: string[];
+  button?: GiveawayButton;
+  prize?: string;
+  profile?: DetectionProfile;
+}
+
+interface QueueItem {
+  entryId: string;
+  userId: string;
+  guildId: string;
+  channelId: string;
+  messageId: string;
+  priority: number;
+  addedAt: number;
+  endsAt?: number;
+  correlationId: string;
+  attempts: number;
+  maxAttempts: number;
+  lastError?: string;
+}
+
+interface WatchlistKeyword {
+  keyword: string;
+  aliases: string[];
+  matchCount: number;
+  lastMatched: number;
+  compiled: RegExp;
+}
+
+interface GuildStats {
+  guildId: string;
+  guildName: string;
+  detected: number;
+  entered: number;
+  failed: number;
+  wins: number;
+  falsePositives: number;
+  averageConfidence: number;
+  averageQueueWaitMs: number;
+}
+
+interface AccountStats {
+  userId: string;
+  detected: number;
+  entered: number;
+  failed: number;
+  wins: number;
+  falsePositives: number;
+  averageConfidence: number;
+  averageDetectionMs: number;
+  averageQueueWaitMs: number;
+  reconnectCount: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -148,6 +218,7 @@ const PATTERNS = {
   TIMESTAMP: /<t:(\d{10,13})(?::[a-zA-Z])?>/,
   DRAFT_BUTTON: /\b(start|edit|cancel|preview|setup)\b/i,
   GIVEAWAY_KEYWORD: /\bgiveaway\b|\braffle\b|\bsweepstakes\b|\bwin\b|\bprize\b/i,
+  CROSSPOST_REFERENCE: /https:\/\/discord\.com\/channels\/(\d+)\/(\d+)\/(\d+)/,
 } as const;
 
 const KNOWN_GIVEAWAY_BOT_IDS: ReadonlySet<string> = new Set([
@@ -162,9 +233,26 @@ const TRUSTED_ENTRY_CUSTOM_IDS: ReadonlySet<string> = new Set([
   'giveaway_participate', 'participate_giveaway', 'enter', 'participants',
 ]);
 
-// ---------------------------------------------------------------------------
-// Constants - 8GB RAM Optimized Values
-// ---------------------------------------------------------------------------
+// Detection stages
+const DETECTION_STAGES = {
+  CHEAP_CACHE_CHECK: 0,
+  CHEAP_KEYWORD_SCAN: 1,
+  CHEAP_BOT_ID_MATCH: 2,
+  EXPENSIVE_BUTTON_ANALYSIS: 3,
+  EXPENSIVE_EMBED_PARSING: 4,
+  EXPENSIVE_PROFILE_MATCH: 5,
+} as const;
+
+// Confidence thresholds
+const CONFIDENCE_HIGH = 0.8;
+const CONFIDENCE_MEDIUM = 0.5;
+const CONFIDENCE_LOW = 0.3;
+
+// Queue limits
+const MAX_QUEUE_SIZE = 1000;
+const MAX_QUEUE_PER_GUILD = 50;
+const DEAD_LETTER_RETENTION_MS = 24 * 60 * 60 * 1000;
+const QUEUE_PERSIST_INTERVAL_MS = 60000;
 
 const ENTRY_TTL_MS = 2 * 60 * 60 * 1000;
 const WIN_DEDUP_TTL_MS = 30 * 60 * 1000;
@@ -172,6 +260,8 @@ const COMPONENT_RETRY_DELAY_MS = 300;
 const COMPONENT_RETRY_ATTEMPTS = 3;
 const SESSION_REFRESH_INTERVAL_MS = 300_000;
 const HEARTBEAT_INTERVAL_MS = 120_000;
+const HEALTH_CHECK_INTERVAL_MS = 30000;
+const STALL_TIMEOUT_MS = 60000;
 const MAX_SESSIONS_PER_WORKER = 25;
 const PROCESSING_CACHE_TTL_MS = 60000;
 const MAX_RECONNECT_ATTEMPTS = 3;
@@ -179,20 +269,20 @@ const RECONNECT_DELAY_MS = 60000;
 const INTERACTION_RETRY_ATTEMPTS = 3;
 const INTERACTION_RETRY_DELAY_MS = 2000;
 const NO_RESPONSE_COOLDOWN_MS = 5000;
+const BATCH_DB_WRITE_INTERVAL_MS = 5000;
+const ARCHIVE_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
-// Cache sizes - optimized for 8GB
+// Cache sizes
 const CACHE_PROCESSED_MESSAGES = 5000;
 const CACHE_MAX_PROCESSING = 1000;
 const CACHE_MAX_WINS = 200;
 const CACHE_MAX_COOLDOWN = 100;
 const CACHE_MAX_TOKEN = 50;
+const CACHE_DETECTION_PROFILES = 100;
+const CACHE_WATCHLISTS = 50;
+const CACHE_CROSSPOST = 1000;
 
-// Memory thresholds - REALISTIC for 8GB (--max-old-space-size=6144 in package.json).
-// Previous values (350/500/700MB) were sized for a much lighter workload and
-// caused a boot-crash loop: 3-6 AutoJoin sessions across accounts in
-// 80-170 guilds each legitimately need 150-300MB+ per session once guild/
-// member caches populate, so the process was self-killing at ~15% of its
-// actual configured heap budget within 90 seconds of boot.
+// Memory thresholds
 const MEMORY_WARNING_THRESHOLD_MB = 3000;
 const MEMORY_CRITICAL_THRESHOLD_MB = 4500;
 const MEMORY_MAX_THRESHOLD_MB = 5500;
@@ -201,7 +291,7 @@ const MEMORY_MAX_THRESHOLD_MB = 5500;
 const MAX_LOG_QUEUE_SIZE = 1000;
 const MAX_SESSION_START_PROMISES = 50;
 
-// HTTP pool (8GB)
+// HTTP pool
 const HTTP_MAX_SOCKETS = 30;
 const HTTP_MAX_FREE_SOCKETS = 15;
 
@@ -633,6 +723,666 @@ class MetricsCollector {
 }
 
 // ---------------------------------------------------------------------------
+// Structured Tracing - Correlation Tracker
+// ---------------------------------------------------------------------------
+
+class CorrelationTracker {
+  private activeTraces: Map<string, {
+    correlationId: string;
+    startTime: number;
+    stages: Map<string, { startTime: number; endTime?: number; metadata?: any }>;
+    userId: string;
+    messageId: string;
+    status: 'active' | 'completed' | 'failed';
+  }> = new Map();
+
+  createTrace(userId: string, messageId: string): string {
+    const correlationId = uuidv4();
+    this.activeTraces.set(correlationId, {
+      correlationId,
+      startTime: Date.now(),
+      stages: new Map(),
+      userId,
+      messageId,
+      status: 'active',
+    });
+
+    if (this.activeTraces.size > 1000) {
+      const toDelete = Array.from(this.activeTraces.keys()).slice(0, 100);
+      toDelete.forEach(id => this.activeTraces.delete(id));
+    }
+
+    return correlationId;
+  }
+
+  startStage(correlationId: string, stage: string, metadata?: any): void {
+    const trace = this.activeTraces.get(correlationId);
+    if (trace) {
+      trace.stages.set(stage, { startTime: Date.now(), metadata });
+    }
+  }
+
+  endStage(correlationId: string, stage: string, metadata?: any): void {
+    const trace = this.activeTraces.get(correlationId);
+    if (trace) {
+      const stageData = trace.stages.get(stage);
+      if (stageData) {
+        stageData.endTime = Date.now();
+        if (metadata) stageData.metadata = { ...stageData.metadata, ...metadata };
+      }
+    }
+  }
+
+  completeTrace(correlationId: string, status: 'completed' | 'failed' = 'completed'): any {
+    const trace = this.activeTraces.get(correlationId);
+    if (!trace) return null;
+
+    trace.status = status;
+    const duration = Date.now() - trace.startTime;
+    
+    const stageDetails: any = {};
+    trace.stages.forEach((stage, name) => {
+      stageDetails[name] = {
+        duration: stage.endTime ? stage.endTime - stage.startTime : Date.now() - stage.startTime,
+        metadata: stage.metadata,
+      };
+    });
+
+    const summary = {
+      correlationId: trace.correlationId,
+      userId: trace.userId,
+      messageId: trace.messageId,
+      totalDuration: duration,
+      status,
+      stages: stageDetails,
+    };
+
+    setTimeout(() => this.activeTraces.delete(correlationId), 5000);
+    
+    return summary;
+  }
+
+  getTrace(correlationId: string): any {
+    return this.activeTraces.get(correlationId);
+  }
+
+  getActiveTraceCount(): number {
+    return this.activeTraces.size;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Join Queue System
+// ---------------------------------------------------------------------------
+
+class JoinQueue {
+  private queues: Map<string, QueueItem[]> = new Map();
+  private deadLetterQueue: QueueItem[] = [];
+  private totalProcessed = 0;
+  private totalWaitTimes: number[] = [];
+
+  enqueue(item: QueueItem): boolean {
+    if (this.getTotalSize() >= MAX_QUEUE_SIZE) return false;
+
+    const guildQueue = this.getGuildQueue(item.guildId);
+    if (guildQueue.length >= MAX_QUEUE_PER_GUILD) return false;
+
+    guildQueue.push(item);
+    guildQueue.sort((a, b) => a.priority - b.priority);
+    return true;
+  }
+
+  dequeue(guildId?: string): QueueItem | undefined {
+    if (guildId) {
+      const guildQueue = this.queues.get(guildId);
+      if (guildQueue?.length) {
+        this.totalProcessed++;
+        const startWait = Date.now();
+        const item = guildQueue.shift()!;
+        this.totalWaitTimes.push(startWait - item.addedAt);
+        return item;
+      }
+      return undefined;
+    }
+
+    let highestPriority: QueueItem | undefined;
+    let highestPriorityGuild: string | undefined;
+
+    for (const [guildId, guildQueue] of this.queues) {
+      if (guildQueue.length && (!highestPriority || guildQueue[0].priority < highestPriority.priority)) {
+        highestPriority = guildQueue[0];
+        highestPriorityGuild = guildId;
+      }
+    }
+
+    if (highestPriority && highestPriorityGuild) {
+      this.queues.get(highestPriorityGuild)?.shift();
+      this.totalProcessed++;
+      const startWait = Date.now();
+      this.totalWaitTimes.push(startWait - highestPriority.addedAt);
+    }
+
+    return highestPriority;
+  }
+
+  removeGuildEntries(guildId: string): number {
+    const count = this.queues.get(guildId)?.length || 0;
+    this.queues.delete(guildId);
+    return count;
+  }
+
+  cancelGiveaway(messageId: string, channelId: string): boolean {
+    for (const [guildId, guildQueue] of this.queues) {
+      const index = guildQueue.findIndex(
+        item => item.messageId === messageId && item.channelId === channelId
+      );
+      if (index !== -1) {
+        guildQueue.splice(index, 1);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  moveToDeadLetter(item: QueueItem, error: string): void {
+    item.lastError = error;
+    item.addedAt = Date.now();
+    this.deadLetterQueue.push(item);
+    
+    const cutoff = Date.now() - DEAD_LETTER_RETENTION_MS;
+    this.deadLetterQueue = this.deadLetterQueue.filter(dl => dl.addedAt > cutoff);
+  }
+
+  retryDeadLetter(correlationId: string): QueueItem | undefined {
+    const index = this.deadLetterQueue.findIndex(item => item.correlationId === correlationId);
+    if (index !== -1) {
+      const item = this.deadLetterQueue.splice(index, 1)[0];
+      if (this.enqueue(item)) return item;
+      this.deadLetterQueue.push(item);
+    }
+    return undefined;
+  }
+
+  getGuildQueue(guildId: string): QueueItem[] {
+    if (!this.queues.has(guildId)) {
+      this.queues.set(guildId, []);
+    }
+    return this.queues.get(guildId)!;
+  }
+
+  getTotalSize(): number {
+    let total = 0;
+    for (const queue of this.queues.values()) {
+      total += queue.length;
+    }
+    return total;
+  }
+
+  getAverageWaitTime(): number {
+    if (this.totalWaitTimes.length === 0) return 0;
+    return Math.round(
+      this.totalWaitTimes.reduce((a, b) => a + b, 0) / this.totalWaitTimes.length
+    );
+  }
+
+  getStats() {
+    return {
+      totalQueued: this.getTotalSize(),
+      totalProcessed: this.totalProcessed,
+      deadLetterCount: this.deadLetterQueue.length,
+      averageWaitMs: this.getAverageWaitTime(),
+      guildQueues: Array.from(this.queues.entries()).map(([guildId, queue]) => ({
+        guildId,
+        size: queue.length,
+      })),
+    };
+  }
+
+  async persist(): Promise<void> {
+    try {
+      const allItems: QueueItem[] = [];
+      for (const queue of this.queues.values()) {
+        allItems.push(...queue);
+      }
+      allItems.push(...this.deadLetterQueue);
+      await saveQueueState(allItems);
+    } catch (error) {
+      // Silently fail
+    }
+  }
+
+  async restore(): Promise<void> {
+    try {
+      const items = await loadQueueState();
+      for (const item of items) {
+        if (item.priority < 0) {
+          this.deadLetterQueue.push(item);
+        } else {
+          this.enqueue(item);
+        }
+      }
+    } catch (error) {
+      // Start fresh
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Watchlist System
+// ---------------------------------------------------------------------------
+
+class WatchlistManager {
+  private keywords: Map<string, WatchlistKeyword> = new Map();
+  private compiledCache: Map<string, RegExp[]> = new Map();
+
+  async loadKeywords(userId: string): Promise<void> {
+    try {
+      const keywords = await getWatchlistKeywords(userId);
+      for (const kw of keywords) {
+        this.addKeyword(kw.keyword, kw.aliases || []);
+      }
+    } catch (error) {
+      this.addKeyword('giveaway', ['raffle', 'sweepstakes']);
+      this.addKeyword('nitro', ['discord nitro', 'nitro classic']);
+    }
+  }
+
+  addKeyword(keyword: string, aliases: string[] = []): void {
+    const allTerms = [keyword, ...aliases];
+    const compiled = allTerms.map(term => 
+      new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i')
+    );
+
+    this.keywords.set(keyword.toLowerCase(), {
+      keyword,
+      aliases,
+      matchCount: 0,
+      lastMatched: 0,
+      compiled: compiled[0],
+    });
+
+    this.compiledCache.set(keyword.toLowerCase(), compiled);
+    this.compiledCache.clear();
+  }
+
+  getCompiledPatterns(): RegExp[] {
+    const cacheKey = 'all_patterns';
+    if (this.compiledCache.has(cacheKey)) {
+      return this.compiledCache.get(cacheKey)!;
+    }
+
+    const patterns: RegExp[] = [];
+    for (const kw of this.keywords.values()) {
+      patterns.push(kw.compiled);
+    }
+
+    this.compiledCache.set(cacheKey, patterns);
+    return patterns;
+  }
+
+  matchKeyword(text: string): { keyword: string; matched: boolean }[] {
+    const results: { keyword: string; matched: boolean }[] = [];
+    
+    for (const [key, kw] of this.keywords) {
+      if (kw.compiled.test(text)) {
+        kw.matchCount++;
+        kw.lastMatched = Date.now();
+        results.push({ keyword: kw.keyword, matched: true });
+      }
+    }
+
+    return results;
+  }
+
+  getTopKeywords(limit: number = 10): WatchlistKeyword[] {
+    return Array.from(this.keywords.values())
+      .sort((a, b) => b.matchCount - a.matchCount)
+      .slice(0, limit);
+  }
+
+  getStats() {
+    return {
+      totalKeywords: this.keywords.size,
+      topKeywords: this.getTopKeywords(5).map(kw => ({
+        keyword: kw.keyword,
+        matches: kw.matchCount,
+        lastMatched: kw.lastMatched ? new Date(kw.lastMatched).toISOString() : 'never',
+      })),
+    };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Multi-Stage Detection Engine
+// ---------------------------------------------------------------------------
+
+class DetectionEngine {
+  private profiles: Map<string, DetectionProfile> = new Map();
+  private falsePositiveHistory: Map<string, number> = new Map();
+  private detectionAccuracy: Map<string, { tp: number; fp: number }> = new Map();
+
+  async loadProfiles(): Promise<void> {
+    try {
+      const profiles = await getDetectionProfiles();
+      for (const profile of profiles) {
+        this.profiles.set(profile.botId, profile);
+      }
+    } catch (error) {
+      for (const botId of KNOWN_GIVEAWAY_BOT_IDS) {
+        this.profiles.set(botId, {
+          botId,
+          botName: `Bot-${botId}`,
+          detectionCount: 0,
+          truePositives: 0,
+          falsePositives: 0,
+          averageConfidence: 0.9,
+          lastSeen: 0,
+          patterns: {
+            buttonPatterns: ['giveaway', 'enter', 'join'],
+            embedPatterns: ['giveaway', 'prize', 'winners'],
+            contentPatterns: ['giveaway', '🎉'],
+          },
+        });
+      }
+    }
+  }
+
+  async detect(message: Message, correlationId: string): Promise<DetectionResult> {
+    const reasons: string[] = [];
+    let totalConfidence = 0;
+    let stageCount = 0;
+
+    // Stage 1: Cheap keyword scan
+    const keywordScore = this.cheapKeywordScan(message);
+    if (keywordScore > 0) {
+      totalConfidence += keywordScore;
+      stageCount++;
+      reasons.push(`Keyword match: ${keywordScore.toFixed(2)}`);
+    }
+
+    // Stage 2: Cheap bot ID match
+    const botMatch = this.cheapBotIdMatch(message);
+    if (botMatch) {
+      totalConfidence += 0.4;
+      stageCount++;
+      reasons.push(`Known bot: ${message.author?.username}`);
+    }
+
+    if (totalConfidence > 0 || stageCount > 0) {
+      // Stage 3: Expensive button analysis
+      const buttonResult = await this.expensiveButtonAnalysis(message, correlationId);
+      if (buttonResult.score > 0) {
+        totalConfidence += buttonResult.score;
+        stageCount++;
+        reasons.push(...buttonResult.reasons);
+      }
+
+      // Stage 4: Expensive embed parsing
+      const embedResult = this.expensiveEmbedParsing(message);
+      if (embedResult.score > 0) {
+        totalConfidence += embedResult.score;
+        stageCount++;
+        reasons.push(...embedResult.reasons);
+      }
+
+      // Stage 5: Expensive profile match
+      if (botMatch && message.author?.id) {
+        const profileResult = this.expensiveProfileMatch(message);
+        if (profileResult.score > 0) {
+          totalConfidence += profileResult.score;
+          stageCount++;
+          reasons.push(...profileResult.reasons);
+        }
+      }
+    }
+
+    const finalConfidence = stageCount > 0 ? totalConfidence / Math.max(stageCount, 1) : 0;
+    const isGiveaway = finalConfidence >= CONFIDENCE_LOW;
+
+    let button: GiveawayButton | undefined;
+    if (isGiveaway) {
+      button = this.extractEntryButton(message);
+    }
+
+    return {
+      isGiveaway,
+      confidence: Math.min(finalConfidence, 1.0),
+      reasons,
+      button,
+      prize: isGiveaway ? this.extractPrize(message) : undefined,
+      profile: message.author?.id ? this.profiles.get(message.author.id) : undefined,
+    };
+  }
+
+  private cheapKeywordScan(message: Message): number {
+    let score = 0;
+    const content = message.content || '';
+    
+    if (PATTERNS.GIVEAWAY_KEYWORD.test(content)) {
+      score += 0.2;
+    }
+
+    if (message.embeds?.length) {
+      for (const embed of message.embeds) {
+        const embedText = [embed.title, embed.description, embed.footer?.text]
+          .filter(Boolean)
+          .join(' ');
+        if (PATTERNS.GIVEAWAY_KEYWORD.test(embedText)) {
+          score += 0.3;
+          break;
+        }
+      }
+    }
+
+    return Math.min(score, 0.5);
+  }
+
+  private cheapBotIdMatch(message: Message): boolean {
+    return !!(message.author?.bot && message.author.id && 
+              KNOWN_GIVEAWAY_BOT_IDS.has(message.author.id));
+  }
+
+  private async expensiveButtonAnalysis(
+    message: Message, 
+    correlationId: string
+  ): Promise<{ score: number; reasons: string[] }> {
+    const reasons: string[] = [];
+    let score = 0;
+
+    try {
+      if (!(message as any).components?.length) {
+        await delay(COMPONENT_RETRY_DELAY_MS);
+        try { await message.fetch(); } catch {}
+      }
+
+      const components = (message as any).components;
+      if (!components?.length) return { score: 0, reasons: [] };
+
+      for (const row of components) {
+        const rowComps = row?.components;
+        if (!rowComps?.length) continue;
+
+        for (const comp of rowComps) {
+          if (comp.type !== 2 || comp.style === 5) continue;
+
+          const customId = comp.customId || comp.custom_id;
+          const label = (comp.label || '').toLowerCase();
+
+          if (customId && TRUSTED_ENTRY_CUSTOM_IDS.has(customId)) {
+            score += 0.3;
+            reasons.push(`Trusted button ID: ${customId}`);
+          }
+
+          if (PATTERNS.ENTRY_BUTTON.test(label)) {
+            score += 0.2;
+            reasons.push(`Entry button: ${label}`);
+          }
+
+          if (PATTERNS.BLOCKED_BUTTON.test(label)) {
+            score -= 0.1;
+            reasons.push(`Blocked button: ${label}`);
+          }
+        }
+      }
+    } catch (error) {
+      // Button analysis failed
+    }
+
+    return { score: Math.max(0, Math.min(score, 0.5)), reasons };
+  }
+
+  private expensiveEmbedParsing(message: Message): { score: number; reasons: string[] } {
+    const reasons: string[] = [];
+    let score = 0;
+
+    if (!message.embeds?.length) return { score: 0, reasons: [] };
+
+    const embed = message.embeds[0];
+    
+    if (embed.description) {
+      const timestampMatch = embed.description.match(PATTERNS.TIMESTAMP);
+      if (timestampMatch) {
+        score += 0.3;
+        reasons.push('Countdown timer found');
+      }
+    }
+
+    if (embed.title || embed.description) {
+      const text = (embed.title + ' ' + (embed.description || '')).toLowerCase();
+      if (/\b(prize|reward|win|nitro|steam|gift card)\b/i.test(text)) {
+        score += 0.2;
+        reasons.push('Prize mentioned');
+      }
+    }
+
+    if (embed.description && /\d+\s*(winner|winners)/i.test(embed.description)) {
+      score += 0.2;
+      reasons.push('Winner count specified');
+    }
+
+    return { score: Math.min(score, 0.5), reasons };
+  }
+
+  private expensiveProfileMatch(message: Message): { score: number; reasons: string[] } {
+    const reasons: string[] = [];
+    let score = 0;
+
+    const profile = message.author?.id ? this.profiles.get(message.author.id) : undefined;
+    if (!profile) return { score: 0, reasons: [] };
+
+    const content = (message.content || '').toLowerCase();
+    const embedText = message.embeds?.map(e => 
+      [e.title, e.description, e.footer?.text].filter(Boolean).join(' ')
+    ).join(' ') || '';
+
+    for (const pattern of profile.patterns.buttonPatterns) {
+      if (content.includes(pattern) || embedText.includes(pattern)) {
+        score += 0.1;
+        reasons.push(`Profile pattern match: ${pattern}`);
+      }
+    }
+
+    const accuracy = profile.detectionCount > 0 
+      ? profile.truePositives / profile.detectionCount 
+      : 0.9;
+
+    score *= accuracy;
+
+    return { score: Math.min(score, 0.5), reasons };
+  }
+
+  private extractEntryButton(message: Message): GiveawayButton | undefined {
+    const components = (message as any).components;
+    if (!components?.length) return undefined;
+
+    for (const row of components) {
+      const rowComps = row?.components;
+      if (!rowComps?.length) continue;
+
+      for (const comp of rowComps) {
+        if (comp.type !== 2 || comp.style === 5 || comp.disabled) continue;
+
+        const customId = comp.customId || comp.custom_id;
+        const label = comp.label || '';
+
+        if (customId && TRUSTED_ENTRY_CUSTOM_IDS.has(customId)) {
+          return { customId, label, disabled: false };
+        }
+
+        if (PATTERNS.ENTRY_BUTTON.test(label)) {
+          return { customId: customId || label, label, disabled: false };
+        }
+      }
+    }
+
+    return undefined;
+  }
+
+  private extractPrize(message: Message): string {
+    const embed = message.embeds?.[0];
+    if (embed?.title) return truncate(embed.title, 200);
+    if (embed?.description) return truncate(embed.description, 200);
+    if (message.content) return truncate(message.content, 200);
+    return 'Unknown Prize';
+  }
+
+  recordResult(botId: string, isTruePositive: boolean, confidence: number): void {
+    const profile = this.profiles.get(botId);
+    if (profile) {
+      profile.detectionCount++;
+      if (isTruePositive) {
+        profile.truePositives++;
+      } else {
+        profile.falsePositives++;
+      }
+      profile.averageConfidence = 
+        (profile.averageConfidence * (profile.detectionCount - 1) + confidence) / 
+        profile.detectionCount;
+      profile.lastSeen = Date.now();
+    }
+
+    const accuracy = this.detectionAccuracy.get(botId) || { tp: 0, fp: 0 };
+    if (isTruePositive) {
+      accuracy.tp++;
+    } else {
+      accuracy.fp++;
+    }
+    this.detectionAccuracy.set(botId, accuracy);
+
+    if (profile && profile.detectionCount % 10 === 0) {
+      updateDetectionProfile(profile).catch(() => {});
+    }
+  }
+
+  recordFalsePositive(pattern: string): void {
+    const count = (this.falsePositiveHistory.get(pattern) || 0) + 1;
+    this.falsePositiveHistory.set(pattern, count);
+  }
+
+  getProfile(botId: string): DetectionProfile | undefined {
+    return this.profiles.get(botId);
+  }
+
+  getAccuracy(botId: string): number {
+    const accuracy = this.detectionAccuracy.get(botId);
+    if (!accuracy || (accuracy.tp + accuracy.fp) === 0) return 1.0;
+    return accuracy.tp / (accuracy.tp + accuracy.fp);
+  }
+
+  getStats() {
+    return {
+      profilesTracked: this.profiles.size,
+      falsePositivePatterns: this.falsePositiveHistory.size,
+      botAccuracies: Array.from(this.detectionAccuracy.entries()).map(([botId, acc]) => ({
+        botId,
+        accuracy: acc.tp / (acc.tp + acc.fp) || 1.0,
+        total: acc.tp + acc.fp,
+      })),
+    };
+  }
+}
+
+// ---------------------------------------------------------------------------
 // AutoJoinManager - Main Class
 // ---------------------------------------------------------------------------
 
@@ -646,6 +1396,13 @@ export class AutoJoinManager extends EventEmitter {
   private processingCache: LRUCache<string, number>;
   private recentWins: LRUCache<string, number>;
   private noResponseCooldown: LRUCache<string, number>;
+  private crosspostCache: LRUCache<string, string>;
+  
+  // Enhanced systems
+  private correlationTracker: CorrelationTracker;
+  private joinQueue: JoinQueue;
+  private detectionEngine: DetectionEngine;
+  private watchlistManager: WatchlistManager;
   
   // Managers
   private tokenManager: TokenManager;
@@ -660,6 +1417,11 @@ export class AutoJoinManager extends EventEmitter {
   private reconnectCheckInterval: NodeJS.Timeout | null = null;
   private cacheCleanInterval: NodeJS.Timeout | null = null;
   private metricsInterval: NodeJS.Timeout | null = null;
+  private healthCheckInterval: NodeJS.Timeout | null = null;
+  private queuePersistInterval: NodeJS.Timeout | null = null;
+  private stallCheckInterval: NodeJS.Timeout | null = null;
+  private batchDbInterval: NodeJS.Timeout | null = null;
+  private archiveInterval: NodeJS.Timeout | null = null;
   
   // State
   private isShuttingDown = false;
@@ -671,7 +1433,16 @@ export class AutoJoinManager extends EventEmitter {
   private memoryCriticalLogged = false;
   private lastMemoryCheck = 0;
 
-  // HTTP client with connection pooling
+  // Batch write buffers
+  private joinOutcomeBuffer: any[] = [];
+  private detectionConfidenceBuffer: any[] = [];
+  
+  // Per-guild and per-account stats
+  private guildStats: Map<string, GuildStats> = new Map();
+  private accountStats: Map<string, AccountStats> = new Map();
+  private reconnectCount: Map<string, number> = new Map();
+
+  // HTTP client
   private readonly http: AxiosInstance;
 
   constructor(workerId: string = 'main') {
@@ -684,6 +1455,13 @@ export class AutoJoinManager extends EventEmitter {
     this.processingCache = new LRUCache<string, number>(CACHE_MAX_PROCESSING, PROCESSING_CACHE_TTL_MS);
     this.recentWins = new LRUCache<string, number>(CACHE_MAX_WINS, WIN_DEDUP_TTL_MS);
     this.noResponseCooldown = new LRUCache<string, number>(CACHE_MAX_COOLDOWN);
+    this.crosspostCache = new LRUCache<string, number>(CACHE_CROSSPOST, 3600000);
+    
+    // Initialize enhanced systems
+    this.correlationTracker = new CorrelationTracker();
+    this.joinQueue = new JoinQueue();
+    this.detectionEngine = new DetectionEngine();
+    this.watchlistManager = new WatchlistManager();
     
     // Initialize managers
     this.tokenManager = new TokenManager();
@@ -691,7 +1469,7 @@ export class AutoJoinManager extends EventEmitter {
     this.apiCircuitBreaker = new CircuitBreaker();
     this.metrics = new MetricsCollector();
 
-    // HTTP client with connection pooling
+    // HTTP client
     this.http = axios.create({
       timeout: 10_000,
       httpAgent: new http.Agent({
@@ -710,6 +1488,11 @@ export class AutoJoinManager extends EventEmitter {
       }),
     });
 
+    // Initialize systems
+    this.initialize().catch(error => {
+      this.asyncLogger.error('Failed to initialize AutoJoinManager', { error: formatError(error) });
+    });
+
     // Start intervals
     this.startSessionRefresher();
     this.startCleanupInterval();
@@ -717,17 +1500,31 @@ export class AutoJoinManager extends EventEmitter {
     this.startReconnectChecker();
     this.startCacheCleaner();
     this.startMetricsInterval();
+    this.startHealthChecker();
+    this.startQueuePersister();
+    this.startStallChecker();
+    this.startBatchDbWriter();
+    this.startArchiveInterval();
 
-    this.asyncLogger.info('🚀 AutoJoinManager initialized', {
+    this.asyncLogger.info('🚀 Enhanced AutoJoinManager initialized', {
       worker: this.workerId,
-      cacheSizes: {
-        processedMessages: CACHE_PROCESSED_MESSAGES,
-        processing: CACHE_MAX_PROCESSING,
-        wins: CACHE_MAX_WINS,
-        cooldown: CACHE_MAX_COOLDOWN,
+      features: {
+        multiStageDetection: true,
+        joinQueue: true,
+        structuredTracing: true,
+        watchlists: true,
+        batchDb: true,
+        healthChecks: true,
       },
       memory: this.getMemoryUsage(),
     });
+  }
+
+  private async initialize(): Promise<void> {
+    await Promise.all([
+      this.detectionEngine.loadProfiles(),
+      this.joinQueue.restore(),
+    ]);
   }
 
   // -------------------------------------------------------------------------
@@ -744,10 +1541,6 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   private checkMemory(): boolean {
-    // Throttle: this is called from many hot paths (every handleMessage,
-    // every session-management loop iteration). Re-measuring process
-    // memory on every single call is wasted work; 5s resolution is more
-    // than enough for a monitoring signal at these thresholds.
     const now = Date.now();
     if (now - this.lastMemoryCheck < 5000) return this.healthStatus !== 'critical';
     this.lastMemoryCheck = now;
@@ -813,6 +1606,7 @@ export class AutoJoinManager extends EventEmitter {
     this.processingCache.clear();
     this.recentWins.clear();
     this.noResponseCooldown.clear();
+    this.crosspostCache.clear();
     this.tokenManager.clearAll();
     
     if (this.sessionStartPromises.size > 10) {
@@ -822,12 +1616,6 @@ export class AutoJoinManager extends EventEmitter {
     if (global.gc) {
       global.gc();
     }
-    
-    const mem = this.getMemoryUsage();
-    this.asyncLogger.info('🧹 Aggressive cleanup complete', {
-      worker: this.workerId,
-      ...mem,
-    });
   }
 
   private forceCleanup(): void {
@@ -835,12 +1623,6 @@ export class AutoJoinManager extends EventEmitter {
     
     const mem = this.getMemoryUsage();
     if (mem.heapUsedMB > MEMORY_CRITICAL_THRESHOLD_MB && this.sessions.size > 1) {
-      // Was Math.floor(size * 0.3) with no floor — at size=3-6 (typical
-      // production session counts) this rounds to 0 or 1, meaning force
-      // cleanup could run indefinitely without ever actually shedding a
-      // session, burning CPU in a tight loop while memory stayed pinned
-      // above the critical threshold (confirmed in production logs:
-      // "Stopped 0 sessions to free memory" repeating dozens of times).
       const toStop = Math.max(1, Math.floor(this.sessions.size * 0.3));
       let stopped = 0;
       for (const [key, session] of this.sessions) {
@@ -981,15 +1763,6 @@ export class AutoJoinManager extends EventEmitter {
         return false;
       }
 
-      // NOTE: previously called validateDiscordToken() here, which spins up
-      // a throwaway Client, logs in, and destroys it — purely to check the
-      // token works before doing the real login two lines below. That
-      // doubled login/gateway-handshake traffic on every session start,
-      // retry, and reconnect for no benefit: loginWithTimeout() below
-      // already throws on an invalid token, and that failure is caught by
-      // the try/catch around this whole function, which already marks the
-      // token inactive. Removed.
-
       const clientOptions: ClientOptions = {
         messageCacheLifetime: 60,
         messageSweepInterval: 300,
@@ -998,19 +1771,6 @@ export class AutoJoinManager extends EventEmitter {
         retryLimit: 3,
         allowedMentions: { parse: [] },
         partials: [],
-        // Sessions can be in 80-170+ guilds each. Without cache limits,
-        // discord.js fully caches presence/reaction/thread/voice-state data
-        // for every guild per session — none of which this bot's detection
-        // or entry logic ever reads. This was the dominant real memory
-        // cost in production (confirmed via logs: ~150-300MB+ per session
-        // on accounts in 100+ guilds).
-        //
-        // GuildMemberManager is intentionally left at its default (NOT
-        // capped to 0) because giveawayManager's doFetchInvite() needs to
-        // resolve the bot's own member object per guild
-        // (guild.members.cache.get(client.user.id)) to check
-        // CREATE_INSTANT_INVITE permissions before generating invites —
-        // hard-capping member cache would silently break that lookup.
         makeCache: Options.cacheWithLimits({
           PresenceManager: 0,
           ReactionManager: 0,
@@ -1023,7 +1783,6 @@ export class AutoJoinManager extends EventEmitter {
       const client = new Client(clientOptions);
       client.setMaxListeners(50);
       
-      // Generate unique session ID
       this.sessionIdCounter++;
       const sessionId = `${userId}-${Date.now()}-${this.sessionIdCounter}`;
       
@@ -1034,13 +1793,15 @@ export class AutoJoinManager extends EventEmitter {
         label: user.tokenLabel || 'main',
         startedAt: Date.now(),
         isActive: true,
-        stats: { detected: 0, entered: 0, failed: 0, wins: 0 },
+        stats: { detected: 0, entered: 0, failed: 0, wins: 0, falsePositives: 0, queueWaitTimes: [] },
         reconnectAttempts: 0,
         maxReconnectAttempts: MAX_RECONNECT_ATTEMPTS,
         rateLimiter: new TokenBucket(5, 5000),
         listeners: {},
         sessionId,
         destroyed: false,
+        lastHealthCheck: Date.now(),
+        stallCount: 0,
       };
 
       this.registerEvents(session);
@@ -1050,7 +1811,6 @@ export class AutoJoinManager extends EventEmitter {
       
       this.tokenManager.clearCache(userId, guildId);
 
-      // CHECK: If shutting down, don't add the session
       if (this.isShuttingDown) {
         this.asyncLogger.warn('Shutdown in progress, destroying newly created session', {
           userId,
@@ -1069,6 +1829,9 @@ export class AutoJoinManager extends EventEmitter {
       await setTokenActive(userId, guildId, true);
       await updateTokenLastUsed(userId, guildId);
 
+      // Load watchlist for this user
+      await this.watchlistManager.loadKeywords(userId);
+
       this.asyncLogger.info('✅ AutoJoin session started', {
         userId,
         label: session.label,
@@ -1077,17 +1840,6 @@ export class AutoJoinManager extends EventEmitter {
         worker: this.workerId,
         sessionId: session.sessionId,
         memory: this.getMemoryUsage(),
-      });
-
-      // Diagnostic aid: if these climb unboundedly across reconnects rather
-      // than staying flat, listener cleanup has regressed somewhere. Cheap
-      // to compute and only logged at debug level.
-      this.asyncLogger.debug('Client listener counts', {
-        userId,
-        messageCreate: client.listenerCount('messageCreate'),
-        messageUpdate: client.listenerCount('messageUpdate'),
-        error: client.listenerCount('error'),
-        disconnect: client.listenerCount('disconnect'),
       });
 
       this.emit('sessionStarted', { userId, guildId });
@@ -1132,7 +1884,7 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   // -------------------------------------------------------------------------
-  // FIX #1: startHeartbeat - Clear old interval before reconnect
+  // Heartbeat with reconnect
   // -------------------------------------------------------------------------
 
   private startHeartbeat(session: UserSession): void {
@@ -1142,7 +1894,6 @@ export class AutoJoinManager extends EventEmitter {
     }
 
     session.heartbeatInterval = setInterval(() => {
-      // Check if this session is still valid
       if (this.isShuttingDown || !session.isActive || session.destroyed) return;
 
       try {
@@ -1150,7 +1901,6 @@ export class AutoJoinManager extends EventEmitter {
         if (!client.isReady()) throw new Error('Client not ready');
         if (client.ws?.connection?.readyState !== 1) throw new Error('WebSocket not open');
       } catch (error) {
-        // FIX: Clear the old heartbeat BEFORE starting reconnect
         if (session.heartbeatInterval) {
           clearInterval(session.heartbeatInterval);
           session.heartbeatInterval = undefined;
@@ -1158,26 +1908,27 @@ export class AutoJoinManager extends EventEmitter {
         
         if (session.reconnectAttempts < session.maxReconnectAttempts) {
           session.reconnectAttempts++;
+          
+          // Track reconnect count
+          const count = (this.reconnectCount.get(session.userId) || 0) + 1;
+          this.reconnectCount.set(session.userId, count);
+          
           this.asyncLogger.debug('Attempting reconnect', {
             userId: session.userId,
             attempt: session.reconnectAttempts,
             oldSessionId: session.sessionId,
           });
           
-          // Destroy old client
           try {
             (session.client as any).destroy();
           } catch {}
           this.cleanupSessionListeners(session);
           
-          // Mark as destroyed to prevent any further use
           session.destroyed = true;
           
-          // Start new session - this will create a new session object
           this._startSessionInternal(session.userId, session.guildId)
             .then(success => {
               if (success) {
-                // Find the new session and reset reconnect attempts
                 const newSession = this.sessionsByUserId.get(session.userId);
                 if (newSession) {
                   newSession.reconnectAttempts = 0;
@@ -1237,21 +1988,15 @@ export class AutoJoinManager extends EventEmitter {
     }
   }
 
-  // -------------------------------------------------------------------------
-  // FIX #2: stopSession - Handle race conditions with heartbeat
-  // -------------------------------------------------------------------------
-
   async stopSession(userId: string, guildId: string): Promise<void> {
     const sessionKey = this.makeSessionKey(userId);
     const session = this.sessions.get(sessionKey);
     if (!session) return;
 
-    // Mark as destroyed immediately to prevent any further use
     session.destroyed = true;
     session.isActive = false;
 
     try {
-      // Clear heartbeat FIRST - prevent any new callbacks
       if (session.heartbeatInterval) {
         clearInterval(session.heartbeatInterval);
         session.heartbeatInterval = undefined;
@@ -1259,12 +2004,10 @@ export class AutoJoinManager extends EventEmitter {
       
       this.cleanupSessionListeners(session);
       
-      // Destroy client
       try {
         await (session.client as any).destroy();
       } catch {}
       
-      // Remove from maps
       this.sessions.delete(sessionKey);
       this.sessionsByUserId.delete(userId);
       this.tokenManager.clearCache(userId, guildId);
@@ -1310,7 +2053,6 @@ export class AutoJoinManager extends EventEmitter {
       delete listeners.disconnect;
     }
     
-    // Remove all listeners from client as safety net
     try {
       client.removeAllListeners();
     } catch {}
@@ -1372,12 +2114,7 @@ export class AutoJoinManager extends EventEmitter {
     }
   }
 
-  // -------------------------------------------------------------------------
-  // FIX #4: getStats - Avoid full Map copy on every call
-  // -------------------------------------------------------------------------
-
   getStats() {
-    // Build stats without creating a full Map copy
     const sessionStats: Array<{ userId: string; stats: SessionStats }> = [];
     let active = 0;
     let totalDetected = 0;
@@ -1401,7 +2138,7 @@ export class AutoJoinManager extends EventEmitter {
       totalDetected,
       totalEntered,
       totalWins,
-      sessionStats, // Array instead of Map
+      sessionStats,
       worker: this.workerId,
       healthStatus: this.healthStatus,
       circuitBreakerState: this.apiCircuitBreaker.getState(),
@@ -1411,6 +2148,7 @@ export class AutoJoinManager extends EventEmitter {
         recentWins: this.recentWins.size,
         noResponseCooldown: this.noResponseCooldown.size,
         tokenCache: this.tokenManager.getCacheStats(),
+        crosspostCache: this.crosspostCache.size,
       },
       memory: {
         heapUsedMB: mem.heapUsedMB,
@@ -1430,6 +2168,24 @@ export class AutoJoinManager extends EventEmitter {
       logStats: this.asyncLogger.getStats(),
       sessionStartPromises: this.sessionStartPromises.size,
       uptime: Math.round((Date.now() - metrics.startTime) / 1000 / 60),
+      
+      // Enhanced monitoring
+      queue: this.joinQueue.getStats(),
+      detection: this.detectionEngine.getStats(),
+      watchlist: this.watchlistManager.getStats(),
+      correlation: {
+        activeTraces: this.correlationTracker.getActiveTraceCount(),
+      },
+      guildStats: Array.from(this.guildStats.values()),
+      accountStats: Array.from(this.accountStats.values()),
+      reconnectCounts: Array.from(this.reconnectCount.entries()).map(([userId, count]) => ({
+        userId,
+        count,
+      })),
+      batchBuffers: {
+        joinOutcomes: this.joinOutcomeBuffer.length,
+        detectionConfidence: this.detectionConfidenceBuffer.length,
+      },
     };
   }
 
@@ -1441,14 +2197,11 @@ export class AutoJoinManager extends EventEmitter {
         sessions: stats.activeSessions,
         memory: stats.memory,
         circuitBreaker: stats.circuitBreakerState,
+        queue: stats.queue,
         uptime: stats.uptime,
       },
     };
   }
-
-  // -------------------------------------------------------------------------
-  // FIX #3: shutdown - Properly cancel mid-flight session starts
-  // -------------------------------------------------------------------------
 
   async shutdown(): Promise<void> {
     if (this.isShuttingDown) {
@@ -1458,46 +2211,56 @@ export class AutoJoinManager extends EventEmitter {
     
     this.isShuttingDown = true;
 
-    this.asyncLogger.info('🛑 Shutting down AutoJoinManager...', {
+    this.asyncLogger.info('🛑 Shutting down Enhanced AutoJoinManager...', {
       worker: this.workerId,
       sessions: this.sessions.size,
+      queueSize: this.joinQueue.getTotalSize(),
       pendingStarts: this.sessionStartPromises.size,
+      activeTraces: this.correlationTracker.getActiveTraceCount(),
     });
 
     // Clear all intervals first
-    [this.refreshInterval, this.cleanupInterval, this.memoryCheckInterval, 
-     this.reconnectCheckInterval, this.cacheCleanInterval, this.metricsInterval]
-      .forEach(interval => {
-        if (interval) { clearInterval(interval); }
-      });
+    [
+      this.refreshInterval, this.cleanupInterval, this.memoryCheckInterval,
+      this.reconnectCheckInterval, this.cacheCleanInterval, this.metricsInterval,
+      this.healthCheckInterval, this.queuePersistInterval, this.stallCheckInterval,
+      this.batchDbInterval, this.archiveInterval,
+    ].forEach(interval => {
+      if (interval) { clearInterval(interval); }
+    });
 
-    // Wait for pending session starts to complete or timeout
+    // Persist queue state
+    await this.joinQueue.persist();
+
+    // Flush batch buffers
+    if (this.joinOutcomeBuffer.length > 0 || this.detectionConfidenceBuffer.length > 0) {
+      try {
+        await batchSaveJoinOutcomes(this.joinOutcomeBuffer);
+        await batchUpdateDetectionConfidence(this.detectionConfidenceBuffer);
+      } catch {}
+      this.joinOutcomeBuffer = [];
+      this.detectionConfidenceBuffer = [];
+    }
+
+    // Wait for pending session starts
     if (this.sessionStartPromises.size > 0) {
-      this.asyncLogger.info(`Waiting for ${this.sessionStartPromises.size} pending session starts...`, {
-        worker: this.workerId,
-      });
-      
+      this.asyncLogger.info(`Waiting for ${this.sessionStartPromises.size} pending session starts...`);
       try {
         await Promise.race([
           Promise.allSettled(this.sessionStartPromises.values()),
           delay(5000),
         ]);
       } catch {}
-      
-      // Clear any remaining promises
       this.sessionStartPromises.clear();
     }
 
-    // Stop all sessions - use a copy of the sessions map
+    // Stop all sessions
     const sessionsToStop = Array.from(this.sessions.values());
-    const stopPromises: Promise<void>[] = [];
     
     for (const session of sessionsToStop) {
-      // Mark as destroyed to prevent any further use
       session.destroyed = true;
       session.isActive = false;
       
-      // Clear heartbeat
       if (session.heartbeatInterval) {
         clearInterval(session.heartbeatInterval);
         session.heartbeatInterval = undefined;
@@ -1514,8 +2277,6 @@ export class AutoJoinManager extends EventEmitter {
       this.tokenManager.clearCache(session.userId, session.guildId);
     }
 
-    await Promise.allSettled(stopPromises);
-
     // Clear everything
     this.sessions.clear();
     this.sessionsByUserId.clear();
@@ -1523,8 +2284,12 @@ export class AutoJoinManager extends EventEmitter {
     this.processingCache.clear();
     this.recentWins.clear();
     this.noResponseCooldown.clear();
+    this.crosspostCache.clear();
     this.tokenManager.clearAll();
     this.sessionStartPromises.clear();
+    this.guildStats.clear();
+    this.accountStats.clear();
+    this.reconnectCount.clear();
     
     this.asyncLogger.shutdown();
     
@@ -1550,6 +2315,7 @@ export class AutoJoinManager extends EventEmitter {
       
       try {
         this.metrics.totalMessagesProcessed++;
+        session.lastHealthCheck = Date.now();
         
         if (!message.guild) {
           await this.handleDmWin(message, userId);
@@ -1564,10 +2330,14 @@ export class AutoJoinManager extends EventEmitter {
       }
     };
 
-    const messageUpdateHandler = async (_old: any, updated: any) => {
+    const messageUpdateHandler = async (_old: Message, updated: Message) => {
       if (this.isShuttingDown || !session.isActive || session.destroyed) return;
       try {
-        await this.handleMessage(updated as Message, session);
+        // Process edited messages as potentially new giveaways
+        const entryId = this.makeEntryId(session, updated);
+        if (!this.processedMessages.has(entryId)) {
+          await this.handleMessage(updated, session);
+        }
       } catch (error) {
         this.asyncLogger.error('Message update handler error', { userId, error: formatError(error) });
       }
@@ -1593,7 +2363,7 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   // -------------------------------------------------------------------------
-  // Message Handling - (rest of the file unchanged)
+  // Message Handling with structured tracing
   // -------------------------------------------------------------------------
 
   private async handleMessage(message: Message, session: UserSession): Promise<void> {
@@ -1616,13 +2386,24 @@ export class AutoJoinManager extends EventEmitter {
     
     this.metrics.cacheMisses++;
 
-    if (!this.checkMemory()) {
-      this.asyncLogger.debug('Memory too high, skipping message processing', {
-        userId: session.userId,
+    // Check for cross-posted duplicates
+    const crosspostId = this.extractCrosspostId(message);
+    if (crosspostId && this.crosspostCache.has(crosspostId)) {
+      this.asyncLogger.debug('Skipping cross-posted duplicate', {
         messageId: message.id,
+        crosspostSource: this.crosspostCache.get(crosspostId),
       });
       return;
     }
+    if (crosspostId) {
+      this.crosspostCache.set(crosspostId, message.id);
+    }
+
+    if (!this.checkMemory()) return;
+
+    // Create correlation ID
+    const correlationId = this.correlationTracker.createTrace(session.userId, message.id);
+    this.correlationTracker.startStage(correlationId, 'detection');
 
     const startTime = Date.now();
     const existing = await getAutoJoinEntry(session.userId, message.id, message.channel.id);
@@ -1630,18 +2411,24 @@ export class AutoJoinManager extends EventEmitter {
     
     if (existing) {
       this.processedMessages.set(entryId, Date.now());
-      if (existing.status === 'pending' || existing.status === 'attempting') {
-        this.processingCache.set(entryId, Date.now());
-        return;
-      }
+      this.correlationTracker.completeTrace(correlationId, 'completed');
       return;
     }
 
     this.processingCache.set(entryId, Date.now());
+    this.correlationTracker.startStage(correlationId, 'processing');
 
     try {
-      const detected = await this.detectGiveaway(message);
-      if (!detected) {
+      // Multi-stage detection
+      const detected = await this.detectionEngine.detect(message, correlationId);
+      this.correlationTracker.endStage(correlationId, 'detection', {
+        isGiveaway: detected.isGiveaway,
+        confidence: detected.confidence,
+        reasons: detected.reasons,
+      });
+
+      if (!detected.isGiveaway) {
+        this.correlationTracker.completeTrace(correlationId, 'completed');
         this.processingCache.delete(entryId);
         return;
       }
@@ -1649,6 +2436,27 @@ export class AutoJoinManager extends EventEmitter {
       this.metrics.totalGiveawaysDetected++;
       const detectionTime = Date.now() - startTime;
       this.metrics.recordDetectionTime(detectionTime);
+
+      // Check watchlists
+      const watchlistMatches = this.watchlistManager.matchKeyword(
+        message.content + ' ' + 
+        message.embeds?.map(e => e.title + ' ' + e.description).join(' ') || ''
+      );
+      
+      if (watchlistMatches.length > 0) {
+        this.correlationTracker.startStage(correlationId, 'watchlist', {
+          matches: watchlistMatches.map(m => m.keyword),
+        });
+        
+        for (const match of watchlistMatches) {
+          if (match.matched) {
+            saveWatchlistMatch(session.userId, match.keyword, message.id, message.channel.id)
+              .catch(() => {});
+          }
+        }
+        
+        this.correlationTracker.endStage(correlationId, 'watchlist');
+      }
 
       const entryData: Omit<GiveawayEntry, '_id'> = {
         userId: session.userId,
@@ -1658,37 +2466,58 @@ export class AutoJoinManager extends EventEmitter {
         authorId: message.author?.id ?? '',
         guildName: message.guild!.name,
         channelName: (message.channel as { name?: string }).name ?? 'unknown',
-        prize: detected.prize,
+        prize: detected.prize || 'Unknown Prize',
         buttonCustomId: detected.button?.customId,
         detectedAt: Date.now(),
         endsAt: this.extractEndTimestamp(message),
         status: 'pending',
         attempts: 0,
         expiresAt: Date.now() + ENTRY_TTL_MS,
+        correlationId,
+        detectionConfidence: detected.confidence,
+        detectionReasons: detected.reasons,
+        crosspostSource: this.extractCrosspostId(message),
       };
 
       await saveAutoJoinEntry(entryData);
       this.metrics.dbQueries++;
-      this.processedMessages.set(entryId, Date.now());
+      
+      this.detectionConfidenceBuffer.push({
+        messageId: message.id,
+        channelId: message.channel.id,
+        confidence: detected.confidence,
+        reasons: detected.reasons,
+      });
 
+      this.processedMessages.set(entryId, Date.now());
       session.stats.detected++;
 
-      this.asyncLogger.debug('🎯 AutoJoin: Giveaway detected', {
+      this.updateGuildStats(message.guild!.id, message.guild!.name, 'detected', detected.confidence);
+      this.updateAccountStats(session.userId, 'detected', detected.confidence, detectionTime);
+
+      this.correlationTracker.startStage(correlationId, 'queueing');
+
+      this.asyncLogger.info('🎯 AutoJoin: Giveaway detected', {
+        correlationId,
         userId: session.userId,
         prize: truncate(entryData.prize, 60),
+        confidence: detected.confidence.toFixed(2),
+        reasons: detected.reasons,
         guild: entryData.guildName,
         worker: this.workerId,
         detectionTime: `${detectionTime}ms`,
       });
 
-      await this.enterGiveaway(entryId, session);
+      await this.queueOrEnter(entryId, session, entryData as GiveawayEntry, correlationId);
 
     } catch (error) {
       this.asyncLogger.error('AutoJoin: Handle message error', {
+        correlationId,
         userId: session.userId,
         error: formatError(error),
         worker: this.workerId,
       });
+      this.correlationTracker.completeTrace(correlationId, 'failed');
     } finally {
       this.processingCache.delete(entryId);
       await cleanupAutoJoinEntries(session.userId);
@@ -1696,156 +2525,95 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   // -------------------------------------------------------------------------
-  // Giveaway Detection
+  // Queue or Enter Decision
   // -------------------------------------------------------------------------
 
-  private async detectGiveaway(message: Message): Promise<{ prize: string; button: GiveawayButton } | null> {
-    const rawContent = message.content ?? '';
-    
-    if (PATTERNS.BLOCKED_CONTENT.test(rawContent)) {
-      return null;
+  private async queueOrEnter(
+    entryId: string, 
+    session: UserSession, 
+    entry: GiveawayEntry, 
+    correlationId: string
+  ): Promise<void> {
+    const queueItem: QueueItem = {
+      entryId,
+      userId: session.userId,
+      guildId: entry.guildId,
+      channelId: entry.channelId,
+      messageId: entry.messageId,
+      priority: entry.endsAt ? Math.max(0, entry.endsAt - Date.now()) : 999999,
+      addedAt: Date.now(),
+      endsAt: entry.endsAt,
+      correlationId,
+      attempts: 0,
+      maxAttempts: CONFIG.maxRetries + 1,
+    };
+
+    const enqueued = this.joinQueue.enqueue(queueItem);
+
+    if (enqueued) {
+      await updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'queued', {
+        queuePosition: this.joinQueue.getGuildQueue(entry.guildId).indexOf(queueItem),
+      });
+      
+      this.correlationTracker.endStage(correlationId, 'queueing', {
+        queued: true,
+        queueSize: this.joinQueue.getGuildQueue(entry.guildId).length,
+      });
+
+      this.processQueue(session.userId, entry.guildId).catch(error => {
+        this.asyncLogger.error('Queue processing error', {
+          correlationId,
+          error: formatError(error),
+        });
+      });
+    } else {
+      this.correlationTracker.endStage(correlationId, 'queueing', { queued: false, reason: 'queue_full' });
+      await this.enterGiveaway(entryId, session);
     }
-
-    const isKnownBot = this.isKnownGiveawayBot(message);
-    const hasKeyword = this.messageHasKeyword(message);
-    
-    if (!isKnownBot && !hasKeyword) return null;
-
-    const immediate = this.tryExtractEntry(message, isKnownBot);
-    if (immediate) return immediate;
-
-    for (let i = 0; i < COMPONENT_RETRY_ATTEMPTS; i++) {
-      await delay(COMPONENT_RETRY_DELAY_MS);
-      try {
-        const refreshed = await message.fetch();
-        const result = this.tryExtractEntry(refreshed, isKnownBot);
-        if (result) return result;
-      } catch {
-        break;
-      }
-    }
-
-    return null;
-  }
-
-  private tryExtractEntry(message: Message, isKnownBot: boolean): { prize: string; button: GiveawayButton } | null {
-    const button = this.extractEntryButton(message, isKnownBot);
-    if (!button) return null;
-    return { prize: this.extractPrize(message), button };
-  }
-
-  private extractEntryButton(message: Message, isKnownBot: boolean): GiveawayButton | null {
-    const msgAny = message as unknown as Record<string, unknown>;
-    const components = msgAny['components'] as unknown[] | undefined;
-    if (!components?.length) return null;
-
-    if (isKnownBot) {
-      for (const row of components) {
-        const rowAny = row as Record<string, unknown>;
-        const rowComps = rowAny['components'] as unknown[] | undefined;
-        if (!rowComps?.length) continue;
-
-        for (const comp of rowComps) {
-          const c = comp as Record<string, unknown>;
-          if (c['type'] !== 2 && c['type'] !== 'BUTTON') continue;
-          if (c['style'] === 5 || c['disabled'] === true) continue;
-
-          const customId = (c['customId'] ?? c['custom_id']) as string | undefined;
-          if (!customId) continue;
-
-          const label = ((c['label'] as string | undefined) ?? '').trim();
-          
-          if (PATTERNS.DRAFT_BUTTON.test(label)) continue;
-
-          if (customId.includes('giveaway') || customId.includes('enter') || customId.includes('join')) {
-            return { customId, label: label || customId, disabled: false };
-          }
-
-          if (PATTERNS.ENTRY_BUTTON.test(label)) {
-            return { customId, label: label || 'Enter', disabled: false };
-          }
-        }
-      }
-      return null;
-    }
-
-    let hasDraftButton = false;
-    for (const row of components) {
-      const rowAny = row as Record<string, unknown>;
-      const rowComps = rowAny['components'] as unknown[] | undefined;
-      if (!rowComps) continue;
-      for (const comp of rowComps) {
-        const c = comp as Record<string, unknown>;
-        if (c['type'] !== 2 && c['type'] !== 'BUTTON') continue;
-        const label = ((c['label'] as string | undefined) ?? '').toLowerCase();
-        if (PATTERNS.DRAFT_BUTTON.test(label)) {
-          hasDraftButton = true;
-          break;
-        }
-      }
-      if (hasDraftButton) break;
-    }
-
-    if (hasDraftButton) {
-      let hasEntry = false;
-      for (const row of components) {
-        const rowAny = row as Record<string, unknown>;
-        const rowComps = rowAny['components'] as unknown[] | undefined;
-        if (!rowComps) continue;
-        for (const comp of rowComps) {
-          const c = comp as Record<string, unknown>;
-          if (c['type'] !== 2 && c['type'] !== 'BUTTON') continue;
-          if (c['style'] === 5 || c['disabled'] === true) continue;
-          
-          const customId = (c['customId'] ?? c['custom_id']) as string | undefined;
-          const label = ((c['label'] as string | undefined) ?? '').trim();
-          
-          if (customId && TRUSTED_ENTRY_CUSTOM_IDS.has(customId)) {
-            hasEntry = true;
-            break;
-          }
-          if (PATTERNS.ENTRY_BUTTON.test(label)) {
-            hasEntry = true;
-            break;
-          }
-        }
-        if (hasEntry) break;
-      }
-      if (!hasEntry) return null;
-    }
-
-    for (const row of components) {
-      const rowAny = row as Record<string, unknown>;
-      const rowComps = rowAny['components'] as unknown[] | undefined;
-      if (!rowComps?.length) continue;
-
-      for (const comp of rowComps) {
-        const c = comp as Record<string, unknown>;
-        if (c['type'] !== 2 && c['type'] !== 'BUTTON') continue;
-        if (c['style'] === 5 || c['disabled'] === true) continue;
-
-        const customId = (c['customId'] ?? c['custom_id']) as string | undefined;
-        if (!customId) continue;
-
-        const label = ((c['label'] as string | undefined) ?? '').trim();
-
-        if (PATTERNS.DRAFT_BUTTON.test(label)) continue;
-
-        if (TRUSTED_ENTRY_CUSTOM_IDS.has(customId)) {
-          return { customId, label: label || customId, disabled: false };
-        }
-
-        if (PATTERNS.ENTRY_BUTTON.test(label)) {
-          return { customId, label: label || 'Enter', disabled: false };
-        }
-      }
-    }
-
-    return null;
   }
 
   // -------------------------------------------------------------------------
-  // Entry Execution
+  // Queue Processing
+  // -------------------------------------------------------------------------
+
+  private async processQueue(userId: string, guildId: string): Promise<void> {
+    const session = this.sessionsByUserId.get(userId);
+    if (!session || !session.isActive) return;
+
+    let item = this.joinQueue.dequeue(guildId);
+    while (item) {
+      const correlationId = item.correlationId;
+      this.correlationTracker.startStage(correlationId, 'queue_processing');
+
+      if (item.endsAt && Date.now() > item.endsAt) {
+        this.joinQueue.cancelGiveaway(item.messageId, item.channelId);
+        await updateAutoJoinEntryStatus(userId, item.messageId, item.channelId, 'skipped', {
+          reason: 'giveaway_ended',
+        });
+        this.correlationTracker.completeTrace(correlationId, 'completed');
+        item = this.joinQueue.dequeue(guildId);
+        continue;
+      }
+
+      const queueWait = Date.now() - item.addedAt;
+      if (session.stats.queueWaitTimes.length >= METRICS_SAMPLE_SIZE) {
+        session.stats.queueWaitTimes.shift();
+      }
+      session.stats.queueWaitTimes.push(queueWait);
+
+      this.correlationTracker.endStage(correlationId, 'queue_processing', {
+        queueWaitMs: queueWait,
+      });
+
+      const entryId = this.makeEntryIdFromMessage(userId, item.channelId, item.messageId);
+      await this.enterGiveaway(entryId, session);
+
+      item = this.joinQueue.dequeue(guildId);
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Enter Giveaway with structured tracing
   // -------------------------------------------------------------------------
 
   private async enterGiveaway(entryId: string, session: UserSession): Promise<void> {
@@ -1857,6 +2625,11 @@ export class AutoJoinManager extends EventEmitter {
     const entry = await getAutoJoinEntry(session.userId, messageId, channelId);
     this.metrics.dbQueries++;
     if (!entry) return;
+
+    const correlationId = entry.correlationId || 
+      this.correlationTracker.createTrace(session.userId, messageId);
+
+    this.correlationTracker.startStage(correlationId, 'entry_attempt');
 
     await updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'attempting', {});
     this.metrics.dbQueries++;
@@ -1892,6 +2665,7 @@ export class AutoJoinManager extends EventEmitter {
         if (skipped) {
           await updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'skipped', {});
           this.metrics.dbQueries++;
+          this.correlationTracker.completeTrace(correlationId, 'completed');
           return;
         }
 
@@ -1902,12 +2676,33 @@ export class AutoJoinManager extends EventEmitter {
         session.stats.lastEntryAt = Date.now();
         this.metrics.totalEntriesSucceeded++;
 
-        await updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'success', { attempts: attemptNum });
+        await updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'success', { 
+          attempts: attemptNum,
+          entryTimeMs: entryTime,
+        });
         this.metrics.dbQueries++;
         await incrementTokenEntries(session.userId, session.guildId);
         await updateTokenLastUsed(session.userId, session.guildId);
 
+        this.joinOutcomeBuffer.push({
+          userId: session.userId,
+          messageId: entry.messageId,
+          channelId: entry.channelId,
+          guildId: entry.guildId,
+          status: 'success',
+          attempts: attemptNum,
+          entryTimeMs: entryTime,
+          correlationId,
+          timestamp: Date.now(),
+        });
+
+        this.updateGuildStats(entry.guildId, entry.guildName, 'entered', entry.detectionConfidence);
+        this.updateAccountStats(session.userId, 'entered', entry.detectionConfidence);
+
+        this.correlationTracker.completeTrace(correlationId, 'completed');
+
         this.asyncLogger.info('✅ AutoJoin: Entered giveaway', {
+          correlationId,
           userId: session.userId,
           prize: truncate(entry.prize, 60),
           attempts: attemptNum,
@@ -1916,12 +2711,12 @@ export class AutoJoinManager extends EventEmitter {
           time: `${entryTime}ms`,
         });
 
-        this.emit('giveawayEntered', { entry, userId: session.userId });
+        this.emit('giveawayEntered', { entry, userId: session.userId, correlationId });
         return;
 
       } catch (error) {
         const errorMsg = formatError(error);
-        const isNoResponse = errorMsg.includes('No responsed from Application') || 
+        const isNoResponse = errorMsg.includes('No response from Application') || 
                             errorMsg.includes('No response from Application');
 
         if (isNoResponse && attempt < maxAttempts - 1) {
@@ -1938,6 +2733,7 @@ export class AutoJoinManager extends EventEmitter {
         this.metrics.dbQueries++;
         
         this.asyncLogger.warn(`AutoJoin: Attempt ${attemptNum}/${maxAttempts} failed`, {
+          correlationId,
           userId: session.userId,
           entryId,
           error: errorMsg,
@@ -1946,20 +2742,47 @@ export class AutoJoinManager extends EventEmitter {
       }
     }
 
-    await updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'failed', {});
+    // All retries exhausted - move to dead letter queue
+    const queueItem: QueueItem = {
+      entryId,
+      userId: session.userId,
+      guildId: entry.guildId,
+      channelId: entry.channelId,
+      messageId: entry.messageId,
+      priority: -1,
+      addedAt: Date.now(),
+      correlationId,
+      attempts: maxAttempts,
+      maxAttempts,
+      lastError: 'All retries exhausted',
+    };
+
+    this.joinQueue.moveToDeadLetter(queueItem, 'All retries exhausted');
+
+    await updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'dead_letter', {
+      lastError: 'All retries exhausted',
+      attempts: maxAttempts,
+    });
     this.metrics.dbQueries++;
     session.stats.failed++;
     this.metrics.totalEntriesFailed++;
 
-    this.asyncLogger.error('❌ AutoJoin: All retries exhausted', {
+    this.correlationTracker.completeTrace(correlationId, 'failed');
+
+    this.asyncLogger.error('❌ AutoJoin: All retries exhausted - moved to dead letter', {
+      correlationId,
       userId: session.userId,
       prize: truncate(entry.prize, 60),
       attempts: entry.attempts,
       worker: this.workerId,
     });
 
-    this.emit('giveawayFailed', { entry, userId: session.userId });
+    this.emit('giveawayFailed', { entry, userId: session.userId, correlationId });
   }
+
+  // -------------------------------------------------------------------------
+  // Button Interaction Methods
+  // -------------------------------------------------------------------------
 
   private async refreshButtonData(entry: GiveawayEntry, session: UserSession): Promise<GiveawayEntry | null> {
     try {
@@ -1969,7 +2792,7 @@ export class AutoJoinManager extends EventEmitter {
       const components = (message as any).components;
       if (!components?.length) return null;
       
-      const isKnownBot = this.isKnownGiveawayBot(message);
+      const isKnownBot = this.detectionEngine.getProfile(entry.authorId) !== undefined;
       const button = this.findEntryButton(components, isKnownBot);
       if (button && button.customId !== entry.buttonCustomId) {
         entry.buttonCustomId = button.customId;
@@ -2028,7 +2851,7 @@ export class AutoJoinManager extends EventEmitter {
     if (!button) {
       const components = (message as any).components;
       if (components?.length) {
-        const isKnownBot = this.isKnownGiveawayBot(message);
+        const isKnownBot = this.detectionEngine.getProfile(entry.authorId) !== undefined;
         const foundButton = this.findEntryButton(components, isKnownBot);
         if (foundButton) {
           button = foundButton;
@@ -2045,10 +2868,6 @@ export class AutoJoinManager extends EventEmitter {
     await this.clickButton(message, button, session);
     return false;
   }
-
-  // -------------------------------------------------------------------------
-  // Interaction Helpers
-  // -------------------------------------------------------------------------
 
   private async clickButton(message: Message, button: GiveawayButton, session: UserSession): Promise<void> {
     const selfbotMsg = message as Message & { clickButton?: (id: string) => Promise<unknown> };
@@ -2077,25 +2896,12 @@ export class AutoJoinManager extends EventEmitter {
     }
 
     await this.apiCircuitBreaker.execute(async () => {
-      // The real gateway session ID lives on the WebSocket shard
-      // (client.ws.shards.get(n).sessionId), not directly on the Client —
-      // `client.sessionId`/`client.session_id` never existed on this
-      // library's Client class, so the old fallback chain always missed
-      // and silently fabricated a fake ID via Date.now().toString().
-      // Sending an interaction with an invented session_id is a
-      // guaranteed-invalid request server-side (this is the direct cause
-      // of the "token was unavailable to the client" HTTP 500s seen in
-      // production). Selfbot connections are effectively always
-      // single-shard, so shard 0 is the correct (and only) one to check.
       const client = message.client as any;
       const sessionId: string | undefined = client.ws?.shards?.first?.()?.sessionId
         ?? client.ws?.shards?.get?.(0)?.sessionId;
 
       if (!sessionId) {
-        throw new Error(
-          'No active gateway session ID available — cannot send interaction ' +
-          '(client may not have finished IDENTIFY/RESUME yet)'
-        );
+        throw new Error('No active gateway session ID available');
       }
       
       const nonce = `${Date.now()}${Math.random().toString(36).slice(2, 8)}`;
@@ -2245,7 +3051,11 @@ export class AutoJoinManager extends EventEmitter {
     this.recentWins.set(dedupKey, Date.now());
 
     const session = this.findSessionByUserId(userId);
-    if (session) session.stats.wins++;
+    if (session) {
+      session.stats.wins++;
+      this.updateGuildStats(message.guild.id, message.guild.name, 'wins');
+      this.updateAccountStats(userId, 'wins');
+    }
     this.metrics.totalWinsDetected++;
 
     await incrementTokenWins(userId, session?.guildId || '');
@@ -2272,7 +3082,10 @@ export class AutoJoinManager extends EventEmitter {
     if (!PATTERNS.WIN.test(allText)) return;
 
     const session = this.findSessionByUserId(userId);
-    if (session) session.stats.wins++;
+    if (session) {
+      session.stats.wins++;
+      this.updateAccountStats(userId, 'wins');
+    }
     this.metrics.totalWinsDetected++;
 
     await incrementTokenWins(userId, session?.guildId || '');
@@ -2335,24 +3148,212 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   // -------------------------------------------------------------------------
+  // Stats Tracking
+  // -------------------------------------------------------------------------
+
+  private updateGuildStats(
+    guildId: string, 
+    guildName: string, 
+    stat: 'detected' | 'entered' | 'failed' | 'wins' | 'falsePositives',
+    confidence?: number
+  ): void {
+    if (!this.guildStats.has(guildId)) {
+      this.guildStats.set(guildId, {
+        guildId,
+        guildName,
+        detected: 0,
+        entered: 0,
+        failed: 0,
+        wins: 0,
+        falsePositives: 0,
+        averageConfidence: 0,
+        averageQueueWaitMs: 0,
+      });
+    }
+
+    const stats = this.guildStats.get(guildId)!;
+    stats[stat]++;
+
+    if (confidence !== undefined && stat === 'detected') {
+      stats.averageConfidence = 
+        (stats.averageConfidence * (stats.detected - 1) + confidence) / stats.detected;
+    }
+  }
+
+  private updateAccountStats(
+    userId: string, 
+    stat: 'detected' | 'entered' | 'failed' | 'wins' | 'falsePositives',
+    confidence?: number,
+    detectionMs?: number
+  ): void {
+    if (!this.accountStats.has(userId)) {
+      this.accountStats.set(userId, {
+        userId,
+        detected: 0,
+        entered: 0,
+        failed: 0,
+        wins: 0,
+        falsePositives: 0,
+        averageConfidence: 0,
+        averageDetectionMs: 0,
+        averageQueueWaitMs: 0,
+        reconnectCount: 0,
+      });
+    }
+
+    const stats = this.accountStats.get(userId)!;
+    stats[stat]++;
+
+    if (detectionMs !== undefined && stat === 'detected') {
+      stats.averageDetectionMs = 
+        (stats.averageDetectionMs * (stats.detected - 1) + detectionMs) / stats.detected;
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Health Check System
+  // -------------------------------------------------------------------------
+
+  private startHealthChecker(): void {
+    this.healthCheckInterval = setInterval(async () => {
+      if (this.isShuttingDown) return;
+
+      for (const [_, session] of this.sessions) {
+        if (!session.isActive || session.destroyed) continue;
+
+        try {
+          const client = session.client as any;
+          const isConnected = client.isReady() && 
+                             client.ws?.connection?.readyState === 1;
+          
+          if (isConnected) {
+            session.lastHealthCheck = Date.now();
+            session.stallCount = 0;
+          }
+        } catch (error) {
+          this.asyncLogger.error('Health check error', {
+            userId: session.userId,
+            error: formatError(error),
+          });
+        }
+      }
+    }, HEALTH_CHECK_INTERVAL_MS);
+
+    if (this.healthCheckInterval.unref) this.healthCheckInterval.unref();
+  }
+
+  private startStallChecker(): void {
+    this.stallCheckInterval = setInterval(() => {
+      if (this.isShuttingDown) return;
+
+      const now = Date.now();
+      for (const [_, session] of this.sessions) {
+        if (!session.isActive || session.destroyed) continue;
+
+        if (now - session.lastHealthCheck > STALL_TIMEOUT_MS) {
+          session.stallCount++;
+          
+          this.asyncLogger.error('Worker stall detected', {
+            userId: session.userId,
+            sessionId: session.sessionId,
+            stallCount: session.stallCount,
+          });
+
+          if (session.stallCount >= 3) {
+            this.asyncLogger.error('Auto-recovering stalled worker', {
+              userId: session.userId,
+              sessionId: session.sessionId,
+            });
+            
+            this.stopSession(session.userId, session.guildId).then(() => {
+              setTimeout(() => {
+                this.startSession(session.userId, session.guildId);
+              }, 5000);
+            });
+          }
+        }
+      }
+    }, STALL_TIMEOUT_MS / 2);
+
+    if (this.stallCheckInterval.unref) this.stallCheckInterval.unref();
+  }
+
+  // -------------------------------------------------------------------------
+  // Batch Database Writer
+  // -------------------------------------------------------------------------
+
+  private startBatchDbWriter(): void {
+    this.batchDbInterval = setInterval(async () => {
+      if (this.isShuttingDown || this.joinOutcomeBuffer.length === 0) return;
+
+      const outcomes = this.joinOutcomeBuffer.splice(0, this.joinOutcomeBuffer.length);
+      const confidences = this.detectionConfidenceBuffer.splice(0, this.detectionConfidenceBuffer.length);
+
+      try {
+        if (outcomes.length > 0) {
+          await batchSaveJoinOutcomes(outcomes);
+          this.metrics.dbQueries++;
+        }
+        if (confidences.length > 0) {
+          await batchUpdateDetectionConfidence(confidences);
+          this.metrics.dbQueries++;
+        }
+      } catch (error) {
+        this.asyncLogger.error('Batch DB write failed', { error: formatError(error) });
+        this.joinOutcomeBuffer.push(...outcomes.slice(0, 100));
+        this.detectionConfidenceBuffer.push(...confidences.slice(0, 100));
+      }
+    }, BATCH_DB_WRITE_INTERVAL_MS);
+
+    if (this.batchDbInterval.unref) this.batchDbInterval.unref();
+  }
+
+  private startArchiveInterval(): void {
+    this.archiveInterval = setInterval(async () => {
+      if (this.isShuttingDown) return;
+      
+      try {
+        const archived = await archiveOldGiveaways(ARCHIVE_AGE_MS);
+        if (archived > 0) {
+          this.asyncLogger.info(`Archived ${archived} old giveaways`);
+        }
+      } catch (error) {
+        // Silently fail
+      }
+    }, 60 * 60 * 1000);
+
+    if (this.archiveInterval.unref) this.archiveInterval.unref();
+  }
+
+  private startQueuePersister(): void {
+    this.queuePersistInterval = setInterval(() => {
+      if (this.isShuttingDown) return;
+      this.joinQueue.persist().catch(() => {});
+    }, QUEUE_PERSIST_INTERVAL_MS);
+
+    if (this.queuePersistInterval.unref) this.queuePersistInterval.unref();
+  }
+
+  // -------------------------------------------------------------------------
   // Helpers
   // -------------------------------------------------------------------------
 
-  private isKnownGiveawayBot(message: Message): boolean {
-    return !!(message.author?.bot && message.author.id && KNOWN_GIVEAWAY_BOT_IDS.has(message.author.id));
+  private extractCrosspostId(message: Message): string | undefined {
+    const match = (message.content || '').match(PATTERNS.CROSSPOST_REFERENCE);
+    if (match) {
+      return `${match[1]}:${match[2]}:${match[3]}`;
+    }
+    
+    if ((message as any).crosspostReference?.messageId) {
+      const ref = (message as any).crosspostReference;
+      return `${ref.guildId || ''}:${ref.channelId}:${ref.messageId}`;
+    }
+    
+    return undefined;
   }
 
-  private messageHasKeyword(message: Message): boolean {
-    const texts = [
-      message.content ?? '',
-      ...message.embeds.flatMap(e => [
-        e.title ?? '',
-        e.description ?? '',
-        e.footer?.text ?? '',
-        ...(e.fields ?? []).flatMap(f => [f.name, f.value]),
-      ]),
-    ];
-    return texts.some(t => PATTERNS.GIVEAWAY_KEYWORD.test(t));
+  private isKnownGiveawayBot(message: Message): boolean {
+    return !!(message.author?.bot && message.author.id && KNOWN_GIVEAWAY_BOT_IDS.has(message.author.id));
   }
 
   private extractPrize(message: Message): string {
@@ -2400,6 +3401,10 @@ export class AutoJoinManager extends EventEmitter {
 
   private makeEntryId(session: UserSession, message: Message): string {
     return `${session.userId}:${message.channel.id}:${message.id}`;
+  }
+
+  private makeEntryIdFromMessage(userId: string, channelId: string, messageId: string): string {
+    return `${userId}:${channelId}:${messageId}`;
   }
 
   private makeSessionKey(userId: string): string {
@@ -2477,6 +3482,7 @@ export class AutoJoinManager extends EventEmitter {
         this.processingCache.clean(),
         this.recentWins.clean(),
         this.noResponseCooldown.clean(),
+        this.crosspostCache.clean(),
       ].reduce((a, b) => a + b, 0);
       
       if (cleaned > 0) {
@@ -2507,11 +3513,13 @@ export class AutoJoinManager extends EventEmitter {
       detected: stats.totalDetected,
       entered: stats.totalEntered,
       wins: stats.totalWins,
+      queue: stats.queue,
       caches: stats.caches,
       metrics: stats.metrics,
       health: stats.healthStatus,
       circuitBreaker: stats.circuitBreakerState,
       uptime: `${stats.uptime}m`,
+      activeTraces: stats.correlation.activeTraces,
     });
   }
 }
