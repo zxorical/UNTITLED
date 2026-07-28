@@ -1196,6 +1196,7 @@ const DETECTION_SCORE = {
   DESCRIPTION_KEYWORD: 1,
   EMBED_COLOR: 1,
   AUTHOR_KNOWN: 1,
+  TRUSTED_BOT_WITH_SIGNAL: 2,  // FIXED: Added missing property
 } as const;
 
 const DETECTION_MAX_POSSIBLE_SCORE =
@@ -1206,7 +1207,8 @@ const DETECTION_MAX_POSSIBLE_SCORE =
   DETECTION_SCORE.FIELD_GIVEAWAY +
   DETECTION_SCORE.DESCRIPTION_KEYWORD +
   DETECTION_SCORE.EMBED_COLOR +
-  DETECTION_SCORE.AUTHOR_KNOWN;
+  DETECTION_SCORE.AUTHOR_KNOWN +
+  DETECTION_SCORE.TRUSTED_BOT_WITH_SIGNAL;
 
 // Minimum raw score required before something counts as a giveaway.
 // Mirrors giveawayManager.ts's MINIMUM_SCORE_THRESHOLD (6).
@@ -2066,6 +2068,8 @@ export class AutoJoinManager extends EventEmitter {
           VoiceStateManager: 0,
           StageInstanceManager: 0,
           MessageManager: CLIENT_MESSAGE_CACHE_MAX_SIZE,
+          // Use 'any' to bypass incomplete type definitions
+          // These options are accepted at runtime by discord.js v13
           ChannelManager: {
             maxSize: CLIENT_CHANNEL_CACHE_MAX_SIZE,
             keepOverLimit: (channel: any) => channel.isDMBased?.() ?? false,
@@ -2078,7 +2082,7 @@ export class AutoJoinManager extends EventEmitter {
             maxSize: 1,
             keepOverLimit: (user: any) => user.id === user.client?.user?.id,
           },
-        }),
+        } as any),
         sweepers: {
           ...(Options as any).defaultSweeperSettings,
           messages: {
