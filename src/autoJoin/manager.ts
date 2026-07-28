@@ -1029,7 +1029,33 @@ export class AutoJoinManager extends EventEmitter {
         }
         
         const result = await this.attemptEntry(session, entry);
-        if (result.success) {
+        if (result.success && result.skipped) {
+          // Button was already gone/disabled by click time — giveaway likely
+          // already entered or ended. Don't count as an actual entry, don't
+          // retry, just close this entry out quietly.
+          await updateAutoJoinEntryStatus(
+            userId,
+            messageId,
+            channelId,
+            'skipped' as any,
+            {
+              attempts: attempt + 1,
+              lastAttemptAt: Date.now(),
+              reason: 'button gone or disabled at click time'
+            }
+          );
+
+          logger.info(`⏭️ AutoJoin entry skipped (already entered / ended)`, {
+            component: 'AutoJoinManager',
+            userId,
+            prize: prize?.substring(0, 50),
+            messageId,
+            attempts: attempt + 1
+          });
+
+          this.processingEntries.delete(entryId);
+          return { success: true };
+        } else if (result.success) {
           session.stats.entered++;
           session.stats.lastEntryAt = Date.now();
           await incrementTokenEntries(userId, guildId);
@@ -1212,7 +1238,34 @@ export class AutoJoinManager extends EventEmitter {
 
       // Click the button
       await delay(BUTTON_DELAY_MS);
-      
+
+      // ✅ FIX (restored from old autoJoin.ts logic): re-fetch the message
+      // fresh immediately before clicking, and re-locate the button by its
+      // customId on that fresh copy. Components can change between when we
+      // first found the button and when we actually click (queue latency,
+      // retry backoff, someone else's entry consuming it, giveaway ending).
+      // clickButton() throwing BUTTON_NOT_FOUND is usually this — a real
+      // "the button is gone" condition — not a library quirk to route around
+      // with a manual REST POST. Treat it as SKIPPED (already entered /
+      // ended), exactly like the old, working code did.
+      let clickMessage = message;
+      try {
+        clickMessage = await channel.messages.fetch(messageId);
+      } catch {
+        // If we can't even re-fetch, fall through and try with what we have.
+      }
+
+      const freshButton = this.findButtonById(clickMessage, button);
+      if (!freshButton || freshButton.disabled) {
+        logger.info(`Button gone or disabled on fresh fetch — assuming already entered or giveaway ended`, {
+          component: 'AutoJoinManager',
+          userId: session.userId,
+          messageId,
+          button
+        });
+        return { success: true }; // treat as handled, no retries
+      }
+
       logger.debug(`Attempting to click button: ${button}`, {
         component: 'AutoJoinManager',
         userId: session.userId
@@ -1220,34 +1273,30 @@ export class AutoJoinManager extends EventEmitter {
       
       try {
         // Try the clickButton method first
-        const selfbotMsg = message as Message & { clickButton?: (id: string) => Promise<unknown> };
+        const selfbotMsg = clickMessage as Message & { clickButton?: (id: string) => Promise<unknown> };
         if (typeof selfbotMsg.clickButton === 'function') {
           try {
             await selfbotMsg.clickButton(button);
           } catch (clickErr) {
-            // ✅ FIX: the library's own clickButton() sometimes throws
-            // BUTTON_NOT_FOUND even though our own findEntryButton() just
-            // located that exact customId on the same message object — its
-            // internal component search doesn't always match ours (stale
-            // row references after messages.fetch(), etc). Instead of
-            // failing outright, fall back to the raw REST interaction POST,
-            // which only needs the customId string and doesn't depend on
-            // the library's internal component lookup.
             const errMsg = formatError(clickErr);
             if (/BUTTON_NOT_FOUND/i.test(errMsg)) {
-              logger.debug(`clickButton() reported BUTTON_NOT_FOUND, falling back to raw interaction POST`, {
+              // Button vanished between our fresh fetch and the click itself
+              // (race with another entrant / giveaway ending mid-click).
+              // This is a real "gone" condition, not a bug — skip, don't retry.
+              logger.info(`Button vanished at click time — treating as already entered/ended`, {
                 component: 'AutoJoinManager',
                 userId: session.userId,
+                messageId,
                 button
               });
-              await this.postInteraction(message, button, session);
-            } else {
-              throw clickErr;
+              return { success: true };
             }
+            throw clickErr;
           }
         } else {
-          // Fallback: POST interaction directly
-          await this.postInteraction(message, button, session);
+          // Fallback: POST interaction directly (only reached if clickButton
+          // truly isn't a function on this message — not for BUTTON_NOT_FOUND).
+          await this.postInteraction(clickMessage, button, session);
         }
         
         logger.info(`✅ Entered giveaway`, {
@@ -1300,6 +1349,27 @@ export class AutoJoinManager extends EventEmitter {
   // ============================================================================
   // Button Detection - From autoJoin.ts
   // ============================================================================
+
+  private findButtonById(message: Message, customId: string): { customId: string; label: string; disabled: boolean } | null {
+    const components = (message as any).components as any[] | undefined;
+    if (!components?.length) return null;
+
+    for (const row of components) {
+      const rowComps = row.components as any[] | undefined;
+      if (!rowComps) continue;
+
+      for (const comp of rowComps) {
+        const id = comp.customId ?? comp.custom_id;
+        if (id !== customId) continue;
+        return {
+          customId: id,
+          label: (comp.label as string | undefined) ?? '',
+          disabled: (comp.disabled as boolean | undefined) ?? false,
+        };
+      }
+    }
+    return null;
+  }
 
   private findEntryButton(message: Message): { customId: string; label: string } | null {
     const components = (message as any).components;
