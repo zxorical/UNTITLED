@@ -23,6 +23,25 @@
  * 33. Per-guild and per-account monitoring stats
  * 34. Health check that verifies Discord connection
  * 35. Worker stall detection and auto-recovery
+ *
+ * MEMORY FIX (this revision):
+ * - discord.js-selfbot-v13's `messageCacheLifetime` / `messageSweepInterval`
+ *   ClientOptions fields are v12 leftovers and are silently ignored in v13.
+ *   Caching is controlled via `makeCache` (ceiling) + `sweepers` (active eviction).
+ *   Previously only Presence/Reaction/Thread/VoiceState/StageInstance managers
+ *   were capped, leaving MessageManager, ChannelManager, UserManager, and
+ *   GuildMemberManager completely unbounded. Since fetchMessage() /
+ *   enterViaButton() / refreshButtonData() fetch+cache a channel and message
+ *   on every single join attempt, this was the source of the steady
+ *   per-attempt RAM growth.
+ * - Added capped makeCache limits for MessageManager/ChannelManager/
+ *   UserManager/GuildMemberManager.
+ * - Added `sweepers` config for active eviction over time.
+ * - Added a manual periodic message-cache clear as a fallback in case this
+ *   selfbot fork's version predates `sweepers` support.
+ * - Reconnect path now awaits client.destroy() (with a timeout guard) instead
+ *   of fire-and-forget, preventing two live Client instances (and their
+ *   caches) from existing simultaneously during rapid reconnect storms.
  */
 
 import { Client, Message, TextChannel, ClientOptions, Options, NewsChannel, PartialMessage } from 'discord.js-selfbot-v13';
@@ -250,10 +269,16 @@ const PATTERNS = {
   CROSSPOST_REFERENCE: /https:\/\/discord\.com\/channels\/(\d+)\/(\d+)\/(\d+)/,
 } as const;
 
+// Restricted to match giveawayManager.ts's ALLOWED_GIVEAWAY_BOT_IDS. This
+// used to include several other bot IDs (welcome bots, stats/leveling bots,
+// etc.) whose ordinary messages — welcome pings, "messages sent" stats,
+// ended-giveaway announcements, minigame results — were previously being
+// scored as giveaways purely because they shared an ID with something that
+// once posted a real giveaway. Only the bot actually running giveaways here
+// is trusted now, and even for this bot, ID match alone is never sufficient
+// (see DetectionEngine.detect below — it requires real content signals).
 const KNOWN_GIVEAWAY_BOT_IDS: ReadonlySet<string> = new Set([
-  '294882584201003009', '739448630517039104', '515195524879237130',
-  '235148962103951360', '282859044593598464', '270904126974590976',
-  '508391840525975553', '530082442967646230',
+  '530082442967646230',
 ]);
 
 const TRUSTED_ENTRY_CUSTOM_IDS: ReadonlySet<string> = new Set([
@@ -300,6 +325,14 @@ const INTERACTION_RETRY_DELAY_MS = 2000;
 const NO_RESPONSE_COOLDOWN_MS = 5000;
 const BATCH_DB_WRITE_INTERVAL_MS = 5000;
 const ARCHIVE_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
+// Client-level Discord cache sweeping (NEW - memory fix)
+const CLIENT_MESSAGE_CACHE_MAX_SIZE = 25;
+const CLIENT_MESSAGE_SWEEP_INTERVAL_SEC = 300; // 5 minutes
+const CLIENT_MESSAGE_SWEEP_LIFETIME_SEC = 120; // 2 minutes
+const CLIENT_CHANNEL_CACHE_MAX_SIZE = 200;
+const MANUAL_CLIENT_CACHE_SWEEP_INTERVAL_MS = 5 * 60_000;
+const CLIENT_DESTROY_TIMEOUT_MS = 8000;
 
 // Cache sizes
 const CACHE_PROCESSED_MESSAGES = 5000;
@@ -1000,29 +1033,61 @@ class JoinQueue {
 // Watchlist System
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Watchlist System
+//
+// FIXED: previously `keywords` was a single flat Map<keyword, entry> shared
+// across every premium user's session. Since the map key was only the
+// lowercased keyword (never the userId), calling loadKeywords() for user B
+// after user A would merge B's keywords into A's exact same map slots —
+// silently overwriting/colliding whenever two users picked the same or
+// similar keyword. It also never shrank: keywords accumulated forever
+// across all users for the life of the process, with no cleanup on
+// stopSession(). Now keyed per-user, with per-user eviction support.
+// ---------------------------------------------------------------------------
+
 class WatchlistManager {
-  private keywords: Map<string, WatchlistKeyword> = new Map();
+  // userId -> (lowercased keyword -> entry)
+  private userKeywords: Map<string, Map<string, WatchlistKeyword>> = new Map();
   private compiledCache: Map<string, RegExp[]> = new Map();
 
   async loadKeywords(userId: string): Promise<void> {
     try {
       const keywords = await getWatchlistKeywords(userId);
+      // Replace this user's keyword set wholesale rather than merging into
+      // a shared map, so re-loading (e.g. on reconnect) doesn't leak stale
+      // entries and never touches other users' keywords.
+      this.userKeywords.delete(userId);
       for (const kw of keywords) {
-        this.addKeyword(kw.keyword, kw.aliases || []);
+        this.addKeyword(userId, kw.keyword, kw.aliases || []);
       }
     } catch (error) {
-      this.addKeyword('giveaway', ['raffle', 'sweepstakes']);
-      this.addKeyword('nitro', ['discord nitro', 'nitro classic']);
+      this.userKeywords.delete(userId);
+      this.addKeyword(userId, 'giveaway', ['raffle', 'sweepstakes']);
+      this.addKeyword(userId, 'nitro', ['discord nitro', 'nitro classic']);
     }
   }
 
-  addKeyword(keyword: string, aliases: string[] = []): void {
+  /** Removes a user's keyword set entirely. Call on stopSession(). */
+  removeUser(userId: string): void {
+    if (this.userKeywords.delete(userId)) {
+      this.compiledCache.clear();
+    }
+  }
+
+  addKeyword(userId: string, keyword: string, aliases: string[] = []): void {
     const allTerms = [keyword, ...aliases];
     const compiled = allTerms.map(term => 
       new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i')
     );
 
-    this.keywords.set(keyword.toLowerCase(), {
+    let userMap = this.userKeywords.get(userId);
+    if (!userMap) {
+      userMap = new Map();
+      this.userKeywords.set(userId, userMap);
+    }
+
+    userMap.set(keyword.toLowerCase(), {
       keyword,
       aliases,
       matchCount: 0,
@@ -1030,29 +1095,40 @@ class WatchlistManager {
       compiled: compiled[0],
     });
 
-    this.compiledCache.set(keyword.toLowerCase(), compiled);
     this.compiledCache.clear();
   }
 
-  getCompiledPatterns(): RegExp[] {
-    const cacheKey = 'all_patterns';
+  getCompiledPatterns(userId: string): RegExp[] {
+    const cacheKey = `user:${userId}`;
     if (this.compiledCache.has(cacheKey)) {
       return this.compiledCache.get(cacheKey)!;
     }
 
     const patterns: RegExp[] = [];
-    for (const kw of this.keywords.values()) {
-      patterns.push(kw.compiled);
+    const userMap = this.userKeywords.get(userId);
+    if (userMap) {
+      for (const kw of userMap.values()) {
+        patterns.push(kw.compiled);
+      }
     }
 
     this.compiledCache.set(cacheKey, patterns);
     return patterns;
   }
 
-  matchKeyword(text: string): { keyword: string; matched: boolean }[] {
+  /**
+   * Matches text against a single user's keyword set. Callers that need to
+   * check "does this message match anyone's watchlist" should call this per
+   * userId, not against a shared global set — every user's autojoin session
+   * only cares about their own watchlist matches anyway (see handleMessage's
+   * call site, which already passes session.userId).
+   */
+  matchKeyword(userId: string, text: string): { keyword: string; matched: boolean }[] {
     const results: { keyword: string; matched: boolean }[] = [];
-    
-    for (const [key, kw] of this.keywords) {
+    const userMap = this.userKeywords.get(userId);
+    if (!userMap) return results;
+
+    for (const [key, kw] of userMap) {
       if (kw.compiled.test(text)) {
         kw.matchCount++;
         kw.lastMatched = Date.now();
@@ -1063,16 +1139,27 @@ class WatchlistManager {
     return results;
   }
 
-  getTopKeywords(limit: number = 10): WatchlistKeyword[] {
-    return Array.from(this.keywords.values())
+  getTopKeywords(userId: string, limit: number = 10): WatchlistKeyword[] {
+    const userMap = this.userKeywords.get(userId);
+    if (!userMap) return [];
+    return Array.from(userMap.values())
       .sort((a, b) => b.matchCount - a.matchCount)
       .slice(0, limit);
   }
 
   getStats() {
+    let totalKeywords = 0;
+    const topOverall: WatchlistKeyword[] = [];
+    for (const userMap of this.userKeywords.values()) {
+      totalKeywords += userMap.size;
+      for (const kw of userMap.values()) topOverall.push(kw);
+    }
+    topOverall.sort((a, b) => b.matchCount - a.matchCount);
+
     return {
-      totalKeywords: this.keywords.size,
-      topKeywords: this.getTopKeywords(5).map(kw => ({
+      totalUsers: this.userKeywords.size,
+      totalKeywords,
+      topKeywords: topOverall.slice(0, 5).map(kw => ({
         keyword: kw.keyword,
         matches: kw.matchCount,
         lastMatched: kw.lastMatched ? new Date(kw.lastMatched).toISOString() : 'never',
@@ -1083,7 +1170,84 @@ class WatchlistManager {
 
 // ---------------------------------------------------------------------------
 // Multi-Stage Detection Engine
+//
+// REWRITTEN to match giveawayManager.ts's scored, multi-signal model.
+//
+// The previous implementation let a single bot-ID match (worth 0.4) clear the
+// 0.3 confidence threshold entirely on its own, with zero content evidence
+// required. That meant ANY message at all from a "known giveaway bot" —
+// welcome pings, "messages sent" stats, ended-giveaway announcements,
+// minigame results — scored as a real giveaway. giveawayManager.ts never
+// lets bot identity alone decide: it requires multiple weighted content
+// signals (entry button, embed color, countdown timestamp, keyword hits in
+// title/description/footer/fields) to clear a much higher score threshold,
+// and it explicitly rejects blocked/draft/ended content up front. This
+// rewrite ports that same weighted-signal scoring model in here, so both
+// modules now agree on what does and doesn't count as a giveaway.
 // ---------------------------------------------------------------------------
+
+// ─── Scoring weights (mirrors giveawayManager.ts SCORE table) ─────────────
+const DETECTION_SCORE = {
+  ENTRY_BUTTON: 3,
+  TIMESTAMP: 3,
+  TITLE_KEYWORD: 2,
+  FOOTER_ENDS: 2,
+  FIELD_GIVEAWAY: 2,
+  DESCRIPTION_KEYWORD: 1,
+  EMBED_COLOR: 1,
+  AUTHOR_KNOWN: 1,
+} as const;
+
+const DETECTION_MAX_POSSIBLE_SCORE =
+  DETECTION_SCORE.ENTRY_BUTTON +
+  DETECTION_SCORE.TIMESTAMP +
+  DETECTION_SCORE.TITLE_KEYWORD +
+  DETECTION_SCORE.FOOTER_ENDS +
+  DETECTION_SCORE.FIELD_GIVEAWAY +
+  DETECTION_SCORE.DESCRIPTION_KEYWORD +
+  DETECTION_SCORE.EMBED_COLOR +
+  DETECTION_SCORE.AUTHOR_KNOWN;
+
+// Minimum raw score required before something counts as a giveaway.
+// Mirrors giveawayManager.ts's MINIMUM_SCORE_THRESHOLD (6).
+const DETECTION_MINIMUM_SCORE_THRESHOLD = 6;
+
+const DETECTION_GIVEAWAY_WORDS = new Set(['giveaway', 'raffle', 'sweepstakes', 'win', 'prize']);
+const DETECTION_FOOTER_END_WORDS = new Set(['ends', 'expires']);
+const DETECTION_EMBED_COLORS = new Set([0xF1C40F, 0x7289DA, 0x2ECC71, 0xE91E63]);
+const DETECTION_ENTRY_EMOJIS = new Set(['🎉', '🎁', '🎊', '🎈', '🎀', '👍', '✅']);
+const DETECTION_DRAFT_BUTTON_LABELS = new Set(['start', 'edit', 'cancel', 'preview', 'setup']);
+
+const DETECTION_BLOCKED_PHRASES = [
+  'already entered', 'you have already entered', "you've already entered",
+  'you are already in', 'leave giveaway', 'joined successfully',
+  'entry confirmed', 'entered successfully', "you're entered",
+  'withdraw entry', 'giveaway has ended', 'giveaway ended',
+  'giveaway is over', 'winners selected', 'winner selected',
+  'congratulations', 'you won', 'you did not win',
+  'results are in', 'giveaway is now closed', 'thank you for participating',
+];
+
+const DETECTION_DRAFT_PHRASES = [
+  'review your giveaway', 'click "start" to', "click 'start' to",
+  'this message expires in', 'giveaway preview', 'configure your giveaway',
+  'setup your giveaway', 'you can edit this', 'you can change',
+  'create a giveaway', 'select a channel', 'set the prize', 'set the duration',
+];
+
+const DETECTION_ENDED_PHRASES = [
+  'ended', 'winner', 'closed', 'congratulations', 'results',
+  'giveaway has ended', 'giveaway ended', 'giveaway is over',
+];
+
+const DETECTION_COUNT_ME_IN_REGEX = /count\s+me\s+in/i;
+
+interface DetectionParsedButtons {
+  entry: GiveawayButton | undefined;
+  draftLabels: string[];
+  draftCount: number;
+  entryCount: number;
+}
 
 class DetectionEngine {
   private profiles: Map<string, DetectionProfile> = new Map();
@@ -1094,6 +1258,16 @@ class DetectionEngine {
     try {
       const profiles = await getDetectionProfiles();
       for (const profile of profiles) {
+        // CRITICAL: only load profiles for bots still in the trusted set.
+        // MongoDB may contain stale profile documents from before
+        // KNOWN_GIVEAWAY_BOT_IDS was restricted to a single bot (this
+        // collection previously tracked Carl-bot, welcome bots, etc.) —
+        // without this filter, loadProfiles() would silently re-admit
+        // those old bot IDs into `this.profiles` on every restart,
+        // regardless of what the current KNOWN_GIVEAWAY_BOT_IDS set says.
+        // This was the actual cause of "Known bot: Carl-bot" appearing in
+        // detection reasons even after the ID list was restricted in code.
+        if (!KNOWN_GIVEAWAY_BOT_IDS.has(profile.botId)) continue;
         this.profiles.set(profile.botId, profile);
       }
     } catch (error) {
@@ -1117,93 +1291,225 @@ class DetectionEngine {
   }
 
   async detect(message: Message, correlationId: string): Promise<DetectionResult> {
-    const reasons: string[] = [];
-    let totalConfidence = 0;
-    let stageCount = 0;
-
-    // Stage 1: Cheap keyword scan
-    const keywordScore = this.cheapKeywordScan(message);
-    if (keywordScore > 0) {
-      totalConfidence += keywordScore;
-      stageCount++;
-      reasons.push(`Keyword match: ${keywordScore.toFixed(2)}`);
+    // Ensure components are present before scoring, same as before — some
+    // gateway events arrive without components populated yet.
+    try {
+      if (!(message as any).components?.length) {
+        await delay(COMPONENT_RETRY_DELAY_MS);
+        try { await message.fetch(); } catch {}
+      }
+    } catch {
+      // Ignore fetch errors, fall through to scoring with what we have
     }
 
-    // Stage 2: Cheap bot ID match
+    const embed = message.embeds?.[0];
+    const content = message.content || '';
+    const title = embed?.title || '';
+    const lowerTitle = title.toLowerCase();
+    const description = embed?.description || '';
+    const lowerDescription = description.toLowerCase();
+    const footer = embed?.footer?.text || '';
+    const lowerFooter = footer.toLowerCase();
+    const authorName = (embed as any)?.author?.name || '';
+    const lowerAuthor = authorName.toLowerCase();
+
+    const fieldNames: string[] = [];
+    const lowerFieldNames: string[] = [];
+    const fieldValues: string[] = [];
+    if (embed?.fields) {
+      for (const field of embed.fields) {
+        fieldNames.push(field.name);
+        lowerFieldNames.push(field.name.toLowerCase());
+        fieldValues.push(field.value);
+      }
+    }
+
+    const fullTextParts = [content, title, description, footer, authorName, ...fieldNames, ...fieldValues];
+    const fullText = fullTextParts.filter(Boolean).join(' ');
+    const lowerText = fullText.toLowerCase();
+
+    const reasons: string[] = [];
+
+    // ─── Reject blocked content outright (already-entered, ended, etc.) ───
+    for (const phrase of DETECTION_BLOCKED_PHRASES) {
+      if (lowerText.includes(phrase)) {
+        return {
+          isGiveaway: false,
+          confidence: 0,
+          reasons: [`Blocked content: "${phrase}"`],
+          profile: message.author?.id ? this.profiles.get(message.author.id) : undefined,
+        };
+      }
+    }
+
+    const buttons = this.parseButtons((message as any).components);
+
+    // ─── Reject drafts (giveaway-creation UI, not a live giveaway) ───
+    let isDraft = false;
+    for (const phrase of DETECTION_DRAFT_PHRASES) {
+      if (lowerText.includes(phrase)) { isDraft = true; break; }
+    }
+    if (!isDraft && buttons.draftCount > 0 && buttons.entryCount === 0) {
+      isDraft = true;
+    }
+    if (isDraft) {
+      return {
+        isGiveaway: false,
+        confidence: 0,
+        reasons: ['Draft/creation UI detected'],
+        profile: message.author?.id ? this.profiles.get(message.author.id) : undefined,
+      };
+    }
+
+    // ─── Weighted signal scoring (mirrors giveawayManager.ts) ───
+    let score = 0;
+
+    if (buttons.entry) {
+      score += DETECTION_SCORE.ENTRY_BUTTON;
+      reasons.push('Entry button found');
+    }
+
+    const timestampMatch = fullText.match(PATTERNS.TIMESTAMP);
+    let endsAt: number | undefined;
+    if (timestampMatch?.[1]) {
+      const raw = parseInt(timestampMatch[1], 10);
+      const tsMs = raw < 1e12 ? raw * 1000 : raw;
+      if (Number.isFinite(tsMs) && tsMs > Date.now()) {
+        endsAt = tsMs;
+        score += DETECTION_SCORE.TIMESTAMP;
+        reasons.push('Countdown timer found');
+      }
+    }
+
+    for (const word of DETECTION_GIVEAWAY_WORDS) {
+      if (lowerTitle.includes(word)) {
+        score += DETECTION_SCORE.TITLE_KEYWORD;
+        reasons.push(`Title keyword: ${word}`);
+        break;
+      }
+    }
+
+    for (const word of DETECTION_GIVEAWAY_WORDS) {
+      if (lowerDescription.includes(word)) {
+        score += DETECTION_SCORE.DESCRIPTION_KEYWORD;
+        reasons.push(`Description keyword: ${word}`);
+        break;
+      }
+    }
+
+    for (const word of DETECTION_FOOTER_END_WORDS) {
+      if (lowerFooter.includes(word)) {
+        score += DETECTION_SCORE.FOOTER_ENDS;
+        reasons.push(`Footer keyword: ${word}`);
+        break;
+      }
+    }
+
+    if (embed?.color !== undefined && embed?.color !== null && DETECTION_EMBED_COLORS.has(embed.color)) {
+      score += DETECTION_SCORE.EMBED_COLOR;
+      reasons.push('Recognized embed color');
+    }
+
+    if (lowerAuthor.includes('giveaway')) {
+      score += DETECTION_SCORE.AUTHOR_KNOWN;
+      reasons.push('Author name mentions giveaway');
+    }
+
+    for (const fieldName of lowerFieldNames) {
+      if (fieldName.includes('ends') || fieldName.includes('winners') || fieldName.includes('time remaining')) {
+        score += DETECTION_SCORE.FIELD_GIVEAWAY;
+        reasons.push(`Giveaway field: ${fieldName}`);
+        break;
+      }
+    }
+
+    // Bot-ID match: this list is already restricted to one pre-vetted,
+    // trusted giveaway bot (see KNOWN_GIVEAWAY_BOT_IDS above) — unlike
+    // giveawayManager.ts's public detector, which watches many unknown bots
+    // and therefore can't give bot identity real scoring weight. The bonus
+    // REQUIRES an actual clickable entry button — a countdown timestamp
+    // alone is not enough, since "Messages Sent" stat embeds, "already
+    // entered" replies, and other non-enterable messages from this same
+    // bot also contain <t:...> timestamps. Without a real button there is
+    // nothing to click anyway (enterViaButton always fails immediately
+    // with "No buttonCustomId set" for these), so admitting them here only
+    // produced dead-letter spam with zero chance of ever joining anything.
     const botMatch = this.cheapBotIdMatch(message);
     if (botMatch) {
-      totalConfidence += 0.4;
-      stageCount++;
       reasons.push(`Known bot: ${message.author?.username}`);
-    }
-
-    if (totalConfidence > 0 || stageCount > 0) {
-      // Stage 3: Expensive button analysis
-      const buttonResult = await this.expensiveButtonAnalysis(message, correlationId);
-      if (buttonResult.score > 0) {
-        totalConfidence += buttonResult.score;
-        stageCount++;
-        reasons.push(...buttonResult.reasons);
-      }
-
-      // Stage 4: Expensive embed parsing
-      const embedResult = this.expensiveEmbedParsing(message);
-      if (embedResult.score > 0) {
-        totalConfidence += embedResult.score;
-        stageCount++;
-        reasons.push(...embedResult.reasons);
-      }
-
-      // Stage 5: Expensive profile match
-      if (botMatch && message.author?.id) {
-        const profileResult = this.expensiveProfileMatch(message);
-        if (profileResult.score > 0) {
-          totalConfidence += profileResult.score;
-          stageCount++;
-          reasons.push(...profileResult.reasons);
-        }
+      if (buttons.entry) {
+        score += DETECTION_SCORE.TRUSTED_BOT_WITH_SIGNAL;
+        reasons.push('Trusted bot bonus (has entry button)');
       }
     }
 
-    const finalConfidence = stageCount > 0 ? totalConfidence / Math.max(stageCount, 1) : 0;
-    const isGiveaway = finalConfidence >= CONFIDENCE_LOW;
+    // ─── Reject if it looks already-ended ───
+    const isEnded = (endsAt !== undefined && endsAt < Date.now()) ||
+      DETECTION_ENDED_PHRASES.some(p => lowerText.includes(p));
+    if (isEnded) {
+      return {
+        isGiveaway: false,
+        confidence: 0,
+        reasons: ['Giveaway already ended'],
+        profile: message.author?.id ? this.profiles.get(message.author.id) : undefined,
+      };
+    }
 
-    let button: GiveawayButton | undefined;
-    if (isGiveaway) {
-      button = this.extractEntryButton(message);
+    const isGiveaway = score >= DETECTION_MINIMUM_SCORE_THRESHOLD;
+    const confidence = Math.min(1, score / DETECTION_MAX_POSSIBLE_SCORE);
+
+    if (!isGiveaway) {
+      reasons.push(`Below threshold: score=${score}/${DETECTION_MAX_POSSIBLE_SCORE} (need ${DETECTION_MINIMUM_SCORE_THRESHOLD})`);
     }
 
     return {
       isGiveaway,
-      confidence: Math.min(finalConfidence, 1.0),
+      confidence,
       reasons,
-      button,
+      button: isGiveaway ? buttons.entry : undefined,
       prize: isGiveaway ? this.extractPrize(message) : undefined,
       profile: message.author?.id ? this.profiles.get(message.author.id) : undefined,
     };
   }
 
-  private cheapKeywordScan(message: Message): number {
-    let score = 0;
-    const content = message.content || '';
-    
-    if (PATTERNS.GIVEAWAY_KEYWORD.test(content)) {
-      score += 0.2;
-    }
+  private parseButtons(components: any[] | undefined): DetectionParsedButtons {
+    const result: DetectionParsedButtons = {
+      entry: undefined, draftLabels: [], draftCount: 0, entryCount: 0,
+    };
+    if (!components) return result;
 
-    if (message.embeds?.length) {
-      for (const embed of message.embeds) {
-        const embedText = [embed.title, embed.description, embed.footer?.text]
-          .filter(Boolean)
-          .join(' ');
-        if (PATTERNS.GIVEAWAY_KEYWORD.test(embedText)) {
-          score += 0.3;
-          break;
+    for (const row of components) {
+      const comps = row?.components as any[] | undefined;
+      if (!comps) continue;
+      for (const comp of comps) {
+        if (comp.type !== 2 || comp.style === 5) continue;
+        const customId: string = comp.customId || comp.custom_id || '';
+        const label: string = (comp.label || '').trim();
+        const lowerLabel = label.toLowerCase();
+
+        if (DETECTION_DRAFT_BUTTON_LABELS.has(lowerLabel)) {
+          result.draftLabels.push(lowerLabel);
+          result.draftCount++;
+          continue;
+        }
+
+        if (comp.disabled === true) continue;
+
+        if (this.isEntryButton(customId, label, lowerLabel)) {
+          if (!result.entry) result.entry = { customId: customId || label, label: label || customId, disabled: false };
+          result.entryCount++;
         }
       }
     }
+    return result;
+  }
 
-    return Math.min(score, 0.5);
+  private isEntryButton(customId: string, label: string, lowerLabel: string): boolean {
+    if (TRUSTED_ENTRY_CUSTOM_IDS.has(customId)) return true;
+    for (const emoji of DETECTION_ENTRY_EMOJIS) { if (label.includes(emoji)) return true; }
+    if (PATTERNS.ENTRY_BUTTON.test(lowerLabel)) return true;
+    if (DETECTION_COUNT_ME_IN_REGEX.test(lowerLabel)) return true;
+    return false;
   }
 
   private cheapBotIdMatch(message: Message): boolean {
@@ -1211,144 +1517,15 @@ class DetectionEngine {
               KNOWN_GIVEAWAY_BOT_IDS.has(message.author.id));
   }
 
-  private async expensiveButtonAnalysis(
-    message: Message, 
-    correlationId: string
-  ): Promise<{ score: number; reasons: string[] }> {
-    const reasons: string[] = [];
-    let score = 0;
-
-    try {
-      if (!(message as any).components?.length) {
-        await delay(COMPONENT_RETRY_DELAY_MS);
-        try { await message.fetch(); } catch {}
-      }
-
-      const components = (message as any).components;
-      if (!components?.length) return { score: 0, reasons: [] };
-
-      for (const row of components) {
-        const rowComps = row?.components;
-        if (!rowComps?.length) continue;
-
-        for (const comp of rowComps) {
-          if (comp.type !== 2 || comp.style === 5) continue;
-
-          const customId = comp.customId || comp.custom_id;
-          const label = (comp.label || '').toLowerCase();
-
-          if (customId && TRUSTED_ENTRY_CUSTOM_IDS.has(customId)) {
-            score += 0.3;
-            reasons.push(`Trusted button ID: ${customId}`);
-          }
-
-          if (PATTERNS.ENTRY_BUTTON.test(label)) {
-            score += 0.2;
-            reasons.push(`Entry button: ${label}`);
-          }
-
-          if (PATTERNS.BLOCKED_BUTTON.test(label)) {
-            score -= 0.1;
-            reasons.push(`Blocked button: ${label}`);
-          }
-        }
-      }
-    } catch (error) {
-      // Button analysis failed
-    }
-
-    return { score: Math.max(0, Math.min(score, 0.5)), reasons };
-  }
-
-  private expensiveEmbedParsing(message: Message): { score: number; reasons: string[] } {
-    const reasons: string[] = [];
-    let score = 0;
-
-    if (!message.embeds?.length) return { score: 0, reasons: [] };
-
-    const embed = message.embeds[0];
-    
-    if (embed.description) {
-      const timestampMatch = embed.description.match(PATTERNS.TIMESTAMP);
-      if (timestampMatch) {
-        score += 0.3;
-        reasons.push('Countdown timer found');
-      }
-    }
-
-    if (embed.title || embed.description) {
-      const text = (embed.title + ' ' + (embed.description || '')).toLowerCase();
-      if (/\b(prize|reward|win|nitro|steam|gift card)\b/i.test(text)) {
-        score += 0.2;
-        reasons.push('Prize mentioned');
-      }
-    }
-
-    if (embed.description && /\d+\s*(winner|winners)/i.test(embed.description)) {
-      score += 0.2;
-      reasons.push('Winner count specified');
-    }
-
-    return { score: Math.min(score, 0.5), reasons };
-  }
-
-  private expensiveProfileMatch(message: Message): { score: number; reasons: string[] } {
-    const reasons: string[] = [];
-    let score = 0;
-
-    const profile = message.author?.id ? this.profiles.get(message.author.id) : undefined;
-    if (!profile) return { score: 0, reasons: [] };
-
-    const content = (message.content || '').toLowerCase();
-    const embedText = message.embeds?.map(e => 
-      [e.title, e.description, e.footer?.text].filter(Boolean).join(' ')
-    ).join(' ') || '';
-
-    for (const pattern of profile.patterns.buttonPatterns) {
-      if (content.includes(pattern) || embedText.includes(pattern)) {
-        score += 0.1;
-        reasons.push(`Profile pattern match: ${pattern}`);
-      }
-    }
-
-    const accuracy = profile.detectionCount > 0 
-      ? profile.truePositives / profile.detectionCount 
-      : 0.9;
-
-    score *= accuracy;
-
-    return { score: Math.min(score, 0.5), reasons };
-  }
-
-  private extractEntryButton(message: Message): GiveawayButton | undefined {
-    const components = (message as any).components;
-    if (!components?.length) return undefined;
-
-    for (const row of components) {
-      const rowComps = row?.components;
-      if (!rowComps?.length) continue;
-
-      for (const comp of rowComps) {
-        if (comp.type !== 2 || comp.style === 5 || comp.disabled) continue;
-
-        const customId = comp.customId || comp.custom_id;
-        const label = comp.label || '';
-
-        if (customId && TRUSTED_ENTRY_CUSTOM_IDS.has(customId)) {
-          return { customId, label, disabled: false };
-        }
-
-        if (PATTERNS.ENTRY_BUTTON.test(label)) {
-          return { customId: customId || label, label, disabled: false };
-        }
-      }
-    }
-
-    return undefined;
-  }
-
   private extractPrize(message: Message): string {
     const embed = message.embeds?.[0];
+    if (embed?.fields?.length) {
+      for (const field of embed.fields) {
+        if (['prize', 'reward', 'item', 'prizes', 'rewards'].includes(field.name.toLowerCase())) {
+          return truncate(field.value, 200) || 'Unknown Prize';
+        }
+      }
+    }
     if (embed?.title) return truncate(embed.title, 200);
     if (embed?.description) return truncate(embed.description, 200);
     if (message.content) return truncate(message.content, 200);
@@ -1451,6 +1628,7 @@ export class AutoJoinManager extends EventEmitter {
   private stallCheckInterval: NodeJS.Timeout | null = null;
   private batchDbInterval: NodeJS.Timeout | null = null;
   private archiveInterval: NodeJS.Timeout | null = null;
+  private clientCacheSweepInterval: NodeJS.Timeout | null = null; // NEW - memory fix
   
   // State
   private isShuttingDown = false;
@@ -1534,6 +1712,7 @@ export class AutoJoinManager extends EventEmitter {
     this.startStallChecker();
     this.startBatchDbWriter();
     this.startArchiveInterval();
+    this.startClientCacheSweeper(); // NEW - memory fix
 
     this.asyncLogger.info('🚀 Enhanced AutoJoinManager initialized', {
       worker: this.workerId,
@@ -1637,6 +1816,7 @@ export class AutoJoinManager extends EventEmitter {
     this.noResponseCooldown.clear();
     this.crosspostCache.clear();
     this.tokenManager.clearAll();
+    this.sweepAllClientCaches(); // NEW - memory fix
     
     if (this.sessionStartPromises.size > 10) {
       this.sessionStartPromises.clear();
@@ -1665,6 +1845,76 @@ export class AutoJoinManager extends EventEmitter {
         remaining: this.sessions.size,
       });
     }
+  }
+
+  /**
+   * NEW - memory fix.
+   * Manual fallback sweep for per-client Discord.js caches (messages/channels/
+   * users/members). This runs regardless of whether `sweepers` is honored by
+   * the installed discord.js-selfbot-v13 version, since some forks lag behind
+   * upstream and may not implement it. Safe to call even if sweepers ARE
+   * active — it's just a no-op extra pass in that case.
+   */
+  private sweepAllClientCaches(): void {
+    for (const session of this.sessions.values()) {
+      this.sweepClientCaches(session.client);
+    }
+  }
+
+  private sweepClientCaches(client: Client): void {
+    try {
+      const c = client as any;
+      const channels = c.channels?.cache;
+      if (channels) {
+        for (const channel of channels.values()) {
+          try {
+            if (channel?.messages?.cache?.size > CLIENT_MESSAGE_CACHE_MAX_SIZE) {
+              channel.messages.cache.clear();
+            }
+          } catch {}
+        }
+        // Keep only channels currently relevant (bounded ceiling)
+        if (channels.size > CLIENT_CHANNEL_CACHE_MAX_SIZE) {
+          const excess = channels.size - CLIENT_CHANNEL_CACHE_MAX_SIZE;
+          let removed = 0;
+          for (const [id] of channels) {
+            if (removed >= excess) break;
+            channels.delete(id);
+            removed++;
+          }
+        }
+      }
+
+      // Keep only the bot's own user/member cached; drop the rest
+      const selfId = c.user?.id;
+      if (c.users?.cache?.size > 1) {
+        for (const [id] of c.users.cache) {
+          if (id !== selfId) c.users.cache.delete(id);
+        }
+      }
+      if (c.guilds?.cache) {
+        for (const guild of c.guilds.cache.values()) {
+          try {
+            if (guild.members?.cache?.size > 1) {
+              for (const [id] of guild.members.cache) {
+                if (id !== selfId) guild.members.cache.delete(id);
+              }
+            }
+          } catch {}
+        }
+      }
+    } catch {
+      // Never let a sweep failure take down the session
+    }
+  }
+
+  private startClientCacheSweeper(): void {
+    this.clientCacheSweepInterval = setInterval(() => {
+      if (this.isShuttingDown) return;
+      this.sweepAllClientCaches();
+    }, MANUAL_CLIENT_CACHE_SWEEP_INTERVAL_MS);
+
+    if (this.clientCacheSweepInterval.unref) this.clientCacheSweepInterval.unref();
   }
 
   // -------------------------------------------------------------------------
@@ -1792,9 +2042,18 @@ export class AutoJoinManager extends EventEmitter {
         return false;
       }
 
+      // -----------------------------------------------------------------
+      // MEMORY FIX: `messageCacheLifetime` / `messageSweepInterval` are
+      // discord.js v12 fields and are silently ignored by v13 — they were
+      // doing nothing here. In v13, caching ceilings come from `makeCache`
+      // and active eviction comes from `sweepers`. Previously only
+      // Presence/Reaction/Thread/VoiceState/StageInstance were capped —
+      // MessageManager, ChannelManager, UserManager, and GuildMemberManager
+      // were fully unbounded, and every fetchMessage()/enterViaButton() call
+      // permanently grew those caches. This is the fix for the "RAM grows on
+      // every autojoin attempt" issue.
+      // -----------------------------------------------------------------
       const clientOptions: ClientOptions = {
-        messageCacheLifetime: 60,
-        messageSweepInterval: 300,
         restRequestTimeout: 15000,
         restGlobalRateLimit: 50,
         retryLimit: 3,
@@ -1806,7 +2065,35 @@ export class AutoJoinManager extends EventEmitter {
           ThreadManager: 0,
           VoiceStateManager: 0,
           StageInstanceManager: 0,
+          MessageManager: CLIENT_MESSAGE_CACHE_MAX_SIZE,
+          ChannelManager: {
+            maxSize: CLIENT_CHANNEL_CACHE_MAX_SIZE,
+            keepOverLimit: (channel: any) => channel.isDMBased?.() ?? false,
+          },
+          GuildMemberManager: {
+            maxSize: 1,
+            keepOverLimit: (member: any) => member.id === member.client?.user?.id,
+          },
+          UserManager: {
+            maxSize: 1,
+            keepOverLimit: (user: any) => user.id === user.client?.user?.id,
+          },
         }),
+        sweepers: {
+          ...(Options as any).defaultSweeperSettings,
+          messages: {
+            interval: CLIENT_MESSAGE_SWEEP_INTERVAL_SEC,
+            lifetime: CLIENT_MESSAGE_SWEEP_LIFETIME_SEC,
+          },
+          users: {
+            interval: CLIENT_MESSAGE_SWEEP_INTERVAL_SEC,
+            filter: () => (user: any) => user.id !== user.client?.user?.id,
+          },
+          guildMembers: {
+            interval: CLIENT_MESSAGE_SWEEP_INTERVAL_SEC,
+            filter: () => (member: any) => member.id !== member.client?.user?.id,
+          },
+        } as any,
       };
 
       const client = new Client(clientOptions);
@@ -1845,9 +2132,7 @@ export class AutoJoinManager extends EventEmitter {
           userId,
           sessionId: session.sessionId,
         });
-        try {
-          await client.destroy();
-        } catch {}
+        await this.destroyClientSafely(client);
         return false;
       }
 
@@ -1912,6 +2197,26 @@ export class AutoJoinManager extends EventEmitter {
     });
   }
 
+  /**
+   * NEW - memory fix helper.
+   * Awaits client.destroy() with a timeout guard so callers never block
+   * forever, but critically DO wait for destruction to actually begin
+   * completing before proceeding (e.g. before spinning up a replacement
+   * client on reconnect). Previously this was fire-and-forget
+   * (`try { destroy() } catch {}`), which could let two live Client
+   * instances (and their caches) coexist during rapid reconnect storms.
+   */
+  private async destroyClientSafely(client: Client): Promise<void> {
+    try {
+      await Promise.race([
+        (client as any).destroy(),
+        delay(CLIENT_DESTROY_TIMEOUT_MS),
+      ]);
+    } catch {
+      // Ignore — best effort
+    }
+  }
+
   // -------------------------------------------------------------------------
   // Heartbeat with reconnect
   // -------------------------------------------------------------------------
@@ -1947,14 +2252,14 @@ export class AutoJoinManager extends EventEmitter {
             oldSessionId: session.sessionId,
           });
           
-          try {
-            (session.client as any).destroy();
-          } catch {}
-          this.cleanupSessionListeners(session);
-          
           session.destroyed = true;
-          
-          this._startSessionInternal(session.userId, session.guildId)
+          this.cleanupSessionListeners(session);
+
+          // MEMORY FIX: await destruction (with timeout guard) before
+          // starting a replacement session, instead of fire-and-forget,
+          // so we never have two live Client instances/caches at once.
+          this.destroyClientSafely(session.client)
+            .then(() => this._startSessionInternal(session.userId, session.guildId))
             .then(success => {
               if (success) {
                 const newSession = this.sessionsByUserId.get(session.userId);
@@ -2032,13 +2337,12 @@ export class AutoJoinManager extends EventEmitter {
       
       this.cleanupSessionListeners(session);
       
-      try {
-        await (session.client as any).destroy();
-      } catch {}
+      await this.destroyClientSafely(session.client);
       
       this.sessions.delete(sessionKey);
       this.sessionsByUserId.delete(userId);
       this.tokenManager.clearCache(userId, guildId);
+      this.watchlistManager.removeUser(userId);
       
       await setTokenActive(userId, guildId, false);
       
@@ -2252,7 +2556,7 @@ export class AutoJoinManager extends EventEmitter {
       this.refreshInterval, this.cleanupInterval, this.memoryCheckInterval,
       this.reconnectCheckInterval, this.cacheCleanInterval, this.metricsInterval,
       this.healthCheckInterval, this.queuePersistInterval, this.stallCheckInterval,
-      this.batchDbInterval, this.archiveInterval,
+      this.batchDbInterval, this.archiveInterval, this.clientCacheSweepInterval,
     ].forEach(interval => {
       if (interval) { clearInterval(interval); }
     });
@@ -2296,9 +2600,7 @@ export class AutoJoinManager extends EventEmitter {
       
       this.cleanupSessionListeners(session);
       
-      try {
-        await (session.client as any).destroy();
-      } catch {}
+      await this.destroyClientSafely(session.client);
       
       this.sessions.delete(this.makeSessionKey(session.userId));
       this.sessionsByUserId.delete(session.userId);
@@ -2461,12 +2763,35 @@ export class AutoJoinManager extends EventEmitter {
         return;
       }
 
+      // SAFETY NET: never queue/attempt-enter something with no clickable
+      // button. This is a hard backstop independent of DetectionEngine's
+      // scoring — regardless of how confidence was computed, if there's no
+      // button.customId there is nothing for enterViaButton() to click, and
+      // every attempt would fail immediately with "No buttonCustomId set",
+      // burn 3-4 retries, and dead-letter. That was previously happening at
+      // scale for "Known bot" detections (welcome pings, stat embeds,
+      // "already entered" replies) that scored as giveaways without an
+      // actual entry button being present.
+      if (!detected.button?.customId) {
+        this.asyncLogger.debug('Skipping detected giveaway with no entry button', {
+          correlationId,
+          userId: session.userId,
+          messageId: message.id,
+          reasons: detected.reasons,
+        });
+        this.correlationTracker.completeTrace(correlationId, 'completed');
+        this.processingCache.delete(entryId);
+        return;
+      }
+
       this.metrics.totalGiveawaysDetected++;
       const detectionTime = Date.now() - startTime;
       this.metrics.recordDetectionTime(detectionTime);
 
-      // Check watchlists
+      // Check watchlists (scoped to this session's own user — watchlists
+      // are per-user now, not a shared global set)
       const watchlistMatches = this.watchlistManager.matchKeyword(
+        session.userId,
         message.content + ' ' + 
         message.embeds?.map(e => e.title + ' ' + e.description).join(' ') || ''
       );
@@ -2994,8 +3319,15 @@ export class AutoJoinManager extends EventEmitter {
               throw new Error(`No response from Application after ${INTERACTION_RETRY_ATTEMPTS} attempts`);
             }
             if (attempt === 1) {
+              // Only regenerate the nonce on retry. session_id was
+              // correctly fetched from the real gateway shard above
+              // (client.ws.shards...) — overwriting it here with a
+              // fabricated `${Date.now()}_${random}` string replaces a
+              // valid session ID with garbage that Discord always
+              // rejects (manifesting as "Request to use token, but token
+              // was unavailable to the client" / HTTP 500, which was
+              // crashing out as an unhandled promise rejection).
               payload.nonce = `${Date.now()}${Math.random().toString(36).slice(2, 8)}`;
-              payload.session_id = `${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
             }
             continue;
           }
@@ -3004,6 +3336,18 @@ export class AutoJoinManager extends EventEmitter {
             const retryAfterMs = Math.ceil((axiosErr.response?.data?.retry_after ?? 1) * 1000);
             await delay(retryAfterMs);
             continue;
+          }
+
+          // Discord error code 40002 ("You need to verify your account in
+          // order to perform this action") is an account-verification
+          // restriction, not proof the token itself is invalid/blocked.
+          // Previously this fell through to the generic `status === 403`
+          // branch below and called setTokenActive(false), permanently
+          // disabling a perfectly valid session over an unrelated
+          // restriction. Retrying also can't help here, so fail fast.
+          const errorCode = (axiosErr.response?.data as any)?.code;
+          if (errorCode === 40002 || errorMessage?.toLowerCase().includes('verify your account')) {
+            throw new Error('Account requires verification for this action');
           }
 
           if (status === 401 || status === 403) {
