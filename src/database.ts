@@ -26,6 +26,8 @@
  *     never clobbers an entry that a concurrent winner has already moved
  *     to 'queued'/'attempting'/etc, since $setOnInsert fields are only
  *     applied when the document doesn't exist yet.
+ * 13. FIXED: Version conflict handling in bulk writes - individual
+ *     retries now properly handle version conflicts without endless loops
  */
 
 import { MongoClient, Db, Collection, AnyBulkWriteOperation } from 'mongodb';
@@ -639,6 +641,9 @@ async function flushSync(): Promise<void> {
           continue;
         }
         
+        // FIXED: Use $set with version instead of $inc
+        const newVersion = (entry.doc.version || 1) + 1;
+        
         ops.push({
           updateOne: {
             filter: { 
@@ -646,8 +651,10 @@ async function flushSync(): Promise<void> {
               channelId: entry.doc.channelId,
             },
             update: { 
-              $set: entry.doc, 
-              $inc: { version: 1 } 
+              $set: {
+                ...entry.doc,
+                version: newVersion,
+              }
             },
             upsert: true,
           },
@@ -708,29 +715,103 @@ async function executeBulkWrite(ops: AnyBulkWriteOperation<StoredGiveaway>[], ke
         component: 'Database',
         errors: errors.map(e => e.errmsg).slice(0, 5)
       });
+      
+      // Process individual errors
+      for (const error of errors) {
+        if (error.errmsg && error.errmsg.includes('version')) {
+          // Version conflict - try to recover
+          const filter = ops[error.index]?.updateOne?.filter;
+          if (filter) {
+            const key = cacheKey(filter.messageId, filter.channelId);
+            dirtyKeys.delete(key);
+            
+            // Reload the document to update cache
+            try {
+              const doc = await giveawaysCol.findOne({ 
+                messageId: filter.messageId, 
+                channelId: filter.channelId 
+              });
+              if (doc) {
+                const entry = cache.get(key);
+                if (entry) {
+                  entry.doc = doc;
+                  entry.version = doc.version || 1;
+                  entry.timestamp = Date.now();
+                }
+              }
+            } catch (reloadErr) {
+              // Ignore reload errors
+            }
+          }
+        }
+      }
     }
     
   } catch (err) {
-    // If bulk write fails, retry individually
+    // If bulk write fails, retry individually with proper error handling
     logger.debug('Bulk write failed, retrying individually', {
       component: 'Database',
       error: err instanceof Error ? err.message : String(err)
     });
     
+    // FIXED: Don't retry version conflicts - just log and continue
     for (const op of ops) {
+      if (!('updateOne' in op)) continue;
+      
       try {
-        if ('updateOne' in op) {
-          await giveawaysCol.updateOne(
-            op.updateOne.filter,
-            op.updateOne.update,
-            { upsert: op.updateOne.upsert }
-          );
+        const result = await giveawaysCol.updateOne(
+          op.updateOne.filter,
+          op.updateOne.update,
+          { upsert: op.updateOne.upsert }
+        );
+        
+        // If update succeeded, remove from dirtyKeys
+        if (result.modifiedCount > 0 || result.upsertedCount > 0) {
+          const filter = op.updateOne.filter;
+          const key = cacheKey(filter.messageId, filter.channelId);
+          dirtyKeys.delete(key);
         }
       } catch (individualErr) {
-        logger.error('Individual write failed', {
-          component: 'Database',
-          error: individualErr instanceof Error ? individualErr.message : String(individualErr)
-        });
+        // Check if this is a version conflict
+        const errMsg = individualErr instanceof Error ? individualErr.message : String(individualErr);
+        if (errMsg.includes('version') || errMsg.includes('Updating the path')) {
+          // Version conflict - document was modified elsewhere, just log and skip
+          logger.debug('Version conflict, skipping update', {
+            component: 'Database',
+            filter: op.updateOne.filter,
+            error: errMsg
+          });
+          
+          // Remove from dirtyKeys to prevent endless retry
+          const filter = op.updateOne.filter;
+          const key = cacheKey(filter.messageId, filter.channelId);
+          dirtyKeys.delete(key);
+          
+          // Reload the document to update cache
+          try {
+            const doc = await giveawaysCol.findOne({ 
+              messageId: filter.messageId, 
+              channelId: filter.channelId 
+            });
+            if (doc) {
+              const entry = cache.get(key);
+              if (entry) {
+                entry.doc = doc;
+                entry.version = doc.version || 1;
+                entry.timestamp = Date.now();
+              }
+            }
+          } catch (reloadErr) {
+            // Ignore reload errors
+          }
+        } else {
+          // Other error - log it
+          logger.error('Individual write failed', {
+            component: 'Database',
+            filter: op.updateOne.filter,
+            error: errMsg
+          });
+        }
       }
     }
   }
@@ -1288,7 +1369,7 @@ export async function getLicenseStats(): Promise<{
 }
 
 // ============================================================================
-// Public API - Premium User Tracking (FIXED: removed $inc on version)
+// Public API - Premium User Tracking
 // ============================================================================
 
 export async function setPremiumUser(
@@ -1335,7 +1416,6 @@ export async function removePremiumUser(
   
   await ensureConnected();
 
-  // FIXED: Use $set for version instead of $inc
   const existing = await premiumUsersCol.findOne({ userId, guildId });
   const newVersion = (existing?.version && typeof existing.version === 'number') ? existing.version + 1 : 1;
 
@@ -1426,7 +1506,7 @@ export async function getPremiumStats(guildId: string): Promise<{
 }
 
 // ============================================================================
-// Public API - Auto Joiner Token & Webhook Management (FIXED)
+// Public API - Auto Joiner Token & Webhook Management
 // ============================================================================
 
 export async function updateUserToken(
@@ -1441,7 +1521,6 @@ export async function updateUserToken(
   
   await ensureConnected();
 
-  // FIXED: Use $set for version instead of $inc
   const existing = await premiumUsersCol.findOne({ userId, guildId });
   const newVersion = (existing?.version && typeof existing.version === 'number') ? existing.version + 1 : 1;
 
@@ -1477,7 +1556,6 @@ export async function updateUserWebhook(
   
   await ensureConnected();
 
-  // FIXED: Use $set for version instead of $inc
   const existing = await premiumUsersCol.findOne({ userId, guildId });
   const newVersion = (existing?.version && typeof existing.version === 'number') ? existing.version + 1 : 1;
 
@@ -1533,7 +1611,6 @@ export async function incrementTokenEntries(
   
   await ensureConnected();
   
-  // FIXED: Removed $inc on version
   await premiumUsersCol.updateOne(
     { userId, guildId },
     { $inc: { tokenEntries: 1 } }
@@ -1548,7 +1625,6 @@ export async function incrementTokenWins(
   
   await ensureConnected();
   
-  // FIXED: Removed $inc on version
   await premiumUsersCol.updateOne(
     { userId, guildId },
     { $inc: { tokenWins: 1 } }
@@ -1563,7 +1639,6 @@ export async function updateTokenLastUsed(
   
   await ensureConnected();
   
-  // FIXED: Removed $inc on version
   await premiumUsersCol.updateOne(
     { userId, guildId },
     {
@@ -1581,7 +1656,6 @@ export async function setTokenActive(
   
   await ensureConnected();
   
-  // FIXED: Removed $inc on version
   await premiumUsersCol.updateOne(
     { userId, guildId },
     {
@@ -1936,7 +2010,7 @@ export async function loadQueueState(): Promise<any[]> {
 }
 
 // ============================================================================
-// Public API - Booster Premium Tracking (FIXED)
+// Public API - Booster Premium Tracking
 // ============================================================================
 
 export async function setBoosterPremium(
@@ -1950,7 +2024,6 @@ export async function setBoosterPremium(
   
   await ensureConnected();
 
-  // FIXED: Use $set for version instead of $inc
   const existing = await boosterPremiumCol.findOne({ userId, guildId });
   const newVersion = (existing?.version && typeof existing.version === 'number') ? existing.version + 1 : 1;
 
@@ -2000,7 +2073,6 @@ export async function removeBoosterPremium(
   
   await ensureConnected();
 
-  // FIXED: Use $set for version instead of $inc
   const existing = await boosterPremiumCol.findOne({ userId, guildId });
   const newVersion = (existing?.version && typeof existing.version === 'number') ? existing.version + 1 : 1;
 
