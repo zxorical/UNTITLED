@@ -14,6 +14,18 @@
  * 9. ALL autoJoin functions included
  * 10. FIXED: Removed $inc on version field (causes object type errors)
  * 11. FIXED: Version field now uses $set with numeric values only
+ * 12. FIXED: saveAutoJoinEntry is now an atomic upsert instead of a bare
+ *     insertOne. manager.ts's handleMessage() does a non-atomic
+ *     "check exists, then save" — under concurrent messageCreate/
+ *     messageUpdate events (or a gateway reconnect replaying recent
+ *     messages), two calls can both see "doesn't exist yet" and both call
+ *     saveAutoJoinEntry() for the same _id, so the second insertOne threw
+ *     E11000 duplicate key errors (visible at scale in production logs).
+ *     Using updateOne+upsert with $setOnInsert makes a race a harmless
+ *     no-op for the loser instead of a thrown error, and — critically —
+ *     never clobbers an entry that a concurrent winner has already moved
+ *     to 'queued'/'attempting'/etc, since $setOnInsert fields are only
+ *     applied when the document doesn't exist yet.
  */
 
 import { MongoClient, Db, Collection, AnyBulkWriteOperation } from 'mongodb';
@@ -1594,12 +1606,48 @@ export async function saveAutoJoinEntry(entry: Omit<AutoJoinEntry, '_id'>): Prom
   
   await ensureConnected();
   
-  const entryWithId: AutoJoinEntry = {
-    ...entry,
-    _id: `${entry.userId}:${entry.channelId}:${entry.messageId}`,
-  };
-  
-  await autoJoinEntriesCol.insertOne(entryWithId);
+  const _id = `${entry.userId}:${entry.channelId}:${entry.messageId}`;
+
+  // FIXED: was a bare insertOne(), which throws E11000 whenever two
+  // concurrent calls (messageCreate + messageUpdate firing close together,
+  // or a gateway reconnect replaying recently-seen messages) both pass the
+  // caller's "does this entry exist yet?" check before either has actually
+  // inserted. Converted to an idempotent updateOne+upsert:
+  //   - The loser of a race becomes a harmless no-op instead of a thrown
+  //     error, since $setOnInsert only applies when creating a new doc.
+  //   - If a concurrent winner has ALREADY progressed this entry's status
+  //     past 'pending' (e.g. to 'queued' or 'attempting'), this call does
+  //     not clobber that progress back to 'pending' — all of the entry's
+  //     fields are wrapped in $setOnInsert, so an existing document is left
+  //     completely untouched by a duplicate save attempt.
+  try {
+    await autoJoinEntriesCol.updateOne(
+      { _id },
+      {
+        $setOnInsert: {
+          _id,
+          ...entry,
+        },
+      },
+      { upsert: true }
+    );
+  } catch (err) {
+    // Extremely rare residual race window between the upsert's internal
+    // matched-check and write (two upserts for a brand-new _id landing in
+    // the same instant) can still surface as E11000 under high concurrency.
+    // Treat that specific case as a benign duplicate rather than propagating
+    // it as a hard failure — the entry already exists, which is exactly the
+    // outcome this call wanted anyway.
+    const isDuplicateKeyError =
+      err && typeof err === 'object' && 'code' in err && (err as { code?: number }).code === 11000;
+    if (!isDuplicateKeyError) {
+      throw err;
+    }
+    logger.debug('saveAutoJoinEntry: duplicate entry ignored (race)', {
+      component: 'Database',
+      entryId: _id,
+    });
+  }
 }
 
 export async function getAutoJoinEntry(
