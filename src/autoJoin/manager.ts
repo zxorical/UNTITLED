@@ -250,15 +250,10 @@ const PATTERNS = {
   CROSSPOST_REFERENCE: /https:\/\/discord\.com\/channels\/(\d+)\/(\d+)\/(\d+)/,
 } as const;
 
-// Only trust this single giveaway bot for detection. Previously this set
-// included several other bot IDs (welcome bots, stats/leveling bots, etc.)
-// whose messages — welcome pings, "Messages Sent" stats, ended-giveaway
-// announcements, minigame results — were being scored as giveaways purely
-// because they shared an ID with something that once posted a real
-// giveaway. Restricted per explicit instruction to the one bot actually
-// running giveaways here.
 const KNOWN_GIVEAWAY_BOT_IDS: ReadonlySet<string> = new Set([
-  '530082442967646230',
+  '294882584201003009', '739448630517039104', '515195524879237130',
+  '235148962103951360', '282859044593598464', '270904126974590976',
+  '508391840525975553', '530082442967646230',
 ]);
 
 const TRUSTED_ENTRY_CUSTOM_IDS: ReadonlySet<string> = new Set([
@@ -1167,18 +1162,6 @@ class DetectionEngine {
           stageCount++;
           reasons.push(...profileResult.reasons);
         }
-      }
-
-      // Bot-ID match alone (0.4) previously cleared CONFIDENCE_LOW (0.3) by
-      // itself — meaning ANY message at all from a known giveaway bot
-      // (welcome pings, "Messages Sent" stats, ended-giveaway
-      // announcements, minigame results) scored as a real giveaway with
-      // zero content evidence required. Require the button analysis or
-      // embed parsing stage to have found *something* before trusting
-      // bot-ID-match on its own to push confidence over the line.
-      if (botMatch && buttonResult.score === 0 && embedResult.score === 0) {
-        totalConfidence -= 0.4;
-        reasons.push('Bot-ID match rejected: no button or embed evidence found');
       }
     }
 
@@ -3011,12 +2994,8 @@ export class AutoJoinManager extends EventEmitter {
               throw new Error(`No response from Application after ${INTERACTION_RETRY_ATTEMPTS} attempts`);
             }
             if (attempt === 1) {
-              // Only regenerate the nonce on retry. The session_id was
-              // correctly fetched from the real gateway shard above —
-              // overwriting it with `${Date.now()}_${random}` here (as the
-              // previous version did) replaces a valid session ID with a
-              // fabricated one, which Discord will always reject.
               payload.nonce = `${Date.now()}${Math.random().toString(36).slice(2, 8)}`;
+              payload.session_id = `${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
             }
             continue;
           }
