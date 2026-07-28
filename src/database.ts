@@ -716,31 +716,38 @@ async function executeBulkWrite(ops: AnyBulkWriteOperation<StoredGiveaway>[], ke
         errors: errors.map(e => e.errmsg).slice(0, 5)
       });
       
-      // Process individual errors
+      // Process individual errors - FIXED: type guard for updateOne
       for (const error of errors) {
         if (error.errmsg && error.errmsg.includes('version')) {
           // Version conflict - try to recover
-          const filter = ops[error.index]?.updateOne?.filter;
-          if (filter) {
-            const key = cacheKey(filter.messageId, filter.channelId);
-            dirtyKeys.delete(key);
-            
-            // Reload the document to update cache
-            try {
-              const doc = await giveawaysCol.findOne({ 
-                messageId: filter.messageId, 
-                channelId: filter.channelId 
-              });
-              if (doc) {
-                const entry = cache.get(key);
-                if (entry) {
-                  entry.doc = doc;
-                  entry.version = doc.version || 1;
-                  entry.timestamp = Date.now();
+          const op = ops[error.index];
+          // Check if this is an updateOne operation
+          if (op && 'updateOne' in op) {
+            const filter = op.updateOne.filter;
+            // Type guard: ensure filter has messageId and channelId
+            if (filter && typeof filter === 'object' && 'messageId' in filter && 'channelId' in filter) {
+              const messageId = String(filter.messageId);
+              const channelId = String(filter.channelId);
+              const key = cacheKey(messageId, channelId);
+              dirtyKeys.delete(key);
+              
+              // Reload the document to update cache
+              try {
+                const doc = await giveawaysCol.findOne({ 
+                  messageId: messageId, 
+                  channelId: channelId 
+                });
+                if (doc) {
+                  const entry = cache.get(key);
+                  if (entry) {
+                    entry.doc = doc;
+                    entry.version = doc.version || 1;
+                    entry.timestamp = Date.now();
+                  }
                 }
+              } catch (reloadErr) {
+                // Ignore reload errors
               }
-            } catch (reloadErr) {
-              // Ignore reload errors
             }
           }
         }
@@ -756,6 +763,7 @@ async function executeBulkWrite(ops: AnyBulkWriteOperation<StoredGiveaway>[], ke
     
     // FIXED: Don't retry version conflicts - just log and continue
     for (const op of ops) {
+      // Check if this is an updateOne operation
       if (!('updateOne' in op)) continue;
       
       try {
@@ -768,8 +776,13 @@ async function executeBulkWrite(ops: AnyBulkWriteOperation<StoredGiveaway>[], ke
         // If update succeeded, remove from dirtyKeys
         if (result.modifiedCount > 0 || result.upsertedCount > 0) {
           const filter = op.updateOne.filter;
-          const key = cacheKey(filter.messageId, filter.channelId);
-          dirtyKeys.delete(key);
+          // Type guard: ensure filter has messageId and channelId
+          if (filter && typeof filter === 'object' && 'messageId' in filter && 'channelId' in filter) {
+            const messageId = String(filter.messageId);
+            const channelId = String(filter.channelId);
+            const key = cacheKey(messageId, channelId);
+            dirtyKeys.delete(key);
+          }
         }
       } catch (individualErr) {
         // Check if this is a version conflict
@@ -784,25 +797,30 @@ async function executeBulkWrite(ops: AnyBulkWriteOperation<StoredGiveaway>[], ke
           
           // Remove from dirtyKeys to prevent endless retry
           const filter = op.updateOne.filter;
-          const key = cacheKey(filter.messageId, filter.channelId);
-          dirtyKeys.delete(key);
-          
-          // Reload the document to update cache
-          try {
-            const doc = await giveawaysCol.findOne({ 
-              messageId: filter.messageId, 
-              channelId: filter.channelId 
-            });
-            if (doc) {
-              const entry = cache.get(key);
-              if (entry) {
-                entry.doc = doc;
-                entry.version = doc.version || 1;
-                entry.timestamp = Date.now();
+          // Type guard: ensure filter has messageId and channelId
+          if (filter && typeof filter === 'object' && 'messageId' in filter && 'channelId' in filter) {
+            const messageId = String(filter.messageId);
+            const channelId = String(filter.channelId);
+            const key = cacheKey(messageId, channelId);
+            dirtyKeys.delete(key);
+            
+            // Reload the document to update cache
+            try {
+              const doc = await giveawaysCol.findOne({ 
+                messageId: messageId, 
+                channelId: channelId 
+              });
+              if (doc) {
+                const entry = cache.get(key);
+                if (entry) {
+                  entry.doc = doc;
+                  entry.version = doc.version || 1;
+                  entry.timestamp = Date.now();
+                }
               }
+            } catch (reloadErr) {
+              // Ignore reload errors
             }
-          } catch (reloadErr) {
-            // Ignore reload errors
           }
         } else {
           // Other error - log it
@@ -816,7 +834,6 @@ async function executeBulkWrite(ops: AnyBulkWriteOperation<StoredGiveaway>[], ke
     }
   }
 }
-
 function chunkArray<T>(array: T[], size: number): T[][] {
   const chunks: T[][] = [];
   for (let i = 0; i < array.length; i += size) {
