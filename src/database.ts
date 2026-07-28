@@ -12,6 +12,8 @@
  * 7. Consistency checking
  * 8. Reduced log spam
  * 9. ALL autoJoin functions included
+ * 10. FIXED: Removed $inc on version field (causes object type errors)
+ * 11. FIXED: Version field now uses $set with numeric values only
  */
 
 import { MongoClient, Db, Collection, AnyBulkWriteOperation } from 'mongodb';
@@ -1274,7 +1276,7 @@ export async function getLicenseStats(): Promise<{
 }
 
 // ============================================================================
-// Public API - Premium User Tracking
+// Public API - Premium User Tracking (FIXED: removed $inc on version)
 // ============================================================================
 
 export async function setPremiumUser(
@@ -1321,14 +1323,18 @@ export async function removePremiumUser(
   
   await ensureConnected();
 
+  // FIXED: Use $set for version instead of $inc
+  const existing = await premiumUsersCol.findOne({ userId, guildId });
+  const newVersion = (existing?.version && typeof existing.version === 'number') ? existing.version + 1 : 1;
+
   await premiumUsersCol.updateOne(
     { userId, guildId },
     {
       $set: {
         isPremium: false,
         lastChecked: Date.now(),
+        version: newVersion,
       },
-      $inc: { version: 1 },
     }
   );
 
@@ -1408,7 +1414,7 @@ export async function getPremiumStats(guildId: string): Promise<{
 }
 
 // ============================================================================
-// Public API - Auto Joiner Token & Webhook Management
+// Public API - Auto Joiner Token & Webhook Management (FIXED)
 // ============================================================================
 
 export async function updateUserToken(
@@ -1423,6 +1429,10 @@ export async function updateUserToken(
   
   await ensureConnected();
 
+  // FIXED: Use $set for version instead of $inc
+  const existing = await premiumUsersCol.findOne({ userId, guildId });
+  const newVersion = (existing?.version && typeof existing.version === 'number') ? existing.version + 1 : 1;
+
   await premiumUsersCol.updateOne(
     { userId, guildId },
     {
@@ -1435,8 +1445,8 @@ export async function updateUserToken(
         tokenWins: 0,
         tokenActive: true,
         lastChecked: Date.now(),
+        version: newVersion,
       },
-      $inc: { version: 1 },
     },
     { upsert: true }
   );
@@ -1455,6 +1465,10 @@ export async function updateUserWebhook(
   
   await ensureConnected();
 
+  // FIXED: Use $set for version instead of $inc
+  const existing = await premiumUsersCol.findOne({ userId, guildId });
+  const newVersion = (existing?.version && typeof existing.version === 'number') ? existing.version + 1 : 1;
+
   await premiumUsersCol.updateOne(
     { userId, guildId },
     {
@@ -1463,8 +1477,8 @@ export async function updateUserWebhook(
         webhookAddedAt: Date.now(),
         webhookLastUsed: null,
         lastChecked: Date.now(),
+        version: newVersion,
       },
-      $inc: { version: 1 },
     },
     { upsert: true }
   );
@@ -1506,9 +1520,11 @@ export async function incrementTokenEntries(
   if (!userId || !guildId) return;
   
   await ensureConnected();
+  
+  // FIXED: Removed $inc on version
   await premiumUsersCol.updateOne(
     { userId, guildId },
-    { $inc: { tokenEntries: 1, version: 1 } }
+    { $inc: { tokenEntries: 1 } }
   );
 }
 
@@ -1519,9 +1535,11 @@ export async function incrementTokenWins(
   if (!userId || !guildId) return;
   
   await ensureConnected();
+  
+  // FIXED: Removed $inc on version
   await premiumUsersCol.updateOne(
     { userId, guildId },
-    { $inc: { tokenWins: 1, version: 1 } }
+    { $inc: { tokenWins: 1 } }
   );
 }
 
@@ -1532,11 +1550,12 @@ export async function updateTokenLastUsed(
   if (!userId || !guildId) return;
   
   await ensureConnected();
+  
+  // FIXED: Removed $inc on version
   await premiumUsersCol.updateOne(
     { userId, guildId },
     {
       $set: { tokenLastUsed: Date.now() },
-      $inc: { version: 1 },
     }
   );
 }
@@ -1549,11 +1568,12 @@ export async function setTokenActive(
   if (!userId || !guildId) return;
   
   await ensureConnected();
+  
+  // FIXED: Removed $inc on version
   await premiumUsersCol.updateOne(
     { userId, guildId },
     {
       $set: { tokenActive: active },
-      $inc: { version: 1 },
     }
   );
 }
@@ -1868,7 +1888,7 @@ export async function loadQueueState(): Promise<any[]> {
 }
 
 // ============================================================================
-// Public API - Booster Premium Tracking
+// Public API - Booster Premium Tracking (FIXED)
 // ============================================================================
 
 export async function setBoosterPremium(
@@ -1882,6 +1902,10 @@ export async function setBoosterPremium(
   
   await ensureConnected();
 
+  // FIXED: Use $set for version instead of $inc
+  const existing = await boosterPremiumCol.findOne({ userId, guildId });
+  const newVersion = (existing?.version && typeof existing.version === 'number') ? existing.version + 1 : 1;
+
   await boosterPremiumCol.updateOne(
     { userId, guildId },
     {
@@ -1892,8 +1916,8 @@ export async function setBoosterPremium(
         premiumAssigned: isBooster,
         assignedAt: isBooster ? Date.now() : 0,
         lastChecked: Date.now(),
+        version: newVersion,
       },
-      $inc: { version: 1 },
     },
     { upsert: true }
   );
@@ -1927,6 +1951,11 @@ export async function removeBoosterPremium(
   if (!userId || !guildId) return;
   
   await ensureConnected();
+
+  // FIXED: Use $set for version instead of $inc
+  const existing = await boosterPremiumCol.findOne({ userId, guildId });
+  const newVersion = (existing?.version && typeof existing.version === 'number') ? existing.version + 1 : 1;
+
   await boosterPremiumCol.updateOne(
     { userId, guildId },
     {
@@ -1934,8 +1963,8 @@ export async function removeBoosterPremium(
         isBooster: false,
         premiumAssigned: false,
         lastChecked: Date.now(),
+        version: newVersion,
       },
-      $inc: { version: 1 },
     }
   );
 }
