@@ -1327,8 +1327,8 @@ export async function removePremiumUser(
       $set: {
         isPremium: false,
         lastChecked: Date.now(),
-        version: { $inc: 1 } as any,
-      }
+      },
+      $inc: { version: 1 },
     }
   );
 
@@ -1435,8 +1435,8 @@ export async function updateUserToken(
         tokenWins: 0,
         tokenActive: true,
         lastChecked: Date.now(),
-        version: { $inc: 1 } as any,
-      }
+      },
+      $inc: { version: 1 },
     },
     { upsert: true }
   );
@@ -1463,8 +1463,8 @@ export async function updateUserWebhook(
         webhookAddedAt: Date.now(),
         webhookLastUsed: null,
         lastChecked: Date.now(),
-        version: { $inc: 1 } as any,
-      }
+      },
+      $inc: { version: 1 },
     },
     { upsert: true }
   );
@@ -1508,7 +1508,7 @@ export async function incrementTokenEntries(
   await ensureConnected();
   await premiumUsersCol.updateOne(
     { userId, guildId },
-    { $inc: { tokenEntries: 1, version: 1 } as any }
+    { $inc: { tokenEntries: 1, version: 1 } }
   );
 }
 
@@ -1521,7 +1521,7 @@ export async function incrementTokenWins(
   await ensureConnected();
   await premiumUsersCol.updateOne(
     { userId, guildId },
-    { $inc: { tokenWins: 1, version: 1 } as any }
+    { $inc: { tokenWins: 1, version: 1 } }
   );
 }
 
@@ -1534,7 +1534,10 @@ export async function updateTokenLastUsed(
   await ensureConnected();
   await premiumUsersCol.updateOne(
     { userId, guildId },
-    { $set: { tokenLastUsed: Date.now(), version: { $inc: 1 } as any } }
+    {
+      $set: { tokenLastUsed: Date.now() },
+      $inc: { version: 1 },
+    }
   );
 }
 
@@ -1548,7 +1551,10 @@ export async function setTokenActive(
   await ensureConnected();
   await premiumUsersCol.updateOne(
     { userId, guildId },
-    { $set: { tokenActive: active, version: { $inc: 1 } as any } }
+    {
+      $set: { tokenActive: active },
+      $inc: { version: 1 },
+    }
   );
 }
 
@@ -1886,8 +1892,8 @@ export async function setBoosterPremium(
         premiumAssigned: isBooster,
         assignedAt: isBooster ? Date.now() : 0,
         lastChecked: Date.now(),
-        version: { $inc: 1 } as any,
-      }
+      },
+      $inc: { version: 1 },
     },
     { upsert: true }
   );
@@ -1928,8 +1934,8 @@ export async function removeBoosterPremium(
         isBooster: false,
         premiumAssigned: false,
         lastChecked: Date.now(),
-        version: { $inc: 1 } as any,
-      }
+      },
+      $inc: { version: 1 },
     }
   );
 }
