@@ -23,6 +23,11 @@
  * 33. Per-guild and per-account monitoring stats
  * 34. Health check that verifies Discord connection
  * 35. Worker stall detection and auto-recovery
+ * 
+ * CRITICAL FIXES (v2.1):
+ * 36. ENDED giveaway filtering before detection pipeline
+ * 37. Disabled button detection to skip ended giveaways
+ * 38. Skip retries when buttonCustomId is missing
  */
 
 import { Client, Message, TextChannel, ClientOptions, Options, NewsChannel, PartialMessage } from 'discord.js-selfbot-v13';
@@ -248,6 +253,8 @@ const PATTERNS = {
   DRAFT_BUTTON: /\b(start|edit|cancel|preview|setup)\b/i,
   GIVEAWAY_KEYWORD: /\bgiveaway\b|\braffle\b|\bsweepstakes\b|\bwin\b|\bprize\b/i,
   CROSSPOST_REFERENCE: /https:\/\/discord\.com\/channels\/(\d+)\/(\d+)\/(\d+)/,
+  // FIX 36: Pattern to detect ended giveaways before processing
+  ENDED_GIVEAWAY: /\b(ENDED|Winners|Congratulations|winner is|has won|giveaway (has )?ended)\b/i,
 } as const;
 
 // Only trust this single giveaway bot for detection. Previously this set
@@ -1087,7 +1094,7 @@ class WatchlistManager {
 }
 
 // ---------------------------------------------------------------------------
-// Multi-Stage Detection Engine
+// Multi-Stage Detection Engine (with ENDED giveaway filter)
 // ---------------------------------------------------------------------------
 
 class DetectionEngine {
@@ -1121,7 +1128,51 @@ class DetectionEngine {
     }
   }
 
+  // FIX 36 & 37: Added ENDED giveaway and disabled button detection
   async detect(message: Message, correlationId: string): Promise<DetectionResult> {
+    // ===== CRITICAL FIX #36: Check for ended giveaways FIRST =====
+    const title = message.embeds?.[0]?.title || '';
+    const description = message.embeds?.[0]?.description || '';
+    const content = message.content || '';
+    const allText = `${title} ${description} ${content}`;
+    
+    if (PATTERNS.ENDED_GIVEAWAY.test(allText)) {
+      return {
+        isGiveaway: false,
+        confidence: 0,
+        reasons: ['CRITICAL: Giveaway appears to be ended (ENDED/WINNERS text detected)'],
+        button: undefined,
+        prize: undefined,
+        profile: undefined,
+      };
+    }
+
+    // FIX 37: Check if all buttons are disabled (ended giveaways disable the enter button)
+    const components = (message as any).components;
+    if (components?.length && message.author?.bot) {
+      let hasEnabledButton = false;
+      for (const row of components) {
+        for (const comp of (row?.components || [])) {
+          if (comp.type === 2 && comp.style !== 5 && !comp.disabled) {
+            hasEnabledButton = true;
+            break;
+          }
+        }
+        if (hasEnabledButton) break;
+      }
+      if (!hasEnabledButton) {
+        return {
+          isGiveaway: false,
+          confidence: 0,
+          reasons: ['CRITICAL: All buttons disabled - giveaway likely ended'],
+          button: undefined,
+          prize: undefined,
+          profile: undefined,
+        };
+      }
+    }
+    // ===== END CRITICAL FIXES =====
+
     const reasons: string[] = [];
     let totalConfidence = 0;
     let stageCount = 0;
@@ -1561,6 +1612,8 @@ export class AutoJoinManager extends EventEmitter {
         watchlists: true,
         batchDb: true,
         healthChecks: true,
+        endedGiveawayFilter: true,
+        skipRetryOnNoButton: true,
       },
       memory: this.getMemoryUsage(),
     });
@@ -2464,7 +2517,7 @@ export class AutoJoinManager extends EventEmitter {
     this.correlationTracker.startStage(correlationId, 'processing');
 
     try {
-      // Multi-stage detection
+      // Multi-stage detection (includes ENDED giveaway filter)
       const detected = await this.detectionEngine.detect(message, correlationId);
       this.correlationTracker.endStage(correlationId, 'detection', {
         isGiveaway: detected.isGiveaway,
@@ -2658,7 +2711,7 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   // -------------------------------------------------------------------------
-  // Enter Giveaway with structured tracing
+  // Enter Giveaway with structured tracing (FIX 38: Skip retries when no button)
   // -------------------------------------------------------------------------
 
   private async enterGiveaway(entryId: string, session: UserSession): Promise<void> {
@@ -2675,6 +2728,22 @@ export class AutoJoinManager extends EventEmitter {
       this.correlationTracker.createTrace(session.userId, messageId);
 
     this.correlationTracker.startStage(correlationId, 'entry_attempt');
+
+    // FIX 38: If no buttonCustomId, skip immediately instead of retrying
+    if (!entry.buttonCustomId) {
+      this.asyncLogger.warn('AutoJoin: No buttonCustomId, skipping entry (likely ended giveaway)', {
+        correlationId,
+        userId: session.userId,
+        prize: truncate(entry.prize, 60),
+        worker: this.workerId,
+      });
+      await updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'skipped', {
+        lastError: 'No entry button available - giveaway likely ended',
+      });
+      this.metrics.dbQueries++;
+      this.correlationTracker.completeTrace(correlationId, 'completed');
+      return;
+    }
 
     await updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'attempting', {});
     this.metrics.dbQueries++;
