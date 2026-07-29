@@ -23,6 +23,7 @@
  * FIXED: No retries for no-button messages
  * FIXED: Suppressed token-unavailable flood from library internals
  * FIXED: Wait for gateway session ID before interaction
+ * FIXED: TypeScript error - removed GuildChannelManager (doesn't exist in discord.js-selfbot-v13)
  */
 
 import { Client, Message, TextChannel, ClientOptions, Options, NewsChannel, PartialMessage } from 'discord.js-selfbot-v13';
@@ -1290,6 +1291,7 @@ export class AutoJoinManager extends EventEmitter {
       }
 
       // 🔥 OPTIMIZED: Minimal client options - NO guild caching
+      // FIXED: Removed GuildChannelManager (doesn't exist in discord.js-selfbot-v13)
       const clientOptions: ClientOptions = {
         messageCacheLifetime: 30,
         messageSweepInterval: 60,
@@ -1301,7 +1303,6 @@ export class AutoJoinManager extends EventEmitter {
         makeCache: Options.cacheWithLimits({
           // 🔥 CRITICAL: Limit to 1 guild per session - saves 2.8GB
           GuildManager: { maxSize: MAX_GUILDS_CACHED },
-          GuildChannelManager: { maxSize: MAX_CHANNELS_CACHED },
           ChannelManager: { maxSize: MAX_CHANNELS_CACHED },
           PresenceManager: 0,
           ReactionManager: 0,
