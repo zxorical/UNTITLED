@@ -7,6 +7,10 @@
  * FIXED: Token now stored in session.decryptedToken for reliable HTTP requests
  * FIXED: Circuit breaker sensitivity reduced
  * FIXED: Failed tokens are marked inactive and removed from autojoin rotation
+ * FIXED: Messages without buttons are NEVER considered giveaways
+ * FIXED: No retries for no-button messages
+ * FIXED: Suppressed token-unavailable flood from library internals
+ * FIXED: Wait for gateway session ID before interaction
  */
 
 import { Client, Message, TextChannel, ClientOptions, Options, NewsChannel, PartialMessage } from 'discord.js-selfbot-v13';
@@ -49,6 +53,14 @@ import {
 } from '../database.js';
 import { decryptToken } from '../premium/tokenManager.js';
 import { CONFIG } from '../config.js';
+
+// SUPPRESS the token-unavailable flood from discord.js-selfbot-v13 internals
+process.on('unhandledRejection', (reason: any) => {
+  if (reason?.code === 500 && reason?.message?.includes('token was unavailable')) {
+    return;
+  }
+  logger.error('[Process] Unhandled rejection', { reason: formatError(reason) });
+});
 
 // ---------------------------------------------------------------------------
 // Types
@@ -134,7 +146,7 @@ interface UserSession {
   destroyed: boolean;
   lastHealthCheck: number;
   stallCount: number;
-  decryptedToken: string; // FIXED: Store decrypted token for HTTP requests
+  decryptedToken: string;
 }
 
 interface SessionStats {
@@ -188,18 +200,13 @@ interface AccountStats {
 }
 
 // ---------------------------------------------------------------------------
-// Constants - FIXED with old working detection patterns
+// Constants
 // ---------------------------------------------------------------------------
 
-// ===== OLD WORKING DETECTION PATTERNS =====
-
-/**
- * Known giveaway bot Snowflake IDs.
- */
 const KNOWN_GIVEAWAY_BOT_IDS: ReadonlySet<string> = new Set([
   '530082442967646230',
-  '294882584201003009', // GiveawayBot
-  '739448630517039104', // GiveawayBoat
+  '294882584201003009',
+  '739448630517039104',
   '515195524879237130',
   '235148962103951360',
   '282859044593598464',
@@ -220,10 +227,6 @@ const TRUSTED_ENTRY_CUSTOM_IDS: ReadonlySet<string> = new Set([
   'participants',
 ]);
 
-/**
- * If ANY of these patterns match the message's plain-text content, the entire
- * message is rejected — even from known giveaway bots.
- */
 const BLOCKED_MESSAGE_PATTERNS: ReadonlyArray<RegExp> = [
   /already\s+entered\s+this\s+giveaway/i,
   /you(?:'ve|\s+have)\s+already\s+entered/i,
@@ -232,9 +235,6 @@ const BLOCKED_MESSAGE_PATTERNS: ReadonlyArray<RegExp> = [
   /leave\s+giveaway/i,
 ];
 
-/**
- * Button labels that must NEVER be clicked.
- */
 const BLOCKED_BUTTON_PATTERNS: ReadonlyArray<RegExp> = [
   /\bleave\b/i,
   /\bquit\b/i,
@@ -247,9 +247,6 @@ const BLOCKED_BUTTON_PATTERNS: ReadonlyArray<RegExp> = [
   /end\s+giveaway/i,
 ];
 
-/**
- * Button labels that identify a giveaway ENTRY button.
- */
 const ENTRY_BUTTON_PATTERNS: ReadonlyArray<RegExp> = [
   /\benter\b/i,
   /\bjoin\b/i,
@@ -265,8 +262,6 @@ const ENTRY_BUTTON_PATTERNS: ReadonlyArray<RegExp> = [
   /^\d[\d,]*$/,
 ];
 
-// ===== WIN DETECTION PATTERNS =====
-
 const WIN_PATTERNS: ReadonlyArray<RegExp> = [
   /congratulations?[^.!?\n]{0,60}(?:you|won)/i,
   /you(?:'ve|\s+have)\s+won/i,
@@ -279,8 +274,6 @@ const WIN_PATTERNS: ReadonlyArray<RegExp> = [
   /🎉\s*congrat/i,
   /🏆\s*(?:congrat|winner|you)/i,
 ];
-
-// ===== OTHER CONSTANTS =====
 
 const PATTERNS = {
   TIMESTAMP: /<t:(\d{10,13})(?::[a-zA-Z])?>/,
@@ -325,7 +318,6 @@ const MAX_SESSION_START_PROMISES = 50;
 const HTTP_MAX_SOCKETS = 30;
 const HTTP_MAX_FREE_SOCKETS = 15;
 
-// FIXED: Increased from 10 to 20 to prevent premature circuit breaker trips
 const CIRCUIT_BREAKER_THRESHOLD = 20;
 const CIRCUIT_BREAKER_TIMEOUT_MS = 30000;
 const CIRCUIT_BREAKER_HALF_OPEN_ATTEMPTS = 3;
@@ -1006,15 +998,12 @@ export class AutoJoinManager extends EventEmitter {
       }),
     });
 
-    // FIXED: Reset circuit breaker on startup
     this.apiCircuitBreaker.reset();
 
-    // Initialize systems
     this.initialize().catch(error => {
       this.asyncLogger.error('Failed to initialize AutoJoinManager', { error: formatError(error) });
     });
 
-    // Start intervals
     this.startSessionRefresher();
     this.startCleanupInterval();
     this.startMemoryCheck();
@@ -1027,7 +1016,7 @@ export class AutoJoinManager extends EventEmitter {
     this.startBatchDbWriter();
     this.startArchiveInterval();
 
-    this.asyncLogger.info('🚀 AutoJoinManager initialized (FIXED detection + token handling)', {
+    this.asyncLogger.info('🚀 AutoJoinManager initialized', {
       worker: this.workerId,
       memory: this.getMemoryUsage(),
     });
@@ -1201,7 +1190,6 @@ export class AutoJoinManager extends EventEmitter {
     }
   }
 
-  // FIXED: Token failure handling - marks bad tokens as inactive
   private async _startSessionInternal(userId: string, guildId: string): Promise<boolean> {
     const sessionKey = this.makeSessionKey(userId);
 
@@ -1214,10 +1202,7 @@ export class AutoJoinManager extends EventEmitter {
         decryptedToken = await this.tokenManager.getDecryptedToken(userId, guildId, user.token);
       } catch (error) {
         this.asyncLogger.error('❌ Failed to decrypt token - marking as inactive', {
-          userId,
-          guildId,
-          error: formatError(error),
-          worker: this.workerId,
+          userId, guildId, error: formatError(error), worker: this.workerId,
         });
         await setTokenActive(userId, guildId, false);
         return false;
@@ -1243,59 +1228,35 @@ export class AutoJoinManager extends EventEmitter {
       const client = new Client(clientOptions);
       client.setMaxListeners(50);
       
-      // FIXED: Try to login with proper error handling
       try {
         await this.loginWithTimeout(client, decryptedToken);
         await this.waitForReady(client);
       } catch (loginError) {
         const errorMsg = formatError(loginError);
         
-        // Check if token is invalid/expired/blocked/rate-limited
         const isTokenBad = 
           errorMsg.includes('Invalid token') ||
           errorMsg.includes('401') ||
           errorMsg.includes('Unauthorized') ||
           errorMsg.includes('incorrect login') ||
           errorMsg.includes('incorrect password') ||
-          errorMsg.includes('token') && errorMsg.includes('invalid') ||
           errorMsg.includes('Login timeout') ||
           errorMsg.includes('Ready timeout');
         
-        if (isTokenBad) {
-          this.asyncLogger.error('❌ Token failed to login - marking as inactive permanently', {
-            userId,
-            guildId,
-            error: errorMsg,
-            worker: this.workerId,
-          });
-        } else {
-          this.asyncLogger.error('❌ Token login failed - marking inactive temporarily', {
-            userId,
-            guildId,
-            error: errorMsg,
-            worker: this.workerId,
-          });
-        }
+        this.asyncLogger.error(isTokenBad ? '❌ Token failed - marking inactive permanently' : '❌ Token login failed - marking inactive', {
+          userId, guildId, error: errorMsg, worker: this.workerId,
+        });
         
-        // Mark token as inactive in database so it won't be retried
         await setTokenActive(userId, guildId, false).catch(() => {});
-        
-        // Clear from cache
         this.tokenManager.clearCache(userId, guildId);
-        
-        // Destroy the failed client
         try { await client.destroy(); } catch {}
-        
-        // Emit event so other systems know
         this.emit('tokenFailed', { userId, guildId, error: errorMsg });
-        
         return false;
       }
       
       this.sessionIdCounter++;
       const sessionId = `${userId}-${Date.now()}-${this.sessionIdCounter}`;
       
-      // FIXED: Store decryptedToken in session
       const session: UserSession = {
         client,
         userId,
@@ -1312,7 +1273,7 @@ export class AutoJoinManager extends EventEmitter {
         destroyed: false,
         lastHealthCheck: Date.now(),
         stallCount: 0,
-        decryptedToken, // FIXED: Store the decrypted token
+        decryptedToken,
       };
 
       this.registerEvents(session);
@@ -1332,13 +1293,9 @@ export class AutoJoinManager extends EventEmitter {
       await updateTokenLastUsed(userId, guildId);
 
       this.asyncLogger.info('✅ AutoJoin session started', {
-        userId,
-        label: session.label,
-        username: client.user?.username,
-        guilds: client.guilds.cache.size,
-        worker: this.workerId,
-        sessionId: session.sessionId,
-        memory: this.getMemoryUsage(),
+        userId, label: session.label, username: client.user?.username,
+        guilds: client.guilds.cache.size, worker: this.workerId,
+        sessionId: session.sessionId, memory: this.getMemoryUsage(),
       });
 
       this.emit('sessionStarted', { userId, guildId });
@@ -1346,10 +1303,7 @@ export class AutoJoinManager extends EventEmitter {
 
     } catch (error) {
       this.asyncLogger.error('Failed to start AutoJoin session', {
-        userId,
-        guildId,
-        error: formatError(error),
-        worker: this.workerId,
+        userId, guildId, error: formatError(error), worker: this.workerId,
       });
       await setTokenActive(userId, guildId, false).catch(() => {});
       this.tokenManager.clearCache(userId, guildId);
@@ -1423,9 +1377,7 @@ export class AutoJoinManager extends EventEmitter {
             .then(success => {
               if (success) {
                 const newSession = this.sessionsByUserId.get(session.userId);
-                if (newSession) {
-                  newSession.reconnectAttempts = 0;
-                }
+                if (newSession) newSession.reconnectAttempts = 0;
               }
             })
             .catch(() => {});
@@ -1466,9 +1418,7 @@ export class AutoJoinManager extends EventEmitter {
       }
       
       this.asyncLogger.info(`✅ Restored ${restored} AutoJoin sessions (${failed} failed, ${skipped} skipped)`, {
-        worker: this.workerId,
-        total: this.sessions.size,
-        memory: this.getMemoryUsage(),
+        worker: this.workerId, total: this.sessions.size, memory: this.getMemoryUsage(),
       });
     } catch (error) {
       this.asyncLogger.error('Failed to restore AutoJoin sessions', { error: formatError(error) });
@@ -1497,13 +1447,8 @@ export class AutoJoinManager extends EventEmitter {
       this.sessionsByUserId.delete(userId);
       this.tokenManager.clearCache(userId, guildId);
       
-      // Don't mark inactive here - let the caller decide
-      
       this.asyncLogger.info('⏹️ AutoJoin session stopped', { 
-        userId, 
-        guildId,
-        sessionId: session.sessionId,
-        memory: this.getMemoryUsage(),
+        userId, guildId, sessionId: session.sessionId, memory: this.getMemoryUsage(),
       });
       
       this.emit('sessionStopped', { userId, guildId });
@@ -1571,7 +1516,6 @@ export class AutoJoinManager extends EventEmitter {
     
     try {
       const allPremiumUsers = await this.getAllPremiumUsersAcrossAllGuilds();
-      // FIXED: Only retry tokens that are still marked as active (not explicitly failed)
       const failedUsers = allPremiumUsers.filter(u => u.token && u.tokenActive === false);
       
       for (const user of failedUsers) {
@@ -1645,8 +1589,7 @@ export class AutoJoinManager extends EventEmitter {
       guildStats: Array.from(this.guildStats.values()),
       accountStats: Array.from(this.accountStats.values()),
       reconnectCounts: Array.from(this.reconnectCount.entries()).map(([userId, count]) => ({
-        userId,
-        count,
+        userId, count,
       })),
       batchBuffers: {
         joinOutcomes: this.joinOutcomeBuffer.length,
@@ -1674,9 +1617,7 @@ export class AutoJoinManager extends EventEmitter {
     this.isShuttingDown = true;
 
     this.asyncLogger.info('🛑 Shutting down AutoJoinManager...', {
-      worker: this.workerId,
-      sessions: this.sessions.size,
-      queueSize: this.joinQueue.getTotalSize(),
+      worker: this.workerId, sessions: this.sessions.size, queueSize: this.joinQueue.getTotalSize(),
     });
 
     [
@@ -1691,9 +1632,7 @@ export class AutoJoinManager extends EventEmitter {
     await this.joinQueue.persist();
 
     if (this.joinOutcomeBuffer.length > 0) {
-      try {
-        await batchSaveJoinOutcomes(this.joinOutcomeBuffer);
-      } catch {}
+      try { await batchSaveJoinOutcomes(this.joinOutcomeBuffer); } catch {}
       this.joinOutcomeBuffer = [];
     }
 
@@ -1742,13 +1681,10 @@ export class AutoJoinManager extends EventEmitter {
     
     this.asyncLogger.shutdown();
     
-    if (global.gc) {
-      global.gc();
-    }
+    if (global.gc) global.gc();
     
     this.asyncLogger.info('✅ AutoJoin shutdown complete', { 
-      worker: this.workerId,
-      memory: this.getMemoryUsage(),
+      worker: this.workerId, memory: this.getMemoryUsage(),
     });
   }
 
@@ -1811,7 +1747,7 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   // -------------------------------------------------------------------------
-  // FIXED: Message Handling with old working binary detection
+  // Message Handling - NO BUTTON = NOT A GIVEAWAY
   // -------------------------------------------------------------------------
 
   private async handleMessage(message: Message, session: UserSession): Promise<void> {
@@ -1839,10 +1775,10 @@ export class AutoJoinManager extends EventEmitter {
     this.processingCache.set(entryId, Date.now());
 
     try {
-      // FIXED: Use old working binary detection
       const detected = await this.detectGiveawaySimple(message);
       
-      if (!detected) {
+      // NO BUTTON = NOT A GIVEAWAY - skip immediately, no retries
+      if (!detected || !detected.button) {
         this.processingCache.delete(entryId);
         return;
       }
@@ -1862,7 +1798,7 @@ export class AutoJoinManager extends EventEmitter {
         guildName: message.guild!.name,
         channelName: (message.channel as { name?: string }).name ?? 'unknown',
         prize: detected.prize,
-        buttonCustomId: detected.button?.customId,
+        buttonCustomId: detected.button.customId,
         detectedAt: Date.now(),
         endsAt: this.extractEndTimestamp(message),
         status: 'pending',
@@ -1870,7 +1806,7 @@ export class AutoJoinManager extends EventEmitter {
         expiresAt: Date.now() + ENTRY_TTL_MS,
         correlationId,
         detectionConfidence: 1.0,
-        detectionReasons: ['binary_detection'],
+        detectionReasons: ['binary_detection_with_button'],
       };
 
       await saveAutoJoinEntry(entryData as Omit<AutoJoinEntry, '_id'>);
@@ -1880,6 +1816,7 @@ export class AutoJoinManager extends EventEmitter {
         correlationId,
         userId: session.userId,
         prize: truncate(entryData.prize, 60),
+        button: detected.button.label || detected.button.customId,
         guild: entryData.guildName,
         worker: this.workerId,
       });
@@ -1898,33 +1835,44 @@ export class AutoJoinManager extends EventEmitter {
     }
   }
 
-  // ===== FIXED: Old working binary detection =====
+  // ===== BINARY DETECTION - BUTTON REQUIRED =====
 
   private async detectGiveawaySimple(message: Message): Promise<{
     button?: GiveawayButton;
     prize: string;
   } | null> {
-    // 1. Check blocked content first
+    // Skip messages older than 30 seconds
+    if (Date.now() - message.createdTimestamp > 30000) {
+      return null;
+    }
+
+    // Check blocked content first
     const rawContent = message.content ?? '';
     if (BLOCKED_MESSAGE_PATTERNS.some(re => re.test(rawContent))) {
       return null;
     }
 
-    // 2. Check for a signal - known bot OR keyword
+    // Check for a signal - known bot OR keyword
     const isKnownBot = message.author?.bot && 
                        message.author.id && 
                        KNOWN_GIVEAWAY_BOT_IDS.has(message.author.id);
     const hasKeyword = this.messageHasKeyword(message);
     
+    // Must have at least one signal
     if (!isKnownBot && !hasKeyword) return null;
+    
+    // Known bot without keyword AND without embeds = probably not a giveaway
+    if (isKnownBot && !hasKeyword && !message.embeds?.length) return null;
 
-    // 3. Try to find button immediately
+    // Try to find button immediately
     let button = this.extractEntryButton(message);
     if (button) {
       return { button, prize: this.extractPrize(message) };
     }
 
-    // 4. Retry with delay for components that arrive late
+    // Only retry component fetch for known bots with embeds
+    if (!isKnownBot || !message.embeds?.length) return null;
+
     for (let i = 0; i < COMPONENT_RETRY_ATTEMPTS; i++) {
       await delay(COMPONENT_RETRY_DELAY_MS);
       try {
@@ -1938,6 +1886,7 @@ export class AutoJoinManager extends EventEmitter {
       }
     }
 
+    // No button found after all retries = not a valid giveaway
     return null;
   }
 
@@ -1976,15 +1925,12 @@ export class AutoJoinManager extends EventEmitter {
 
         const label = ((c['label'] as string | undefined) ?? '').trim();
 
-        // Skip blocked buttons
         if (BLOCKED_BUTTON_PATTERNS.some(re => re.test(label))) continue;
 
-        // Trusted customIds always pass
         if (TRUSTED_ENTRY_CUSTOM_IDS.has(customId)) {
           return { customId, label: label || customId, disabled: false };
         }
 
-        // Entry button patterns
         if (ENTRY_BUTTON_PATTERNS.some(re => re.test(label))) {
           return { customId, label: label || 'Enter', disabled: false };
         }
@@ -2024,10 +1970,7 @@ export class AutoJoinManager extends EventEmitter {
       await updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'queued', {});
 
       this.processQueue(session.userId, entry.guildId).catch(error => {
-        this.asyncLogger.error('Queue processing error', {
-          correlationId,
-          error: formatError(error),
-        });
+        this.asyncLogger.error('Queue processing error', { correlationId, error: formatError(error) });
       });
     } else {
       await this.enterGiveaway(entryId, session);
@@ -2061,7 +2004,7 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   // -------------------------------------------------------------------------
-  // Enter Giveaway
+  // Enter Giveaway - NO RETRY FOR NO-BUTTON ERRORS
   // -------------------------------------------------------------------------
 
   private async enterGiveaway(entryId: string, session: UserSession): Promise<void> {
@@ -2137,7 +2080,6 @@ export class AutoJoinManager extends EventEmitter {
         this.updateGuildStats(entry.guildId, entry.guildName, 'entered');
         this.updateAccountStats(session.userId, 'entered');
 
-        // FIXED: Reset circuit breaker on success
         this.apiCircuitBreaker.reset();
 
         this.asyncLogger.info('✅ AutoJoin: Entered giveaway', {
@@ -2155,7 +2097,15 @@ export class AutoJoinManager extends EventEmitter {
       } catch (error) {
         const errorMsg = formatError(error);
         
-        // FIXED: Handle circuit breaker open
+        // NO BUTTON = NOT A GIVEAWAY - skip immediately, NO RETRIES
+        if (errorMsg.includes('No buttonCustomId set')) {
+          await updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'skipped', {
+            lastError: 'No button found - not a valid giveaway entry',
+          });
+          this.metrics.dbQueries++;
+          return;
+        }
+        
         if (errorMsg.includes('Circuit breaker is open')) {
           await delay(30000);
           this.apiCircuitBreaker.reset();
@@ -2179,16 +2129,11 @@ export class AutoJoinManager extends EventEmitter {
         this.metrics.dbQueries++;
         
         this.asyncLogger.warn(`AutoJoin: Attempt ${attemptNum}/${maxAttempts} failed`, {
-          correlationId,
-          userId: session.userId,
-          entryId,
-          error: errorMsg,
-          worker: this.workerId,
+          correlationId, userId: session.userId, entryId, error: errorMsg, worker: this.workerId,
         });
       }
     }
 
-    // All retries exhausted
     const queueItem: QueueItem = {
       entryId,
       userId: session.userId,
@@ -2214,11 +2159,8 @@ export class AutoJoinManager extends EventEmitter {
     this.metrics.totalEntriesFailed++;
 
     this.asyncLogger.error('❌ AutoJoin: All retries exhausted - moved to dead letter', {
-      correlationId,
-      userId: session.userId,
-      prize: truncate(entry.prize, 60),
-      attempts: entry.attempts,
-      worker: this.workerId,
+      correlationId, userId: session.userId, prize: truncate(entry.prize, 60),
+      attempts: entry.attempts, worker: this.workerId,
     });
 
     this.emit('giveawayFailed', { entry, userId: session.userId, correlationId });
@@ -2291,7 +2233,6 @@ export class AutoJoinManager extends EventEmitter {
     await this.postInteraction(message, button, session);
   }
 
-  // FIXED: Use session.decryptedToken instead of (message.client as any).token
   private async postInteraction(message: Message, button: GiveawayButton, session: UserSession): Promise<void> {
     if (this.apiCircuitBreaker.isOpen()) {
       throw new Error(`Circuit breaker is open (${this.apiCircuitBreaker.getState()})`);
@@ -2299,10 +2240,17 @@ export class AutoJoinManager extends EventEmitter {
 
     await this.apiCircuitBreaker.execute(async () => {
       const client = message.client as any;
-      const sessionId: string | undefined = client.ws?.shards?.first?.()?.sessionId
-        ?? client.ws?.shards?.get?.(0)?.sessionId;
+      
+      // Wait for session ID if not immediately available
+      let wsSessionId: string | undefined;
+      for (let i = 0; i < 5; i++) {
+        wsSessionId = client.ws?.shards?.first?.()?.sessionId
+          ?? client.ws?.shards?.get?.(0)?.sessionId;
+        if (wsSessionId) break;
+        await delay(1000);
+      }
 
-      if (!sessionId) {
+      if (!wsSessionId) {
         throw new Error('No active gateway session ID available');
       }
       
@@ -2323,7 +2271,7 @@ export class AutoJoinManager extends EventEmitter {
         channel_id: message.channel.id,
         message_id: message.id,
         application_id: applicationId,
-        session_id: sessionId,
+        session_id: wsSessionId,
         message_flags: 0,
         data: {
           component_type: 2,
@@ -2331,7 +2279,6 @@ export class AutoJoinManager extends EventEmitter {
         },
       };
 
-      // FIXED: Use the stored decrypted token from the session
       const token = session.decryptedToken;
       if (!token) {
         throw new Error('Token unavailable in session');
@@ -2384,8 +2331,7 @@ export class AutoJoinManager extends EventEmitter {
 
           if (status === 401 || status === 403) {
             this.asyncLogger.error('Token appears to be blocked or invalid', { 
-              userId: session.userId, 
-              status 
+              userId: session.userId, status 
             });
             await setTokenActive(session.userId, session.guildId, false);
             throw new Error(`Token ${status === 401 ? 'invalid' : 'blocked'}`);
@@ -2467,11 +2413,7 @@ export class AutoJoinManager extends EventEmitter {
     const sourceName = `#${(message.channel as { name?: string }).name ?? message.channel.id} in ${message.guild.name}`;
 
     this.asyncLogger.info('🏆 AutoJoin: WIN DETECTED!', {
-      userId,
-      prize,
-      source: sourceName,
-      guild: message.guild.name,
-      worker: this.workerId,
+      userId, prize, source: sourceName, guild: message.guild.name, worker: this.workerId,
     });
 
     await this.sendWinWebhook(message, prize, sourceName, userId);
@@ -2496,9 +2438,7 @@ export class AutoJoinManager extends EventEmitter {
     const prize = this.extractPrize(message);
 
     this.asyncLogger.info('🏆 AutoJoin: WIN DETECTED (DM)!', { 
-      userId, 
-      prize,
-      worker: this.workerId,
+      userId, prize, worker: this.workerId,
     });
 
     await this.sendWinWebhook(message, prize, 'Direct Message', userId);
@@ -2555,22 +2495,14 @@ export class AutoJoinManager extends EventEmitter {
   // -------------------------------------------------------------------------
 
   private updateGuildStats(
-    guildId: string, 
-    guildName: string, 
+    guildId: string, guildName: string, 
     stat: 'detected' | 'entered' | 'failed' | 'wins' | 'falsePositives',
     confidence?: number
   ): void {
     if (!this.guildStats.has(guildId)) {
       this.guildStats.set(guildId, {
-        guildId,
-        guildName,
-        detected: 0,
-        entered: 0,
-        failed: 0,
-        wins: 0,
-        falsePositives: 0,
-        averageConfidence: 0,
-        averageQueueWaitMs: 0,
+        guildId, guildName, detected: 0, entered: 0, failed: 0, wins: 0,
+        falsePositives: 0, averageConfidence: 0, averageQueueWaitMs: 0,
       });
     }
 
@@ -2586,21 +2518,13 @@ export class AutoJoinManager extends EventEmitter {
   private updateAccountStats(
     userId: string, 
     stat: 'detected' | 'entered' | 'failed' | 'wins' | 'falsePositives',
-    confidence?: number,
-    detectionMs?: number
+    confidence?: number, detectionMs?: number
   ): void {
     if (!this.accountStats.has(userId)) {
       this.accountStats.set(userId, {
-        userId,
-        detected: 0,
-        entered: 0,
-        failed: 0,
-        wins: 0,
-        falsePositives: 0,
-        averageConfidence: 0,
-        averageDetectionMs: 0,
-        averageQueueWaitMs: 0,
-        reconnectCount: 0,
+        userId, detected: 0, entered: 0, failed: 0, wins: 0,
+        falsePositives: 0, averageConfidence: 0, averageDetectionMs: 0,
+        averageQueueWaitMs: 0, reconnectCount: 0,
       });
     }
 
@@ -2635,8 +2559,7 @@ export class AutoJoinManager extends EventEmitter {
           }
         } catch (error) {
           this.asyncLogger.error('Health check error', {
-            userId: session.userId,
-            error: formatError(error),
+            userId: session.userId, error: formatError(error),
           });
         }
       }
@@ -2657,15 +2580,12 @@ export class AutoJoinManager extends EventEmitter {
           session.stallCount++;
           
           this.asyncLogger.error('Worker stall detected', {
-            userId: session.userId,
-            sessionId: session.sessionId,
-            stallCount: session.stallCount,
+            userId: session.userId, sessionId: session.sessionId, stallCount: session.stallCount,
           });
 
           if (session.stallCount >= 3) {
             this.asyncLogger.error('Auto-recovering stalled worker', {
-              userId: session.userId,
-              sessionId: session.sessionId,
+              userId: session.userId, sessionId: session.sessionId,
             });
             
             this.stopSession(session.userId, session.guildId).then(() => {
