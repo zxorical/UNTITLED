@@ -6,6 +6,7 @@
  * FIXED: Integrated working binary detection from old GiveawayManager
  * FIXED: Token now stored in session.decryptedToken for reliable HTTP requests
  * FIXED: Circuit breaker sensitivity reduced
+ * FIXED: Failed tokens are marked inactive and removed from autojoin rotation
  */
 
 import { Client, Message, TextChannel, ClientOptions, Options, NewsChannel, PartialMessage } from 'discord.js-selfbot-v13';
@@ -146,21 +147,6 @@ interface SessionStats {
   queueWaitTimes: number[];
 }
 
-interface DetectionProfile {
-  botId: string;
-  botName: string;
-  detectionCount: number;
-  truePositives: number;
-  falsePositives: number;
-  averageConfidence: number;
-  lastSeen: number;
-  patterns: {
-    buttonPatterns: string[];
-    embedPatterns: string[];
-    contentPatterns: string[];
-  };
-}
-
 interface QueueItem {
   entryId: string;
   userId: string;
@@ -174,14 +160,6 @@ interface QueueItem {
   attempts: number;
   maxAttempts: number;
   lastError?: string;
-}
-
-interface WatchlistKeyword {
-  keyword: string;
-  aliases: string[];
-  matchCount: number;
-  lastMatched: number;
-  compiled: RegExp;
 }
 
 interface GuildStats {
@@ -305,14 +283,7 @@ const WIN_PATTERNS: ReadonlyArray<RegExp> = [
 // ===== OTHER CONSTANTS =====
 
 const PATTERNS = {
-  ENTRY_BUTTON: /\b(enter|join|participate|raffle|sweepstakes|submit|claim|sign\s*up|go)\b|🎉|🎁|🏆|^\d[\d,]*$/i,
-  BLOCKED_BUTTON: /\b(leave|quit|exit|unenter|withdraw|remove\s+entry|cancel\s+(entry|giveaway)|end\s+giveaway)\b/i,
-  BLOCKED_CONTENT: /\b(already\s+entered|already\s+(?:in|participating)|already\s+joined|leave\s+giveaway)\b/i,
-  WIN: /(?:congratulations?|you(?:(?:'ve|\s+have)\s+won| won\s| are|'re)|winner|has\s+won|won\s+(?:the\s+)?giveaway|won\s+(?:a\s+)?(?:prize|raffle))/i,
   TIMESTAMP: /<t:(\d{10,13})(?::[a-zA-Z])?>/,
-  DRAFT_BUTTON: /\b(start|edit|cancel|preview|setup)\b/i,
-  GIVEAWAY_KEYWORD: /\bgiveaway\b|\braffle\b|\bsweepstakes\b|\bwin\b|\bprize\b/i,
-  CROSSPOST_REFERENCE: /https:\/\/discord\.com\/channels\/(\d+)\/(\d+)\/(\d+)/,
 } as const;
 
 const ENTRY_TTL_MS = 2 * 60 * 60 * 1000;
@@ -1056,7 +1027,7 @@ export class AutoJoinManager extends EventEmitter {
     this.startBatchDbWriter();
     this.startArchiveInterval();
 
-    this.asyncLogger.info('🚀 AutoJoinManager initialized (FIXED detection)', {
+    this.asyncLogger.info('🚀 AutoJoinManager initialized (FIXED detection + token handling)', {
       worker: this.workerId,
       memory: this.getMemoryUsage(),
     });
@@ -1230,6 +1201,7 @@ export class AutoJoinManager extends EventEmitter {
     }
   }
 
+  // FIXED: Token failure handling - marks bad tokens as inactive
   private async _startSessionInternal(userId: string, guildId: string): Promise<boolean> {
     const sessionKey = this.makeSessionKey(userId);
 
@@ -1241,6 +1213,12 @@ export class AutoJoinManager extends EventEmitter {
       try {
         decryptedToken = await this.tokenManager.getDecryptedToken(userId, guildId, user.token);
       } catch (error) {
+        this.asyncLogger.error('❌ Failed to decrypt token - marking as inactive', {
+          userId,
+          guildId,
+          error: formatError(error),
+          worker: this.workerId,
+        });
         await setTokenActive(userId, guildId, false);
         return false;
       }
@@ -1264,6 +1242,55 @@ export class AutoJoinManager extends EventEmitter {
 
       const client = new Client(clientOptions);
       client.setMaxListeners(50);
+      
+      // FIXED: Try to login with proper error handling
+      try {
+        await this.loginWithTimeout(client, decryptedToken);
+        await this.waitForReady(client);
+      } catch (loginError) {
+        const errorMsg = formatError(loginError);
+        
+        // Check if token is invalid/expired/blocked/rate-limited
+        const isTokenBad = 
+          errorMsg.includes('Invalid token') ||
+          errorMsg.includes('401') ||
+          errorMsg.includes('Unauthorized') ||
+          errorMsg.includes('incorrect login') ||
+          errorMsg.includes('incorrect password') ||
+          errorMsg.includes('token') && errorMsg.includes('invalid') ||
+          errorMsg.includes('Login timeout') ||
+          errorMsg.includes('Ready timeout');
+        
+        if (isTokenBad) {
+          this.asyncLogger.error('❌ Token failed to login - marking as inactive permanently', {
+            userId,
+            guildId,
+            error: errorMsg,
+            worker: this.workerId,
+          });
+        } else {
+          this.asyncLogger.error('❌ Token login failed - marking inactive temporarily', {
+            userId,
+            guildId,
+            error: errorMsg,
+            worker: this.workerId,
+          });
+        }
+        
+        // Mark token as inactive in database so it won't be retried
+        await setTokenActive(userId, guildId, false).catch(() => {});
+        
+        // Clear from cache
+        this.tokenManager.clearCache(userId, guildId);
+        
+        // Destroy the failed client
+        try { await client.destroy(); } catch {}
+        
+        // Emit event so other systems know
+        this.emit('tokenFailed', { userId, guildId, error: errorMsg });
+        
+        return false;
+      }
       
       this.sessionIdCounter++;
       const sessionId = `${userId}-${Date.now()}-${this.sessionIdCounter}`;
@@ -1289,9 +1316,6 @@ export class AutoJoinManager extends EventEmitter {
       };
 
       this.registerEvents(session);
-      
-      await this.loginWithTimeout(client, decryptedToken);
-      await this.waitForReady(client);
       
       this.tokenManager.clearCache(userId, guildId);
 
@@ -1327,7 +1351,7 @@ export class AutoJoinManager extends EventEmitter {
         error: formatError(error),
         worker: this.workerId,
       });
-      await setTokenActive(userId, guildId, false);
+      await setTokenActive(userId, guildId, false).catch(() => {});
       this.tokenManager.clearCache(userId, guildId);
       return false;
     }
@@ -1406,7 +1430,11 @@ export class AutoJoinManager extends EventEmitter {
             })
             .catch(() => {});
         } else {
+          this.asyncLogger.error('Max reconnect attempts reached, marking token as inactive', {
+            userId: session.userId,
+          });
           session.isActive = false;
+          setTokenActive(session.userId, session.guildId, false).catch(() => {});
           this.stopSession(session.userId, session.guildId);
         }
       }
@@ -1469,7 +1497,7 @@ export class AutoJoinManager extends EventEmitter {
       this.sessionsByUserId.delete(userId);
       this.tokenManager.clearCache(userId, guildId);
       
-      await setTokenActive(userId, guildId, false);
+      // Don't mark inactive here - let the caller decide
       
       this.asyncLogger.info('⏹️ AutoJoin session stopped', { 
         userId, 
@@ -1543,6 +1571,7 @@ export class AutoJoinManager extends EventEmitter {
     
     try {
       const allPremiumUsers = await this.getAllPremiumUsersAcrossAllGuilds();
+      // FIXED: Only retry tokens that are still marked as active (not explicitly failed)
       const failedUsers = allPremiumUsers.filter(u => u.token && u.tokenActive === false);
       
       for (const user of failedUsers) {
