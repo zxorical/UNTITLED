@@ -4,7 +4,7 @@
  * Premium AutoJoiner - PRODUCTION GRADE - MEMORY SAFE - FULLY OPTIMIZED
  * 
  * 🔥 MEMORY OPTIMIZATIONS:
- * 1. Guild cache limited to 1 per session (was 84-171 = 2.8GB leak)
+ * 1. Guild cache limited to 1 per session via sweep (was 84-171 = 2.8GB leak)
  * 2. Channel cache limited to 10 per session
  * 3. User cache limited to 50 per session
  * 4. Message cache limited to 50 with 30s sweep
@@ -23,7 +23,8 @@
  * FIXED: No retries for no-button messages
  * FIXED: Suppressed token-unavailable flood from library internals
  * FIXED: Wait for gateway session ID before interaction
- * FIXED: TypeScript error - removed GuildChannelManager (doesn't exist in discord.js-selfbot-v13)
+ * FIXED: TypeScript error - removed GuildManager (doesn't exist in discord.js-selfbot-v13)
+ *       Memory savings come from startCacheSweep() function instead
  */
 
 import { Client, Message, TextChannel, ClientOptions, Options, NewsChannel, PartialMessage } from 'discord.js-selfbot-v13';
@@ -345,7 +346,7 @@ const METRICS_SAMPLE_SIZE = 100;
 // 🔥 Sweep interval - force clear guild cache every 10 seconds
 const CACHE_SWEEP_INTERVAL_MS = 10_000;
 
-// 🔥 Max guilds to keep per session
+// 🔥 Max guilds to keep per session (enforced by sweep)
 const MAX_GUILDS_CACHED = 1;
 const MAX_CHANNELS_CACHED = 10;
 const MAX_USERS_CACHED = 50;
@@ -1290,8 +1291,8 @@ export class AutoJoinManager extends EventEmitter {
         return false;
       }
 
-      // 🔥 OPTIMIZED: Minimal client options - NO guild caching
-      // FIXED: Removed GuildChannelManager (doesn't exist in discord.js-selfbot-v13)
+      // 🔥 OPTIMIZED: Minimal client options - cache sweep handles guild clearing
+      // NOTE: GuildManager doesn't exist in discord.js-selfbot-v13, so we use the sweep function instead
       const clientOptions: ClientOptions = {
         messageCacheLifetime: 30,
         messageSweepInterval: 60,
@@ -1301,8 +1302,7 @@ export class AutoJoinManager extends EventEmitter {
         allowedMentions: { parse: [] },
         partials: [],
         makeCache: Options.cacheWithLimits({
-          // 🔥 CRITICAL: Limit to 1 guild per session - saves 2.8GB
-          GuildManager: { maxSize: MAX_GUILDS_CACHED },
+          // 🔥 These are the ACTUAL options that exist in discord.js-selfbot-v13
           ChannelManager: { maxSize: MAX_CHANNELS_CACHED },
           PresenceManager: 0,
           ReactionManager: 0,
