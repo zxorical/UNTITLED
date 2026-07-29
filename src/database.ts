@@ -33,6 +33,7 @@
  * 15. FIXED: Emergency memory monitor triggers at 3GB to force cleanup
  * 16. FIXED: Batch size reduced from 500 to 50 for more frequent cleanup
  * 17. FIXED: Cache size now strictly enforced with proper LRU
+ * 18. FIXED: Type errors when iterating cache.entries() - use .value.doc
  */
 
 import { MongoClient, Db, Collection, AnyBulkWriteOperation } from 'mongodb';
@@ -1141,7 +1142,7 @@ export async function getActiveGiveaways(limit: number = 50): Promise<GiveawayDa
   }
   
   for (const [key, entry] of cache.entries()) {
-    const d = entry.doc;
+    const d = entry.value.doc;
     if (d.status === 'active' && (d.endsAt === null || d.endsAt > now)) {
       active.push(d);
       activeGiveawaysCache.set(cacheKey(d.messageId, d.channelId), d);
@@ -1177,7 +1178,7 @@ export async function getAllGiveaways(limit: number = 100): Promise<GiveawayData
   let count = 0;
   for (const [key, entry] of cache.entries()) {
     if (count >= limit) break;
-    results.push(entry.doc);
+    results.push(entry.value.doc);
     count++;
   }
   return results
@@ -1194,7 +1195,7 @@ export async function getStats(): Promise<GiveawayStats> {
   active = activeGiveawaysCache.size;
   
   for (const [key, entry] of cache.entries()) {
-    const d = entry.doc;
+    const d = entry.value.doc;
     guildIds.add(d.guildId);
     if (last === null || d.detectedAt > last) last = d.detectedAt;
   }
@@ -1234,7 +1235,7 @@ export async function cleanupOldGiveaways(days: number = 30): Promise<number> {
   
   const entries = Array.from(cache.entries());
   for (const [key, entry] of entries) {
-    const d = entry.doc;
+    const d = entry.value.doc;
     if (d.status !== 'active' && d.detectedAt < cutoff) {
       cache.delete(key);
       activeGiveawaysCache.delete(key);
@@ -1265,7 +1266,7 @@ export async function purgeEndedGiveaways(): Promise<GiveawayData[]> {
 
   const entries = Array.from(cache.entries());
   for (const [key, entry] of entries) {
-    const d = entry.doc;
+    const d = entry.value.doc;
     const isRunning = d.status === 'active' && (d.endsAt === null || d.endsAt > now);
     if (!isRunning) {
       removed.push(rowToGiveaway(d));
