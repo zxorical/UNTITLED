@@ -1133,19 +1133,8 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   // FIX: Clear Discord.js internal caches to free memory
-  private clearClientCaches(client: Client): void {
-    try {
-      (client as any).guilds?.cache?.clear?.();
-      (client as any).users?.cache?.clear?.();
-      (client as any).channels?.cache?.clear?.();
-      (client as any).emojis?.cache?.clear?.();
-    } catch {
-      // ignore
-    }
-  }
-
   // 🔥 MEMORY FIX: Fetch message WITHOUT adding to Discord.js cache
-  private async fetchMessageUncached(client: Client, channelId: string, messageId: string): Promise<Message | null> {
+private async fetchMessageUncached(client: Client, channelId: string, messageId: string): Promise<Message | null> {
   try {
     // Fetch channel without caching
     const channel = await client.channels.fetch(channelId, { force: true, cache: false });
@@ -1170,29 +1159,6 @@ export class AutoJoinManager extends EventEmitter {
     return null;
   }
 }
-      
-      // Immediately remove from cache if it was added anyway
-      try {
-        (channel as TextChannel).messages.cache.delete(messageId);
-        (client as any).channels?.cache?.delete(channelId);
-      } catch {
-        // ignore
-      }
-      
-      return message;
-    } catch {
-      return null;
-    }
-  }
-
-  // 🔥 MEMORY FIX: Remove message from cache after processing
-  private purgeMessageFromCache(message: Message): void {
-    try {
-      (message.channel as TextChannel)?.messages?.cache?.delete(message.id);
-    } catch {
-      // ignore
-    }
-  }
 
   // -------------------------------------------------------------------------
   // Public API
