@@ -1146,15 +1146,30 @@ export class AutoJoinManager extends EventEmitter {
 
   // 🔥 MEMORY FIX: Fetch message WITHOUT adding to Discord.js cache
   private async fetchMessageUncached(client: Client, channelId: string, messageId: string): Promise<Message | null> {
+  try {
+    // Fetch channel without caching
+    const channel = await client.channels.fetch(channelId, { force: true, cache: false });
+    if (!channel || !('messages' in channel)) return null;
+    
+    // Fetch the message directly by ID (as string)
+    const message = await (channel as TextChannel).messages.fetch(messageId, {
+      force: true,
+      cache: false,
+    }) as Message;
+    
+    // Immediately remove from cache if it was added anyway
     try {
-      const channel = await client.channels.fetch(channelId, { force: true, cache: false });
-      if (!channel || !('messages' in channel)) return null;
-      
-      const message = await (channel as TextChannel).messages.fetch({
-        message: messageId,
-        force: true,
-        cache: false,
-      }) as Message;
+      (channel as TextChannel).messages.cache.delete(messageId);
+      (client as any).channels?.cache?.delete(channelId);
+    } catch {
+      // ignore
+    }
+    
+    return message;
+  } catch {
+    return null;
+  }
+}
       
       // Immediately remove from cache if it was added anyway
       try {
