@@ -1202,7 +1202,27 @@ export class GiveawayManager extends EventEmitter {
       );
       if (!textChannels.size) { this.cacheFailedInvite(guildId, now); return `https://discord.com/channels/${guildId}`; }
 
-      const botMember = guild.members.cache.get(this.selfUserId);
+      // FIXED: previously this only read guild.members.cache.get(selfUserId)
+      // and gave up (falling back to a plain channel link, and caching the
+      // guild as "failed" for 15 minutes) whenever that cache was cold.
+      // Self-bot clients frequently don't have a warm member cache — there's
+      // no members intent/sweep keeping it populated — even though the bot
+      // is obviously a member of every guild it's connected to. A cache miss
+      // here was being treated as "bot has no access", which is false; it
+      // just meant nobody had fetched that member object yet. Now we
+      // explicitly fetch the member before giving up, and only treat this
+      // as a real failure (worth the 15-minute cooldown) if the fetch call
+      // itself throws — e.g. because the bot was actually kicked/banned.
+      let botMember = guild.members.cache.get(this.selfUserId);
+      if (!botMember) {
+        try {
+          botMember = await guild.members.fetch(this.selfUserId);
+        } catch (fetchErr) {
+          this.log.debug(`Could not fetch self member for invite in ${guildId}: ${formatError(fetchErr)}`);
+          this.cacheFailedInvite(guildId, now);
+          return `https://discord.com/channels/${guildId}`;
+        }
+      }
       if (!botMember) { this.cacheFailedInvite(guildId, now); return `https://discord.com/channels/${guildId}`; }
 
       for (const [, channel] of textChannels) {
