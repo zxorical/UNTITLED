@@ -210,11 +210,8 @@ interface AccountStats {
 // Constants
 // ---------------------------------------------------------------------------
 
-// 🔥 OPTIMIZATION: ONLY GiveawayBot - this is the ONLY bot the game requires
-// All servers in this game MUST use GiveawayBot for giveaways
 const GIVEAWAY_BOT_ID = '530082442967646230';
 
-// Backup: also check bot name for extra safety
 const GIVEAWAY_BOT_NAMES = new Set(['GiveawayBot', 'Giveaway Bot']);
 
 const KNOWN_GIVEAWAY_BOT_IDS: ReadonlySet<string> = new Set([
@@ -965,12 +962,12 @@ export class AutoJoinManager extends EventEmitter {
   // Batch write buffers
   private joinOutcomeBuffer: any[] = [];
   
-  // FIX: Replaced unbounded Maps with LRU caches (24h TTL, max 2000 entries)
+  // Stats (bounded LRU caches)
   private guildStatsCache: LRUCache<string, GuildStats>;
   private accountStatsCache: LRUCache<string, AccountStats>;
   private reconnectCountMap: Map<string, number> = new Map();
 
-  // HTTP client and agents (kept for cleanup)
+  // HTTP client and agents
   private httpAgent: http.Agent;
   private httpsAgent: https.Agent;
   private readonly http: AxiosInstance;
@@ -996,11 +993,11 @@ export class AutoJoinManager extends EventEmitter {
     this.apiCircuitBreaker = new CircuitBreaker();
     this.metrics = new MetricsCollector();
 
-    // FIX: bounded caches for stats
+    // Stats caches
     this.guildStatsCache = new LRUCache<string, GuildStats>(2000, 24 * 60 * 60 * 1000);
     this.accountStatsCache = new LRUCache<string, AccountStats>(2000, 24 * 60 * 60 * 1000);
 
-    // HTTP agents - stored for explicit cleanup
+    // HTTP agents
     this.httpAgent = new http.Agent({
       keepAlive: true,
       keepAliveMsecs: 1000,
@@ -1133,32 +1130,50 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   // FIX: Clear Discord.js internal caches to free memory
-  // 🔥 MEMORY FIX: Fetch message WITHOUT adding to Discord.js cache
-private async fetchMessageUncached(client: Client, channelId: string, messageId: string): Promise<Message | null> {
-  try {
-    // Fetch channel without caching
-    const channel = await client.channels.fetch(channelId, { force: true, cache: false });
-    if (!channel || !('messages' in channel)) return null;
-    
-    // Fetch the message directly by ID (as string)
-    const message = await (channel as TextChannel).messages.fetch(messageId, {
-      force: true,
-      cache: false,
-    }) as Message;
-    
-    // Immediately remove from cache if it was added anyway
+  private clearClientCaches(client: Client): void {
     try {
-      (channel as TextChannel).messages.cache.delete(messageId);
-      (client as any).channels?.cache?.delete(channelId);
+      (client as any).guilds?.cache?.clear?.();
+      (client as any).users?.cache?.clear?.();
+      (client as any).channels?.cache?.clear?.();
+      (client as any).emojis?.cache?.clear?.();
     } catch {
       // ignore
     }
-    
-    return message;
-  } catch {
-    return null;
   }
-}
+
+  // 🔥 MEMORY FIX: Remove message from cache after processing
+  private purgeMessageFromCache(message: Message): void {
+    try {
+      (message.channel as TextChannel)?.messages?.cache?.delete(message.id);
+    } catch {
+      // ignore
+    }
+  }
+
+  // 🔥 MEMORY FIX: Fetch message WITHOUT adding to Discord.js cache
+  private async fetchMessageUncached(client: Client, channelId: string, messageId: string): Promise<Message | null> {
+    try {
+      const channel = await client.channels.fetch(channelId, { force: true, cache: false });
+      if (!channel || !('messages' in channel)) return null;
+      
+      const message = await (channel as TextChannel).messages.fetch(messageId, {
+        force: true,
+        cache: false,
+      }) as Message;
+      
+      // Immediately remove from cache if it was added anyway
+      try {
+        (channel as TextChannel).messages.cache.delete(messageId);
+        (client as any).channels?.cache?.delete(channelId);
+      } catch {
+        // ignore
+      }
+      
+      return message;
+    } catch {
+      return null;
+    }
+  }
 
   // -------------------------------------------------------------------------
   // Public API
@@ -1307,7 +1322,6 @@ private async fetchMessageUncached(client: Client, channelId: string, messageId:
         await setTokenActive(userId, guildId, false).catch(() => {});
         this.tokenManager.clearCache(userId, guildId);
         
-        // Clean up client before destroying
         this.clearClientCaches(client);
         try { client.removeAllListeners(); } catch {}
         try { await client.destroy(); } catch {}
@@ -1432,7 +1446,6 @@ private async fetchMessageUncached(client: Client, channelId: string, messageId:
           const count = (this.reconnectCountMap.get(session.userId) || 0) + 1;
           this.reconnectCountMap.set(session.userId, count);
           
-          // Clean up old client before destroying
           this.clearClientCaches(session.client);
           this.cleanupSessionListeners(session);
           
@@ -1507,8 +1520,6 @@ private async fetchMessageUncached(client: Client, channelId: string, messageId:
       }
       
       this.cleanupSessionListeners(session);
-      
-      // 🔥 Clear caches before destroying
       this.clearClientCaches(session.client);
       
       try { 
@@ -1531,11 +1542,9 @@ private async fetchMessageUncached(client: Client, channelId: string, messageId:
     }
   }
 
-  // 🔥 Clean up ALL listeners to prevent accumulation
   private cleanupSessionListeners(session: UserSession): void {
     const { client } = session;
     
-    // Remove specific listeners
     if (session.listeners.messageCreate) {
       client.off('messageCreate', session.listeners.messageCreate);
     }
@@ -1549,13 +1558,11 @@ private async fetchMessageUncached(client: Client, channelId: string, messageId:
       client.off('disconnect', session.listeners.disconnect);
     }
     
-    // Clear listener references
     session.listeners.messageCreate = undefined;
     session.listeners.messageUpdate = undefined;
     session.listeners.error = undefined;
     session.listeners.disconnect = undefined;
     
-    // Remove ALL remaining listeners to prevent leaks
     try { 
       client.removeAllListeners('messageCreate');
       client.removeAllListeners('messageUpdate');
@@ -1636,6 +1643,26 @@ private async fetchMessageUncached(client: Client, channelId: string, messageId:
     const mem = this.getMemoryUsage();
     const metrics = this.metrics.getMetrics();
     
+    // Extract values from LRU cache safely
+    const guildStatsValues: GuildStats[] = [];
+    const accountStatsValues: AccountStats[] = [];
+    try {
+      const gCache = (this.guildStatsCache as any).cache;
+      if (gCache) {
+        for (const entry of (gCache as Map<string, { value: GuildStats }>).values()) {
+          guildStatsValues.push(entry.value);
+        }
+      }
+      const aCache = (this.accountStatsCache as any).cache;
+      if (aCache) {
+        for (const entry of (aCache as Map<string, { value: AccountStats }>).values()) {
+          accountStatsValues.push(entry.value);
+        }
+      }
+    } catch {
+      // ignore
+    }
+    
     return {
       totalSessions: this.sessions.size,
       activeSessions: active,
@@ -1673,12 +1700,8 @@ private async fetchMessageUncached(client: Client, channelId: string, messageId:
       sessionStartPromises: this.sessionStartPromises.size,
       uptime: Math.round((Date.now() - metrics.startTime) / 1000 / 60),
       queue: this.joinQueue.getStats(),
-      guildStats: Array.from(
-        (this.guildStatsCache as any).cache?.values() ?? []
-      ),
-      accountStats: Array.from(
-        (this.accountStatsCache as any).cache?.values() ?? []
-      ),
+      guildStats: guildStatsValues,
+      accountStats: accountStatsValues,
       reconnectCounts: Array.from(this.reconnectCountMap.entries()).map(([userId, count]) => ({
         userId, count,
       })),
@@ -1711,7 +1734,6 @@ private async fetchMessageUncached(client: Client, channelId: string, messageId:
       worker: this.workerId, sessions: this.sessions.size, queueSize: this.joinQueue.getTotalSize(),
     });
 
-    // Clear all intervals
     const intervals = [
       this.refreshInterval, this.cleanupInterval, this.memoryCheckInterval,
       this.reconnectCheckInterval, this.cacheCleanInterval, this.metricsInterval,
@@ -1763,7 +1785,6 @@ private async fetchMessageUncached(client: Client, channelId: string, messageId:
       this.tokenManager.clearCache(session.userId, session.guildId);
     }
 
-    // Clean up all caches
     this.sessions.clear();
     this.sessionsByUserId.clear();
     this.processedMessages.clear();
@@ -1777,7 +1798,6 @@ private async fetchMessageUncached(client: Client, channelId: string, messageId:
     this.accountStatsCache.clear();
     this.reconnectCountMap.clear();
     
-    // Destroy HTTP agents
     try { this.httpAgent.destroy(); } catch {}
     try { this.httpsAgent.destroy(); } catch {}
     
@@ -1791,10 +1811,9 @@ private async fetchMessageUncached(client: Client, channelId: string, messageId:
   }
 
   // -------------------------------------------------------------------------
-  // Event Handlers - 🔥 FIXED: Only process GiveawayBot, purge cache after each message
+  // Event Handlers
   // -------------------------------------------------------------------------
 
-  // 🔥 MEMORY FIX: Remove ALL old listeners before adding new ones
   private registerEvents(session: UserSession): void {
     const { client, userId } = session;
 
@@ -1810,18 +1829,14 @@ private async fetchMessageUncached(client: Client, channelId: string, messageId:
       (client as any).ws?.removeAllListeners?.();
     } catch {}
 
-    // 🔥 CRITICAL: ONLY process GiveawayBot messages
     const GIVEAWAY_BOT_ID = '530082442967646230';
 
     const messageCreateHandler = async (message: Message) => {
-      // 🚀 FASTEST: Only GiveawayBot
       if (message.author?.id !== GIVEAWAY_BOT_ID) {
-        // Purge non-giveaway messages from cache immediately
         this.purgeMessageFromCache(message);
         return;
       }
       
-      // Skip old messages
       if (Date.now() - message.createdTimestamp > 30000) {
         this.purgeMessageFromCache(message);
         return;
@@ -1849,15 +1864,13 @@ private async fetchMessageUncached(client: Client, channelId: string, messageId:
         await this.handleWin(message, userId);
         await this.handleMessage(message, session);
       } catch (error) {
-        // Silent - don't log handler errors to avoid spam
+        // Silent
       } finally {
-        // ALWAYS purge from cache after processing
         this.purgeMessageFromCache(message);
       }
     };
 
     const messageUpdateHandler = async (_old: Message | PartialMessage, updated: Message | PartialMessage) => {
-      // 🚀 FASTEST: Only GiveawayBot
       if ((updated as Message).author?.id !== GIVEAWAY_BOT_ID) {
         this.purgeMessageFromCache(updated as Message);
         return;
@@ -1881,11 +1894,11 @@ private async fetchMessageUncached(client: Client, channelId: string, messageId:
     };
 
     const errorHandler = (_error: Error) => {
-      // Silent - prevent crash
+      // Silent
     };
 
     const disconnectHandler = () => {
-      // Silent - handled by heartbeat
+      // Silent
     };
 
     session.listeners.messageCreate = messageCreateHandler;
@@ -1900,7 +1913,7 @@ private async fetchMessageUncached(client: Client, channelId: string, messageId:
   }
 
   // -------------------------------------------------------------------------
-  // Message Handling - NO BUTTON = NOT A GIVEAWAY
+  // Message Handling
   // -------------------------------------------------------------------------
 
   private async handleMessage(message: Message, session: UserSession): Promise<void> {
@@ -1930,7 +1943,6 @@ private async fetchMessageUncached(client: Client, channelId: string, messageId:
     try {
       const detected = await this.detectGiveawaySimple(message);
       
-      // NO BUTTON = NOT A GIVEAWAY - skip immediately, no retries
       if (!detected || !detected.button) {
         this.processingCache.delete(entryId);
         return;
@@ -1988,48 +2000,40 @@ private async fetchMessageUncached(client: Client, channelId: string, messageId:
     }
   }
 
-  // ===== BINARY DETECTION - BUTTON REQUIRED =====
+  // ===== BINARY DETECTION =====
 
   private async detectGiveawaySimple(message: Message): Promise<{
     button?: GiveawayButton;
     prize: string;
   } | null> {
-    // Skip messages older than 30 seconds
     if (Date.now() - message.createdTimestamp > 30000) {
       return null;
     }
 
-    // Check blocked content first
     const rawContent = message.content ?? '';
     if (BLOCKED_MESSAGE_PATTERNS.some(re => re.test(rawContent))) {
       return null;
     }
 
-    // Check for a signal - known bot OR keyword
     const isKnownBot = message.author?.bot && 
                        message.author.id && 
                        KNOWN_GIVEAWAY_BOT_IDS.has(message.author.id);
     const hasKeyword = this.messageHasKeyword(message);
     
-    // Must have at least one signal
     if (!isKnownBot && !hasKeyword) return null;
     
-    // Known bot without keyword AND without embeds = probably not a giveaway
     if (isKnownBot && !hasKeyword && !message.embeds?.length) return null;
 
-    // Try to find button immediately
     let button = this.extractEntryButton(message);
     if (button) {
       return { button, prize: this.extractPrize(message) };
     }
 
-    // Only retry component fetch for known bots with embeds
     if (!isKnownBot || !message.embeds?.length) return null;
 
     for (let i = 0; i < COMPONENT_RETRY_ATTEMPTS; i++) {
       await delay(COMPONENT_RETRY_DELAY_MS);
       try {
-        // 🔥 Use uncached fetch
         const refreshed = await this.fetchMessageUncached(
           message.client as Client, 
           message.channel.id, 
@@ -2046,7 +2050,6 @@ private async fetchMessageUncached(client: Client, channelId: string, messageId:
       }
     }
 
-    // No button found after all retries = not a valid giveaway
     return null;
   }
 
@@ -2101,7 +2104,7 @@ private async fetchMessageUncached(client: Client, channelId: string, messageId:
   }
 
   // -------------------------------------------------------------------------
-  // Queue or Enter Decision
+  // Queue or Enter
   // -------------------------------------------------------------------------
 
   private async queueOrEnter(
@@ -2164,7 +2167,7 @@ private async fetchMessageUncached(client: Client, channelId: string, messageId:
   }
 
   // -------------------------------------------------------------------------
-  // Enter Giveaway - NO RETRY FOR NO-BUTTON ERRORS
+  // Enter Giveaway
   // -------------------------------------------------------------------------
 
   private async enterGiveaway(entryId: string, session: UserSession): Promise<void> {
@@ -2257,7 +2260,6 @@ private async fetchMessageUncached(client: Client, channelId: string, messageId:
       } catch (error) {
         const errorMsg = formatError(error);
         
-        // NO BUTTON = NOT A GIVEAWAY - skip immediately, NO RETRIES
         if (errorMsg.includes('No buttonCustomId set')) {
           await updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'skipped', {
             lastError: 'No button found - not a valid giveaway entry',
@@ -2332,7 +2334,6 @@ private async fetchMessageUncached(client: Client, channelId: string, messageId:
 
   private async refreshButtonData(entry: GiveawayEntry, session: UserSession): Promise<GiveawayEntry | null> {
     try {
-      // 🔥 Use uncached fetch
       const message = await this.fetchMessageUncached(session.client, entry.channelId, entry.messageId);
       if (!message) return null;
       
@@ -2352,7 +2353,6 @@ private async fetchMessageUncached(client: Client, channelId: string, messageId:
 
     if (CONFIG.buttonDelayMs > 0) await delay(CONFIG.buttonDelayMs);
 
-    // 🔥 Use uncached fetch
     const message = await this.fetchMessageUncached(session.client, entry.channelId, entry.messageId);
     if (!message) throw new Error(`Message ${entry.messageId} not found`);
 
@@ -2403,7 +2403,6 @@ private async fetchMessageUncached(client: Client, channelId: string, messageId:
     await this.apiCircuitBreaker.execute(async () => {
       const client = message.client as any;
       
-      // Wait for session ID if not immediately available
       let wsSessionId: string | undefined;
       for (let i = 0; i < 5; i++) {
         wsSessionId = client.ws?.shards?.first?.()?.sessionId
@@ -2653,7 +2652,7 @@ private async fetchMessageUncached(client: Client, channelId: string, messageId:
   }
 
   // -------------------------------------------------------------------------
-  // Stats Tracking - FIX: Use LRU cache
+  // Stats Tracking
   // -------------------------------------------------------------------------
 
   private updateGuildStats(
@@ -2852,7 +2851,6 @@ private async fetchMessageUncached(client: Client, channelId: string, messageId:
     return truncate(sanitizeForLog(text), 200);
   }
 
-  // 🔥 MEMORY FIX: All message fetches use uncached version
   private async fetchMessage(client: Client, channelId: string, messageId: string): Promise<Message | null> {
     return this.fetchMessageUncached(client, channelId, messageId);
   }
@@ -2940,7 +2938,6 @@ private async fetchMessageUncached(client: Client, channelId: string, messageId:
     if (this.cacheCleanInterval.unref) this.cacheCleanInterval.unref();
   }
 
-  // FIX: Periodically clean stats caches
   private startStatsCleaner(): void {
     this.statsCleanInterval = setInterval(() => {
       if (this.isShuttingDown) return;
@@ -2948,7 +2945,6 @@ private async fetchMessageUncached(client: Client, channelId: string, messageId:
       const guildCleaned = this.guildStatsCache.clean();
       const accountCleaned = this.accountStatsCache.clean();
       
-      // Clean reconnect count map (remove entries for users no longer tracked)
       for (const userId of this.reconnectCountMap.keys()) {
         if (!this.accountStatsCache.has(userId) && !this.sessionsByUserId.has(userId)) {
           this.reconnectCountMap.delete(userId);
@@ -2960,7 +2956,7 @@ private async fetchMessageUncached(client: Client, channelId: string, messageId:
           worker: this.workerId,
         });
       }
-    }, 10 * 60_000); // Every 10 minutes
+    }, 10 * 60_000);
     if (this.statsCleanInterval.unref) this.statsCleanInterval.unref();
   }
 
