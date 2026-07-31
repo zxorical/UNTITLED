@@ -34,6 +34,8 @@
  * 16. FIXED: Batch size reduced from 500 to 50 for more frequent cleanup
  * 17. FIXED: Cache size now strictly enforced with proper LRU
  * 18. FIXED: Type errors when iterating cache.entries() - use .value.doc
+ * 19. FIXED: updateUserToken now handles clearing token (empty string = null)
+ * 20. FIXED: updateUserWebhook now handles clearing webhook (empty string = null)
  */
 
 import { MongoClient, Db, Collection, AnyBulkWriteOperation } from 'mongodb';
@@ -1637,14 +1639,18 @@ export async function getPremiumStats(guildId: string): Promise<{
 // Public API - Auto Joiner Token & Webhook Management
 // ============================================================================
 
+/**
+ * Update a user's Discord token for AutoJoiner
+ * If encryptedToken is empty string, clears the token from database
+ */
 export async function updateUserToken(
   userId: string,
   guildId: string,
   encryptedToken: string,
   label: string
 ): Promise<void> {
-  if (!userId || !guildId || !encryptedToken) {
-    throw new Error('userId, guildId, and encryptedToken are required');
+  if (!userId || !guildId) {
+    throw new Error('userId and guildId are required');
   }
   
   await ensureConnected();
@@ -1652,34 +1658,51 @@ export async function updateUserToken(
   const existing = await premiumUsersCol.findOne({ userId, guildId });
   const newVersion = (existing?.version && typeof existing.version === 'number') ? existing.version + 1 : 1;
 
+  // If token is empty, clear it completely
+  const updateData: any = {
+    lastChecked: Date.now(),
+    version: newVersion,
+  };
+
+  if (encryptedToken && encryptedToken.trim() !== '') {
+    updateData.token = encryptedToken;
+    updateData.tokenLabel = label || 'Unnamed';
+    updateData.tokenAddedAt = Date.now();
+    updateData.tokenLastUsed = null;
+    updateData.tokenEntries = 0;
+    updateData.tokenWins = 0;
+    updateData.tokenActive = true;
+  } else {
+    // Clear token fields
+    updateData.token = null;
+    updateData.tokenLabel = null;
+    updateData.tokenAddedAt = null;
+    updateData.tokenLastUsed = null;
+    updateData.tokenEntries = 0;
+    updateData.tokenWins = 0;
+    updateData.tokenActive = false;
+  }
+
   await premiumUsersCol.updateOne(
     { userId, guildId },
-    {
-      $set: {
-        token: encryptedToken,
-        tokenLabel: label || 'Unnamed',
-        tokenAddedAt: Date.now(),
-        tokenLastUsed: null,
-        tokenEntries: 0,
-        tokenWins: 0,
-        tokenActive: true,
-        lastChecked: Date.now(),
-        version: newVersion,
-      },
-    },
+    { $set: updateData },
     { upsert: true }
   );
 
-  logger.debug('User token updated', { userId, guildId, label });
+  logger.debug('User token updated', { userId, guildId, label: label || 'cleared' });
 }
 
+/**
+ * Update a user's webhook URL for AutoJoiner
+ * If webhookUrl is empty string, clears the webhook from database
+ */
 export async function updateUserWebhook(
   userId: string,
   guildId: string,
   webhookUrl: string
 ): Promise<void> {
-  if (!userId || !guildId || !webhookUrl) {
-    throw new Error('userId, guildId, and webhookUrl are required');
+  if (!userId || !guildId) {
+    throw new Error('userId and guildId are required');
   }
   
   await ensureConnected();
@@ -1687,17 +1710,24 @@ export async function updateUserWebhook(
   const existing = await premiumUsersCol.findOne({ userId, guildId });
   const newVersion = (existing?.version && typeof existing.version === 'number') ? existing.version + 1 : 1;
 
+  const updateData: any = {
+    lastChecked: Date.now(),
+    version: newVersion,
+  };
+
+  if (webhookUrl && webhookUrl.trim() !== '') {
+    updateData.webhookUrl = webhookUrl;
+    updateData.webhookAddedAt = Date.now();
+    updateData.webhookLastUsed = null;
+  } else {
+    updateData.webhookUrl = null;
+    updateData.webhookAddedAt = null;
+    updateData.webhookLastUsed = null;
+  }
+
   await premiumUsersCol.updateOne(
     { userId, guildId },
-    {
-      $set: {
-        webhookUrl: webhookUrl,
-        webhookAddedAt: Date.now(),
-        webhookLastUsed: null,
-        lastChecked: Date.now(),
-        version: newVersion,
-      },
-    },
+    { $set: updateData },
     { upsert: true }
   );
 
@@ -2410,7 +2440,7 @@ export default {
   getPremiumUsersBySource,
   getPremiumStats,
   
-  // Token & Webhook functions
+  // Token & Webhook functions - UPDATED with clearing support
   updateUserToken,
   updateUserWebhook,
   getUserToken,
