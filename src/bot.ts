@@ -54,6 +54,9 @@ import {
   getPremiumStats,
   getLicenseStats,
   listLicenseKeys,
+  updateUserToken,
+  updateUserWebhook,
+  getAutoJoinEntriesCollection,
 } from './database.js';
 import { KeyPanel } from './license/keyPanel.js';
 import { PremiumPanel } from './premium/premiumPanel.js';
@@ -66,6 +69,7 @@ import {
   addPremiumUser,
   removePremiumUser as removePremiumUserService,
   checkPremium,
+  clearPremiumCache,
 } from './license/licenseMiddleware.js';
 
 declare function updateNotificationStatus(
@@ -131,25 +135,12 @@ interface NotificationJob {
   messageId: string;
 }
 
-// How long a messageId needs to be remembered for dedup purposes. Duplicate
-// enqueue() calls for the same giveaway only happen from near-simultaneous
-// retries/races in the detection pipeline (multiple accounts seeing the same
-// message, a message being edited and re-processed, etc.) — anything beyond
-// a few minutes apart is not a duplicate, it's just the same messageId
-// reappearing much later for an unrelated reason and doesn't need
-// protecting against.
 const DEDUP_TTL_MS = 10 * 60 * 1000; // 10 minutes
 const DEDUP_SWEEP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 
 class NotificationService {
   private queue: NotificationJob[] = [];
   private processing = false;
-  // Was: private dedupSet = new Set<string>() — every notification ever
-  // sent added an entry with no expiry and no cap. Across the lifetime of
-  // this process that grows without bound (production logs showed 23,000+
-  // giveaways tracked historically), and was a real contributor to the
-  // slow, ongoing memory climb. Replaced with a TTL map + periodic sweep,
-  // since dedup only needs to cover a short window, not forever.
   private dedupMap = new Map<string, number>();
   private dedupSweepInterval: NodeJS.Timeout | null = null;
   private bot: Client;
@@ -176,7 +167,6 @@ class NotificationService {
     }
   }
 
-  /** Call on process shutdown to stop the sweep interval cleanly. */
   shutdown(): void {
     if (this.dedupSweepInterval) {
       clearInterval(this.dedupSweepInterval);
@@ -434,7 +424,6 @@ export class BotManager {
       ],
     });
 
-    // Set client reference for license middleware
     setClient(this.client);
 
     this.notifications = new NotificationService(this.client, this.metrics);
@@ -451,12 +440,13 @@ export class BotManager {
     this.commands.set('purge', this.purgeCommand.bind(this));
     this.commands.set('watch', this.watchlistCommand.bind(this));
     this.commands.set('licenseadmin', this.licenseAdminCommand.bind(this));
+    this.commands.set('revoke', this.revokeCommand.bind(this));
 
-    // --- Booster Listeners ---
+    // Booster Listeners
     this.client.on('guildMemberUpdate', this.handleGuildMemberUpdate.bind(this));
     this.client.on('guildMemberAdd', this.handleGuildMemberAdd.bind(this));
 
-    // --- Ready Event ---
+    // Ready Event
     this.client.once('ready', async () => {
       logger.info(`Logged in as ${this.client.user?.tag}`, { component: 'BotManager' });
       await this.updatePresence();
@@ -468,23 +458,19 @@ export class BotManager {
       await this.sendLicensePanel();
       await this.sendPremiumPanel();
 
-      // Auto-assign premium to existing boosters on startup
       await this.assignPremiumToExistingBoosters();
 
-      // Start periodic premium role verification
-      this.verificationInterval = setInterval(() => this.verifyAllPremiumRoles(), 300000); // Every 5 minutes
+      this.verificationInterval = setInterval(() => this.verifyAllPremiumRoles(), 300000);
     });
 
-    // --- Interaction Handler ---
+    // Interaction Handler
     this.client.on('interactionCreate', async (interaction: Interaction) => {
       if (interaction.isButton()) {
-        // Role panel
         if (interaction.customId === 'toggle_ping') {
           await this.handlePingToggle(interaction);
           return;
         }
 
-        // License panel (Activate Premium)
         if (interaction.customId === 'license_activate') {
           const channel = interaction.channel as TextChannel;
           const panel = new KeyPanel(channel);
@@ -492,7 +478,6 @@ export class BotManager {
           return;
         }
 
-        // Premium panel (AutoJoiner)
         if (interaction.customId === 'premium_autojoiner') {
           const channel = interaction.channel as TextChannel;
           const panel = new PremiumPanel(channel);
@@ -500,7 +485,6 @@ export class BotManager {
           return;
         }
 
-        // Admin panel
         if (['admin_generate_key', 'admin_list_keys', 'admin_refresh'].includes(interaction.customId)) {
           if (!isOwner(interaction.user.id)) {
             await interaction.reply({ content: 'No permission.', ephemeral: true });
@@ -511,7 +495,6 @@ export class BotManager {
           return;
         }
 
-        // Legacy buttons (backward compatibility)
         if (['activate_premium', 'check_premium', 'generate_key', 'list_keys', 'refresh_stats'].includes(interaction.customId)) {
           const channel = interaction.channel as TextChannel;
           const panel = new KeyPanel(channel);
@@ -522,7 +505,6 @@ export class BotManager {
       }
 
       if (interaction.isModalSubmit()) {
-        // License activation modal
         if (interaction.customId === 'license_activate_modal') {
           const channel = interaction.channel as TextChannel;
           const panel = new KeyPanel(channel);
@@ -530,7 +512,6 @@ export class BotManager {
           return;
         }
 
-        // Premium panel modal (AutoJoiner)
         if (interaction.customId === 'premium_autojoiner_modal') {
           const channel = interaction.channel as TextChannel;
           const panel = new PremiumPanel(channel);
@@ -538,7 +519,6 @@ export class BotManager {
           return;
         }
 
-        // Legacy activation modal
         if (interaction.customId === 'activate_premium_modal') {
           const channel = interaction.channel as TextChannel;
           const panel = new KeyPanel(channel);
@@ -619,6 +599,52 @@ export class BotManager {
   }
 
   // -------------------------------------------------------------------------
+  // DELETE ALL PREMIUM DATA - COMPLETE IMPLEMENTATION
+  // -------------------------------------------------------------------------
+
+  /**
+   * Delete ALL premium-related data for a user
+   * This includes: premium status, tokens, webhooks, booster status, and auto-join entries
+   */
+  private async deleteAllPremiumData(userId: string, guildId: string): Promise<void> {
+    // 1. Remove from premium_users (sets isPremium: false)
+    await removePremiumUser(userId, guildId);
+
+    // 2. Remove from booster_premium
+    await removeBoosterPremium(userId, guildId);
+
+    // 3. Clear token (set to null/empty)
+    await updateUserToken(userId, guildId, '', '');
+
+    // 4. Clear webhook (set to null/empty)
+    await updateUserWebhook(userId, guildId, '');
+
+    // 5. Delete all auto-join entries for this user
+    try {
+      const autoJoinCol = await getAutoJoinEntriesCollection();
+      await autoJoinCol.deleteMany({ userId });
+    } catch (error) {
+      logger.warn('Failed to delete auto-join entries', {
+        userId,
+        error: String(error),
+      });
+    }
+
+    // 6. Clear any session cache
+    try {
+      const { stopTokenSession } = await import('./premium/tokenManager.js');
+      stopTokenSession(userId, guildId);
+    } catch {}
+
+    // 7. Clear premium cache in license middleware
+    try {
+      clearPremiumCache(userId);
+    } catch {}
+
+    logger.debug('All premium data deleted for user', { userId, guildId });
+  }
+
+  // -------------------------------------------------------------------------
   // Premium Role Verification (Security)
   // -------------------------------------------------------------------------
 
@@ -637,7 +663,6 @@ export class BotManager {
       const allPremiumUsers = await getAllPremiumUsers(guildId);
       const validUserIds = new Set(allPremiumUsers.map(u => u.userId));
       
-      // Also check boosters
       const boosterRoleId = process.env.BOOSTER_ROLE_ID;
       let fixed = 0;
       
@@ -647,7 +672,6 @@ export class BotManager {
         const shouldHaveRole = validUserIds.has(member.id) || isBooster;
         
         if (hasRole && !shouldHaveRole) {
-          // Remove role from people who shouldn't have it
           await member.roles.remove(premiumRoleId);
           fixed++;
           logger.warn('Removed unauthorized premium role', { 
@@ -655,7 +679,6 @@ export class BotManager {
             username: member.user.username 
           });
         } else if (!hasRole && shouldHaveRole) {
-          // Add role to people who should have it
           await member.roles.add(premiumRoleId);
           fixed++;
           logger.info('Added missing premium role', { 
@@ -1016,6 +1039,82 @@ export class BotManager {
   }
 
   // -------------------------------------------------------------------------
+  // REVOKE COMMAND
+  // -------------------------------------------------------------------------
+
+  private async revokeCommand(interaction: ChatInputCommandInteraction<CacheType>): Promise<void> {
+    if (!await requireAdmin(interaction)) return;
+
+    const user = interaction.options.getUser('user', true);
+    const guildId = interaction.guildId;
+
+    if (!guildId) {
+      await interaction.reply({ 
+        content: 'This command must be used in a server.', 
+        ephemeral: true 
+      });
+      return;
+    }
+
+    await interaction.deferReply({ ephemeral: true });
+
+    try {
+      const hasPremium = await isPremiumUser(user.id, guildId);
+
+      if (!hasPremium) {
+        await interaction.editReply({
+          content: `User <@${user.id}> does not have premium access.`,
+        });
+        return;
+      }
+
+      const premiumUser = await getPremiumUser(user.id, guildId);
+      const source = premiumUser?.source || 'unknown';
+
+      // Delete ALL premium data
+      await this.deleteAllPremiumData(user.id, guildId);
+
+      // Remove Discord role
+      try {
+        const guild = await this.client.guilds.fetch(guildId);
+        const member = await guild.members.fetch(user.id).catch(() => null);
+        if (member) {
+          const premiumRoleId = process.env.PREMIUM_ROLE_ID;
+          if (premiumRoleId && member.roles.cache.has(premiumRoleId)) {
+            await member.roles.remove(premiumRoleId);
+          }
+        }
+      } catch (roleError) {
+        logger.warn('Could not remove premium role during revoke', {
+          userId: user.id,
+          error: String(roleError),
+        });
+      }
+
+      logger.info('Premium revoked by admin', {
+        adminId: interaction.user.id,
+        userId: user.id,
+        guildId,
+        source,
+      });
+
+      await interaction.editReply({
+        content: `✅ Successfully revoked premium from <@${user.id}>. All associated data (tokens, webhooks, auto-join entries) has been deleted.`,
+      });
+
+    } catch (error) {
+      logger.error('Revoke command failed', {
+        adminId: interaction.user.id,
+        userId: user.id,
+        error: String(error),
+      });
+      await interaction.editReply({
+        content: `Failed to revoke premium: ${error instanceof Error ? error.message : 'Unknown error'}`,
+      });
+    }
+  }
+
+  // -------------------------------------------------------------------------
   // Existing Commands
   // -------------------------------------------------------------------------
   
@@ -1147,6 +1246,7 @@ export class BotManager {
         { name: '/metrics', value: 'Performance metrics (admin)', inline: false },
         { name: '/setchannel', value: 'Set notify channel (admin)', inline: false },
         { name: '/reset', value: 'Clear database (admin)', inline: false },
+        { name: '/revoke', value: 'Revoke premium from user (admin)', inline: false },
         { name: '/panel', value: 'Send license management panel (owner)', inline: false },
         { name: '/licenseadmin', value: 'Send admin license management panel (owner)', inline: false },
         { name: '/watch add <item>', value: 'Track giveaway items', inline: false },
@@ -1308,6 +1408,7 @@ export class BotManager {
     const hadBooster = oldRoles.has(boosterRoleId);
     const hasBooster = newRoles.has(boosterRoleId);
 
+    // Booster gained → add premium
     if (!hadBooster && hasBooster) {
       try {
         await newMember.roles.add(premiumRoleId);
@@ -1323,14 +1424,21 @@ export class BotManager {
       return;
     }
 
+    // Booster lost → remove premium and DELETE ALL DATA
     if (hadBooster && !hasBooster) {
       try {
+        // Remove Discord role
         await newMember.roles.remove(premiumRoleId);
-        await removePremiumUser(newMember.id, guildId);
-        await removeBoosterPremium(newMember.id, guildId);
-        logger.info('Premium role removed from unbooster', { userId: newMember.id });
+        
+        // Delete ALL premium data for this user in this guild
+        await this.deleteAllPremiumData(newMember.id, guildId);
+        
+        logger.info('Premium data fully deleted for unbooster', { 
+          userId: newMember.id,
+          guildId 
+        });
       } catch (error) {
-        logger.error('Failed to remove premium role from unbooster', {
+        logger.error('Failed to remove premium data from unbooster', {
           userId: newMember.id,
           error: String(error),
         });
@@ -1510,6 +1618,16 @@ export class BotManager {
         .addIntegerOption(opt => opt.setName('amount').setDescription('How many'))
         .setDefaultMemberPermissions(0),
       new SlashCommandBuilder().setName('help').setDescription('List commands'),
+      // /revoke command
+      new SlashCommandBuilder()
+        .setName('revoke')
+        .setDescription('Revoke premium access from a user (admin)')
+        .addUserOption(opt => 
+          opt.setName('user')
+            .setDescription('The user to revoke premium from')
+            .setRequired(true)
+        )
+        .setDefaultMemberPermissions(0),
       new SlashCommandBuilder()
         .setName('watch')
         .setDescription('Manage giveaway watchlist')
