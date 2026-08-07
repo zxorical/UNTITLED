@@ -17,6 +17,9 @@
  * 12. Gateway latency capping to prevent misleading 200k+ ms stats
  * 13. SCRIM/EVENT DETECTION - scans all messages for scrims, squid game, gagaball
  * 14. FIXED: Removed bot-only filter in quickReject() to allow human scrim messages
+ * 15. ADDED: Time parsing and Discord timestamp formatting for scrim/event times
+ * 16. FIXED: Webhook detection to block other giveaway tracker webhooks
+ * 17. FIXED: Smart bot filter to allow official giveaway bot but block other bots
  */
 
 import { Client, Message, TextChannel } from 'discord.js-selfbot-v13';
@@ -268,6 +271,22 @@ const SCRIM_SCORE = {
 
 const MAX_SCRIM_SCORE = Object.values(SCRIM_SCORE).reduce((a, b) => a + b, 0);
 const MINIMUM_SCRIM_SCORE_THRESHOLD = 5;
+
+// ─── Tracker indicators for blocking other trackers ──────────────────────
+const TRACKER_INDICATORS = [
+  'giveaway tracker',
+  'worth joining',
+  'custom giveaway ping',
+  'type:',
+  'winners:',
+  'server invite',
+  'jump to giveaway',
+  'made by',
+  'detected in',
+  'votes:',
+  'created by',
+  'powered by',
+];
 
 // ============================================================================
 // SCRIM DETECTION INTERFACE
@@ -639,6 +658,124 @@ function extractPrize(
 }
 
 // ============================================================================
+// TIME PARSER FOR SCRIM/EVENT NOTIFICATIONS
+// ============================================================================
+
+/**
+ * Parse a human-written time string into a Unix timestamp
+ * Supports: "6 pm EST", "15:00 uk time", "8:45 am est", "Tonight at 8:00 PM EU", "12:30", "8:00 PM EU"
+ */
+function parseScrimTime(timeStr: string): number | null {
+  if (!timeStr || timeStr.length < 2) return null;
+  
+  const clean = timeStr.trim().toLowerCase();
+  
+  let hour: number | null = null;
+  let minute: number | null = null;
+  let isPM: boolean | null = null;
+  let timezone: string | null = null;
+  
+  // Extract timezone
+  const tzMatch = clean.match(/\b(est|edt|pst|pdt|cst|cdt|gmt|utc|uk|eu|et|pt|ct|mt)\b/i);
+  if (tzMatch) {
+    timezone = tzMatch[1].toUpperCase();
+  }
+  
+  // Try 12-hour format: "6 pm", "8:45 am"
+  const twelveHourMatch = clean.match(/(\d{1,2})(?::(\d{2}))?\s*(am|pm)/i);
+  if (twelveHourMatch) {
+    hour = parseInt(twelveHourMatch[1], 10);
+    minute = twelveHourMatch[2] ? parseInt(twelveHourMatch[2], 10) : 0;
+    isPM = twelveHourMatch[3].toLowerCase() === 'pm';
+  }
+  
+  // Try 24-hour format: "15:00", "14:30"
+  if (hour === null) {
+    const twentyFourMatch = clean.match(/(\d{1,2}):(\d{2})/);
+    if (twentyFourMatch) {
+      hour = parseInt(twentyFourMatch[1], 10);
+      minute = parseInt(twentyFourMatch[2], 10);
+      isPM = hour >= 12;
+    }
+  }
+  
+  // Try single hour with am/pm: "8pm"
+  if (hour === null) {
+    const singleHourMatch = clean.match(/(\d{1,2})\s*(am|pm)/i);
+    if (singleHourMatch) {
+      hour = parseInt(singleHourMatch[1], 10);
+      minute = 0;
+      isPM = singleHourMatch[2].toLowerCase() === 'pm';
+    }
+  }
+  
+  if (hour === null) {
+    return null;
+  }
+  
+  // Convert to 24-hour
+  if (isPM && hour < 12) {
+    hour += 12;
+  } else if (!isPM && hour === 12) {
+    hour = 0;
+  }
+  
+  // Determine date
+  const now = new Date();
+  const targetDate = new Date(now);
+  targetDate.setHours(hour, minute || 0, 0, 0);
+  
+  // If time is in the past, assume it's tomorrow
+  if (targetDate.getTime() < now.getTime()) {
+    targetDate.setDate(targetDate.getDate() + 1);
+  }
+  
+  // Apply timezone offset
+  if (timezone) {
+    const tzOffsets: Record<string, number> = {
+      'EST': -5, 'EDT': -4,
+      'PST': -8, 'PDT': -7,
+      'CST': -6, 'CDT': -5,
+      'MT': -7, 'MDT': -6,
+      'GMT': 0, 'UTC': 0,
+      'UK': 0, 'EU': 1,
+      'ET': -5, 'PT': -8, 'CT': -6,
+    };
+    
+    const offsetHours = tzOffsets[timezone];
+    if (offsetHours !== undefined) {
+      targetDate.setHours(targetDate.getHours() - offsetHours);
+    }
+  }
+  
+  return Math.floor(targetDate.getTime() / 1000);
+}
+
+/**
+ * Format a time string into a Discord relative timestamp
+ */
+function formatScrimTime(timeStr: string | null): string {
+  if (!timeStr) return 'Unknown';
+  const timestamp = parseScrimTime(timeStr);
+  if (timestamp === null) {
+    return timeStr;
+  }
+  return `<t:${timestamp}:R>`;
+}
+
+/**
+ * Format a time string into a Discord full date timestamp
+ */
+function formatScrimTimeFull(timeStr: string | null): string {
+  if (!timeStr) return 'Unknown';
+  const timestamp = parseScrimTime(timeStr);
+  if (timestamp === null) {
+    return timeStr;
+  }
+  return `<t:${timestamp}:F>`;
+}
+
+// ============================================================================
 // SCRIM DETECTION FUNCTIONS
 // ============================================================================
 
@@ -687,7 +824,11 @@ function extractScrimTime(text: string): string | null {
   for (const pattern of TIME_PATTERNS) {
     const match = text.match(pattern);
     if (match && match[1]) {
-      return match[1].trim();
+      const timeStr = match[1].trim();
+      // Validate it actually looks like a time
+      if (/\d/.test(timeStr) && (timeStr.includes(':') || timeStr.includes('am') || timeStr.includes('pm') || timeStr.includes('EST') || timeStr.includes('UTC') || timeStr.includes('GMT') || timeStr.includes('UK') || timeStr.includes('EU'))) {
+        return timeStr;
+      }
     }
   }
   return null;
@@ -697,7 +838,11 @@ function extractScrimReward(text: string): string | null {
   for (const pattern of REWARD_PATTERNS) {
     const match = text.match(pattern);
     if (match && match[1]) {
-      return match[1].trim();
+      const rewardStr = match[1].trim();
+      // Validate it's not a single character or generic
+      if (rewardStr.length > 2 && rewardStr !== 'W' && rewardStr !== 'N/A' && rewardStr !== 'TBD') {
+        return rewardStr;
+      }
     }
   }
   return null;
@@ -736,9 +881,68 @@ function extractScrimTicks(text: string): number | null {
   return null;
 }
 
+function isOwnNotification(message: Message): boolean {
+  const content = message.content || '';
+  if (content.includes('Scrim Detected') || content.includes('Event Detected') || content.includes('Giveaway')) {
+    return true;
+  }
+  
+  const embed = message.embeds?.[0];
+  if (embed) {
+    const botColors = [0x5865F2, 0xFF6B6B, 0x4ECDC4, 0x00AAFF, 0xFFD700];
+    if (embed.color !== null && botColors.includes(embed.color)) {
+      if (embed.footer?.text?.includes('Detected in')) {
+        return true;
+      }
+    }
+  }
+  
+  return false;
+}
+
+function isTrackerMessage(message: Message): boolean {
+  const content = (message.content || '').toLowerCase();
+  const embed = message.embeds?.[0];
+  
+  // Check content
+  for (const indicator of TRACKER_INDICATORS) {
+    if (content.includes(indicator)) {
+      return true;
+    }
+  }
+  
+  // Check embed
+  if (embed) {
+    const embedText = [
+      embed.title || '',
+      embed.description || '',
+      embed.footer?.text || '',
+      ...(embed.fields?.map(f => f.name + ' ' + f.value) || [])
+    ].join(' ').toLowerCase();
+    
+    for (const indicator of TRACKER_INDICATORS) {
+      if (embedText.includes(indicator)) {
+        return true;
+      }
+    }
+  }
+  
+  return false;
+}
+
 function detectScrim(parsed: ParsedGiveawayData): ScrimDetectionResult | null {
   const { lowerText, fullText } = parsed;
   
+  // Skip if it's obviously a bot notification
+  if (lowerText.includes('scrim detected') || lowerText.includes('event detected')) return null;
+  if (lowerText.includes('view message') && lowerText.includes('join server')) return null;
+  if (lowerText.includes('detected in') && lowerText.includes('ms')) return null;
+  
+  // Skip if it's obviously a giveaway
+  if (lowerText.includes('giveaway') && (lowerText.includes('winner') || lowerText.includes('entered'))) {
+    return null;
+  }
+
   // First check if it's a scrim/event type
   const type = detectScrimType(fullText);
   if (!type) return null;
@@ -751,13 +955,39 @@ function detectScrim(parsed: ParsedGiveawayData): ScrimDetectionResult | null {
   const teams = extractScrimTeams(fullText);
   const region = extractScrimRegion(fullText);
   const ticks = extractScrimTicks(fullText);
+  const hasEveryone = lowerText.includes('@everyone') || lowerText.includes('@here');
 
-  // Calculate score
+  // ─── TYPE-SPECIFIC VALIDATION ───
+  
+  // SCRIM: Require 2+ of: Host, Time, Teams, @everyone
+  if (type === 'scrim') {
+    let fields = 0;
+    if (host) fields++;
+    if (time) fields++;
+    if (teams) fields++;
+    if (hasEveryone) fields++;
+    if (region) fields++;
+    
+    // Must have at least 2 fields
+    if (fields < 2) return null;
+  }
+
+  // SQUID GAME: Require (Host OR Time) AND Reward
+  if (type === 'squid_game') {
+    if (!host && !time) return null;
+    if (!reward) return null;
+  }
+
+  // GAGABALL: Require Time AND Reward
+  if (type === 'gagaball') {
+    if (!time) return null;
+    if (!reward) return null;
+  }
+
+  // ─── CALCULATE SCORE ───
   let score = 0;
   const signals: string[] = [];
 
-  const hasEveryone = lowerText.includes('@everyone') || lowerText.includes('@here');
-  
   if (hasEveryone) {
     score += SCRIM_SCORE.HAS_EVERYONE;
     signals.push('everyone');
@@ -799,13 +1029,16 @@ function detectScrim(parsed: ParsedGiveawayData): ScrimDetectionResult | null {
     signals.push('keyword');
   }
 
-  // For scrims, require at least host OR time to be present
-  if (type === 'scrim' && !host && !time && !teams) {
+  // ─── FINAL THRESHOLD CHECK ───
+  const requiredScore = type === 'scrim' ? 6 : 5;
+  
+  if (score < requiredScore) {
     return null;
   }
 
-  // For squid game and gagaball, require at least host or time
-  if ((type === 'squid_game' || type === 'gagaball') && !host && !time) {
+  // Skip if it's just a single word mention
+  const words = fullText.split(/\s+/).filter(w => w.length > 2 && !/^<@!?\d+>$/.test(w));
+  if (words.length < 4 && score < 6) {
     return null;
   }
 
@@ -827,14 +1060,44 @@ function detectScrim(parsed: ParsedGiveawayData): ScrimDetectionResult | null {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// QUICK REJECT (Stage 1) - FIXED: Removed bot-only filter
+// QUICK REJECT (Stage 1) - FIXED: Smart bot filter + webhook detection
 // ═══════════════════════════════════════════════════════════════════════════
 
 function quickReject(message: Message, selfUserId: string, now: number): string | null {
   if (!message.guild) return 'no_guild';
+  
+  // Skip self messages (the bot's own messages)
   if (message.author?.id === selfUserId) return 'self';
+  
+  // Skip if it's the bot's own notification
+  if (isOwnNotification(message)) return 'self_notification';
 
-  // AGE CHECK FIRST: Reject messages that are too old immediately
+  // ─── WEBHOOK DETECTION (block all webhook messages) ───
+  if (message.webhookId) {
+    // Check if it looks like a giveaway tracker webhook
+    if (isTrackerMessage(message)) {
+      return 'webhook_tracker';
+    }
+    // If it's a webhook and we're not sure, block it anyway to be safe
+    return 'webhook_blocked';
+  }
+
+  // ─── SMART BOT FILTER ───
+  if (message.author?.bot) {
+    // ALLOW: The official giveaway bot (530082442967646230)
+    if (ALLOWED_GIVEAWAY_BOT_IDS.has(message.author.id)) {
+      // Allow this bot - it's the real giveaway bot
+    } else {
+      // BLOCK: Other bot messages (like Jimbo's tracker, other trackers)
+      if (isTrackerMessage(message)) {
+        return 'other_tracker_bot';
+      }
+      // Block any other bot that's not the official giveaway bot
+      return 'not_allowed_bot';
+    }
+  }
+
+  // ─── AGE CHECK ───
   const messageAge = now - message.createdTimestamp;
   if (messageAge > MAX_MESSAGE_AGE_MS) {
     return 'too_old';
@@ -843,11 +1106,6 @@ function quickReject(message: Message, selfUserId: string, now: number): string 
   if (CONFIG.monitoredChannels.length > 0 && !CONFIG.monitoredChannels.includes(message.channel.id)) {
     return 'not_monitored';
   }
-
-  // REMOVED: Bot-only filter that was blocking all human messages
-  // if (!message.author?.bot || !ALLOWED_GIVEAWAY_BOT_IDS.has(message.author.id)) {
-  //   return 'not_allowed_bot';
-  // }
 
   const rawContent = (message.content || '').toLowerCase();
   if (rawContent.length < 200) {
@@ -1010,9 +1268,9 @@ export class GiveawayManager extends EventEmitter {
     detected: 0, notified: 0, skipped: 0, errors: 0,
     falsePositivesBlocked: 0, watchlistMatches: 0, draftsSkipped: 0,
     startedAt: Date.now(),
-    startupMessagesSkipped: 0, // NEW: Track skipped startup messages
-    scrimsDetected: 0, // NEW: Track scrims detected
-    scrimsNotified: 0, // NEW: Track scrims notified
+    startupMessagesSkipped: 0,
+    scrimsDetected: 0,
+    scrimsNotified: 0,
   };
 
   private guildStats = new Map<string, { detected: number; notified: number; falsePositives: number }>();
@@ -1035,7 +1293,7 @@ export class GiveawayManager extends EventEmitter {
 
     this.startInviteRefresher();
     this.startWatchlistRefresher();
-    this.setupReadyHandler(); // NEW: Handle startup gracefully
+    this.setupReadyHandler();
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -1043,9 +1301,7 @@ export class GiveawayManager extends EventEmitter {
   // ═══════════════════════════════════════════════════════════════════════
 
   private setupReadyHandler(): void {
-    // Listen for ready event to handle startup
     this.client.once('ready', () => {
-      // Give Discord 2 seconds to finish replaying messages
       setTimeout(() => {
         this.readyEventReceived = true;
         
@@ -1063,7 +1319,6 @@ export class GiveawayManager extends EventEmitter {
         this.pendingStartupMessages.clear();
       }, 2000);
       
-      // Set a hard grace period cutoff as fallback
       this.startupGraceTimer = setTimeout(() => {
         if (!this.readyEventReceived) {
           this.readyEventReceived = true;
@@ -1101,12 +1356,15 @@ export class GiveawayManager extends EventEmitter {
       gagaball: 'Gagaball',
     }[scrimResult.type];
 
-    // Build description
+    const formattedTime = scrimResult.time ? formatScrimTime(scrimResult.time) : '';
+    const formattedTimeFull = scrimResult.time ? formatScrimTimeFull(scrimResult.time) : '';
+
     const description = [
       '### Details',
       scrimResult.host ? `**Host:** ${scrimResult.host}` : '',
       scrimResult.coHost ? `**Co-Host:** ${scrimResult.coHost}` : '',
-      scrimResult.time ? `**Time:** ${scrimResult.time}` : '',
+      scrimResult.time ? `**Time:** ${formattedTime}` : '',
+      scrimResult.time ? `**When:** ${formattedTimeFull}` : '',
       scrimResult.teams ? `**Teams:** ${scrimResult.teams}` : '',
       scrimResult.region ? `**Region:** ${scrimResult.region}` : '',
       scrimResult.reward ? `**Reward:** ${scrimResult.reward}` : '',
@@ -1118,7 +1376,6 @@ export class GiveawayManager extends EventEmitter {
       `[View Message](https://discord.com/channels/${guild.id}/${message.channel.id}/${message.id})`,
     ].filter(Boolean).join('\n');
 
-    // Fetch invite
     const inviteUrl = await this.fetchInviteForGuild(guild.id);
 
     try {
@@ -1180,26 +1437,18 @@ export class GiveawayManager extends EventEmitter {
     const now = Date.now();
     const processingStart = performance.now();
 
-    // ─── NEW: Startup Guard - Skip old messages replayed by Discord ───
     if (!this.readyEventReceived) {
-      // Calculate message age
       const messageAge = now - message.createdTimestamp;
-      
-      // If message is older than 10 seconds during startup, skip it entirely
       if (messageAge > MAX_STARTUP_MESSAGE_AGE_MS) {
-        return; // Old message replayed by Discord on reconnect
+        return;
       }
-      
-      // Track that we saw this message during startup
       this.pendingStartupMessages.add(message.id);
     }
 
-    // ─── NEW: Additional age check - reject messages that are too old regardless ───
     if (now - message.createdTimestamp > MAX_MESSAGE_AGE_MS) {
-      return; // Message is too old to process
+      return;
     }
 
-    // Stage 1: Quick Reject (age check now at top of quickReject)
     const rejectReason = quickReject(message, this.selfUserId, now);
     if (rejectReason) return;
 
@@ -1208,12 +1457,10 @@ export class GiveawayManager extends EventEmitter {
     this.processingMessages.add(key);
 
     try {
-      // Stage 2: Parse Once
       let parsed = parseMessage(message, now);
 
       if (isBlockedContent(parsed)) { this.stats.falsePositivesBlocked++; return; }
 
-      // Stage 3a: Creation Detection
       let creationResult = this.creationCache.get(message.id);
       if (!creationResult) {
         creationResult = detectCreation(parsed);
@@ -1233,41 +1480,33 @@ export class GiveawayManager extends EventEmitter {
 
       if (creationResult.isCreation) { this.stats.draftsSkipped++; return; }
 
-      // Stage 3b: Draft Check
       if (isDraftGiveaway(parsed)) { this.stats.draftsSkipped++; return; }
 
-      // Stage 3c: Score Calculation - First check for giveaways
       const detection = calculateGiveawayScore(parsed);
       if (detection.score >= MINIMUM_SCORE_THRESHOLD) {
-        // Stage 3d: Duplicate Check (in-memory, using message+channel ID)
         const messageDupKey = `${message.id}:${message.channel.id}`;
         if (this.duplicateCache.get(messageDupKey)) return;
         this.duplicateCache.set(messageDupKey, now);
 
-        // ─── Stage 3e: Existing Check (NOW WITH MONGODB FALLBACK) ───
         const existing = await getGiveaway(message.id, message.channel.id);
         if (existing) {
-          // Already tracked - update last seen and check if ended
           await updateLastSeen(message.id, message.channel.id);
           if (existing.status === 'active' && isEndedGiveaway(parsed)) {
             await markEnded(message.id, message.channel.id);
           }
-          return; // IMPORTANT: Don't re-notify on restart
+          return;
         }
 
-        // Cooldown Check
         if (await wasNotifiedRecently(message.id, message.channel.id, CONFIG.notificationCooldown)) {
           this.stats.skipped++; return;
         }
 
-        // Stage 4: Build Data & Notify
         this.stats.detected++;
         this.recordGuildStat(message.guild!.id, 'detected');
 
-        // ─── FIXED: Cap gateway latency to prevent misleading stats on restart ───
         const gatewayLatency = Math.min(
           Math.max(1, Date.now() - message.createdTimestamp),
-          MAX_GATEWAY_LATENCY_MS // Cap at 60 seconds
+          MAX_GATEWAY_LATENCY_MS
         );
         const processingTime = performance.now() - processingStart;
         const guild = message.guild!;
@@ -1285,7 +1524,6 @@ export class GiveawayManager extends EventEmitter {
           guildIcon, guildBanner, memberCount,
         };
 
-        // Parallel: save + invite + watchlist
         const savePromise = insertGiveaway(data);
         const invitePromise = this.fetchInviteForGuild(guild.id);
         const watchlistPromise = this.checkWatchlistMatches(parsed, message, invitePromise);
@@ -1323,25 +1561,20 @@ export class GiveawayManager extends EventEmitter {
         return;
       }
 
-      // ─── NOT A GIVEAWAY - Check if it's a scrim/event ───
       const scrimResult = detectScrim(parsed);
       if (scrimResult && scrimResult.score >= MINIMUM_SCRIM_SCORE_THRESHOLD) {
-        // Deduplicate scrims
         const scrimDupKey = `scrim:${message.id}:${message.channel.id}`;
         if (this.duplicateCache.get(scrimDupKey)) return;
         this.duplicateCache.set(scrimDupKey, now);
 
-        // Track stats
         this.stats.detected++;
         this.stats.scrimsDetected++;
         this.recordGuildStat(message.guild!.id, 'detected');
 
-        // Send scrim notification
         await this.sendScrimNotification(message, parsed, scrimResult);
         return;
       }
 
-      // Neither giveaway nor scrim - skip
       this.stats.falsePositivesBlocked++;
       if (this.shouldLogDebug()) {
         this.log.debug('Below thresholds', {
@@ -1518,7 +1751,6 @@ export class GiveawayManager extends EventEmitter {
   ): Promise<void> {
     if (!users.length || !this.botManager) return;
 
-    // Adaptive batching based on user count
     let batchSize = 20;
     let delayMs = 1000;
     if (users.length <= 10) { batchSize = 5; delayMs = 200; }
@@ -1801,7 +2033,6 @@ export class GiveawayManager extends EventEmitter {
       this.startupGraceTimer = null; 
     }
     
-    // Clear caches
     this.creationCache.clear();
     this.inviteCache.clear();
     this.failedInviteCache.clear();
@@ -1809,7 +2040,6 @@ export class GiveawayManager extends EventEmitter {
     this.processingMessages.clear();
     this.pendingStartupMessages.clear();
     
-    // Clear parsed message cache
     parsedMessageCache.clear();
     
     this.log.info(`Shutting down ${this.accountLabel}...`, { 
