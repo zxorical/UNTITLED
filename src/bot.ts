@@ -530,7 +530,7 @@ export class BotManager {
     // Interaction Handler
     this.client.on('interactionCreate', async (interaction: Interaction) => {
       if (interaction.isButton()) {
-        // Per-user notification toggles (replaces ping toggle)
+        // Per-user notification toggles
         if (interaction.customId === 'toggle_giveaway') {
           await this.handleNotificationToggle(interaction, 'giveaways');
           return;
@@ -543,8 +543,6 @@ export class BotManager {
           await this.handleNotificationToggle(interaction, 'events');
           return;
         }
-
-        // REMOVED: toggle_ping handler (replaced by notification panel)
 
         if (interaction.customId === 'license_activate') {
           const channel = interaction.channel as TextChannel;
@@ -674,64 +672,64 @@ export class BotManager {
   }
 
   // -------------------------------------------------------------------------
-  // Notification Panel (PER-USER - replaces ping role panel)
+  // Notification Panel (SIMPLE - PER-USER - replaces ping role panel)
   // -------------------------------------------------------------------------
 
   private async sendNotificationPanel(): Promise<void> {
-  const panelChannelId = process.env.PANEL_CHANNEL_ID || CONFIG.trackerChannelId;
-  const channel = this.client.channels.cache.get(panelChannelId) as TextChannel | undefined;
-  if (!channel) {
-    logger.warn('Notification panel channel not found', { 
-      component: 'BotManager',
-      channelId: panelChannelId 
+    const panelChannelId = process.env.PANEL_CHANNEL_ID || CONFIG.trackerChannelId;
+    const channel = this.client.channels.cache.get(panelChannelId) as TextChannel | undefined;
+    if (!channel) {
+      logger.warn('Notification panel channel not found', { 
+        component: 'BotManager',
+        channelId: panelChannelId 
+      });
+      return;
+    }
+
+    try {
+      const messages = await channel.messages.fetch({ limit: 20 });
+      const oldPanel = messages.find(m =>
+        m.author.id === this.client.user?.id &&
+        m.embeds.length > 0 &&
+        m.embeds[0]?.title === 'Notifications'
+      );
+      if (oldPanel) await oldPanel.delete().catch(() => {});
+    } catch {}
+
+    const embed = new EmbedBuilder()
+      .setColor(0x5865F2)
+      .setTitle('Notifications')
+      .setDescription('Click a button below to toggle your notification preferences')
+      .addFields(
+        { name: 'Giveaways', value: 'Receive notifications for new giveaways', inline: false },
+        { name: 'Scrims', value: 'Receive notifications for scrim announcements', inline: false },
+        { name: 'Events', value: 'Receive notifications for events (Squid Game, Gagaball, etc.)', inline: false },
+      )
+      .setTimestamp();
+
+    const row = new ActionRowBuilder<ButtonBuilder>()
+      .addComponents(
+        new ButtonBuilder()
+          .setCustomId('toggle_giveaway')
+          .setLabel('Giveaway')
+          .setStyle(ButtonStyle.Primary),
+        new ButtonBuilder()
+          .setCustomId('toggle_scrim')
+          .setLabel('Scrim')
+          .setStyle(ButtonStyle.Primary),
+        new ButtonBuilder()
+          .setCustomId('toggle_event')
+          .setLabel('Event')
+          .setStyle(ButtonStyle.Primary),
+      );
+
+    await channel.send({
+      embeds: [embed],
+      components: [row],
     });
-    return;
+
+    logger.info('Notification panel sent', { channelId: panelChannelId });
   }
-
-  try {
-    const messages = await channel.messages.fetch({ limit: 20 });
-    const oldPanel = messages.find(m =>
-      m.author.id === this.client.user?.id &&
-      m.embeds.length > 0 &&
-      m.embeds[0]?.title === 'Notifications'
-    );
-    if (oldPanel) await oldPanel.delete().catch(() => {});
-  } catch {}
-
-  const embed = new EmbedBuilder()
-    .setColor(0x5865F2)
-    .setTitle('Notifications')
-    .setDescription('Click the buttons below to toggle your notification preferences')
-    .addFields(
-      { name: 'Giveaways', value: 'Receive notifications for new giveaways', inline: false },
-      { name: 'Scrims', value: 'Receive notifications for scrim announcements', inline: false },
-      { name: 'Events', value: 'Receive notifications for events (Squid Game, Gagaball, etc.)', inline: false },
-    )
-    .setTimestamp();
-
-  const row = new ActionRowBuilder<ButtonBuilder>()
-    .addComponents(
-      new ButtonBuilder()
-        .setCustomId('toggle_giveaway')
-        .setLabel('Giveaway')
-        .setStyle(ButtonStyle.Primary),
-      new ButtonBuilder()
-        .setCustomId('toggle_scrim')
-        .setLabel('Scrim')
-        .setStyle(ButtonStyle.Primary),
-      new ButtonBuilder()
-        .setCustomId('toggle_event')
-        .setLabel('Event')
-        .setStyle(ButtonStyle.Primary),
-    );
-
-  await channel.send({
-    embeds: [embed],
-    components: [row],
-  });
-
-  logger.info('Notification panel sent', { channelId: panelChannelId });
-}
 
   private async handleNotificationToggle(interaction: ButtonInteraction, type: 'giveaways' | 'scrims' | 'events'): Promise<void> {
     await interaction.deferReply({ ephemeral: true });
@@ -752,37 +750,6 @@ export class BotManager {
     await interaction.editReply({
       content: `${typeLabel} notifications ${newState ? 'ENABLED' : 'DISABLED'} for you.`,
     });
-
-    // Update the panel buttons to show current state
-    if (interaction.message) {
-      await this.updateNotificationPanelButtons(interaction.message, userId);
-    }
-  }
-
-  private async updateNotificationPanelButtons(message: any, userId: string): Promise<void> {
-    const settings = await getUserNotificationSettings(userId);
-    
-    const row = new ActionRowBuilder<ButtonBuilder>()
-      .addComponents(
-        new ButtonBuilder()
-          .setCustomId('toggle_giveaway')
-          .setLabel(`Giveaway ${settings.giveaways ? 'ON' : 'OFF'}`)
-          .setStyle(settings.giveaways ? ButtonStyle.Success : ButtonStyle.Secondary),
-        new ButtonBuilder()
-          .setCustomId('toggle_scrim')
-          .setLabel(`Scrim ${settings.scrims ? 'ON' : 'OFF'}`)
-          .setStyle(settings.scrims ? ButtonStyle.Success : ButtonStyle.Secondary),
-        new ButtonBuilder()
-          .setCustomId('toggle_event')
-          .setLabel(`Event ${settings.events ? 'ON' : 'OFF'}`)
-          .setStyle(settings.events ? ButtonStyle.Success : ButtonStyle.Secondary),
-      );
-
-    try {
-      await message.edit({ components: [row] });
-    } catch {
-      // Message might be deleted or not editable
-    }
   }
 
   // -------------------------------------------------------------------------
