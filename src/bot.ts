@@ -402,7 +402,7 @@ async function requireOwner(interaction: ChatInputCommandInteraction<CacheType>)
 }
 
 // ============================================================================
-// Notification Settings Storage
+// PER-USER Notification Settings (replaces ping role panel)
 // ============================================================================
 
 interface UserNotificationSettings {
@@ -518,10 +518,9 @@ export class BotManager {
       await this.purgeAndUpdatePresence();
       this.cleanupInterval = setInterval(() => this.purgeAndUpdatePresence(), 60_000);
       await this.registerCommands();
-      await this.sendRolePanel();
+      await this.sendNotificationPanel(); // Panel 5 replaces Panel 6
       await this.sendLicensePanel();
       await this.sendPremiumPanel();
-      await this.sendNotificationPanel();
 
       await this.assignPremiumToExistingBoosters();
 
@@ -531,6 +530,7 @@ export class BotManager {
     // Interaction Handler
     this.client.on('interactionCreate', async (interaction: Interaction) => {
       if (interaction.isButton()) {
+        // Per-user notification toggles (replaces ping toggle)
         if (interaction.customId === 'toggle_giveaway') {
           await this.handleNotificationToggle(interaction, 'giveaways');
           return;
@@ -544,10 +544,7 @@ export class BotManager {
           return;
         }
 
-        if (interaction.customId === 'toggle_ping') {
-          await this.handlePingToggle(interaction);
-          return;
-        }
+        // REMOVED: toggle_ping handler (replaced by notification panel)
 
         if (interaction.customId === 'license_activate') {
           const channel = interaction.channel as TextChannel;
@@ -677,11 +674,11 @@ export class BotManager {
   }
 
   // -------------------------------------------------------------------------
-  // Notification Panel
+  // Notification Panel (PER-USER - replaces ping role panel)
   // -------------------------------------------------------------------------
 
   private async sendNotificationPanel(): Promise<void> {
-    const panelChannelId = '1535393352386609346';
+    const panelChannelId = process.env.PANEL_CHANNEL_ID || CONFIG.trackerChannelId;
     const channel = this.client.channels.cache.get(panelChannelId) as TextChannel | undefined;
     if (!channel) {
       logger.warn('Notification panel channel not found', { 
@@ -704,13 +701,13 @@ export class BotManager {
     const embed = new EmbedBuilder()
       .setColor(0x5865F2)
       .setTitle('Notifications')
-      .setDescription('Choose what notifications you want to enable')
+      .setDescription('Click the buttons below to toggle your notification preferences')
       .addFields(
         { name: 'Giveaways', value: 'Receive notifications for new giveaways', inline: false },
         { name: 'Scrims', value: 'Receive notifications for scrim announcements', inline: false },
         { name: 'Events', value: 'Receive notifications for events (Squid Game, Gagaball, etc.)', inline: false },
       )
-      .setFooter({ text: 'Click the buttons below to toggle notifications' })
+      .setFooter({ text: 'Changes only affect you' })
       .setTimestamp();
 
     const row = new ActionRowBuilder<ButtonBuilder>()
@@ -754,9 +751,10 @@ export class BotManager {
     }[type];
 
     await interaction.editReply({
-      content: `${typeLabel} notifications ${newState ? 'ENABLED' : 'DISABLED'}`,
+      content: `${typeLabel} notifications ${newState ? 'ENABLED' : 'DISABLED'} for you.`,
     });
 
+    // Update the panel buttons to show current state
     if (interaction.message) {
       await this.updateNotificationPanelButtons(interaction.message, userId);
     }
@@ -875,10 +873,20 @@ export class BotManager {
 
     const detectionTime = Date.now() - data.detectedAt;
 
-    // PING MENTION
-    const pingMention = process.env.PING_ROLE_ID
-      ? `<@&${process.env.PING_ROLE_ID}>`
-      : '@everyone';
+    // PING MENTION - Use specific role based on type
+    let pingMention = '@everyone';
+    if (data.type === 'scrim') {
+      const scrimRoleId = process.env.SCRIM_ROLE_ID;
+      if (scrimRoleId) {
+        pingMention = `<@&${scrimRoleId}>`;
+      }
+    } else {
+      // Events (squid_game, gagaball, etc.)
+      const eventRoleId = process.env.EVENT_ROLE_ID;
+      if (eventRoleId) {
+        pingMention = `<@&${eventRoleId}>`;
+      }
+    }
 
     const description = [
       `### Details`,
@@ -933,7 +941,6 @@ export class BotManager {
     );
 
     try {
-      // SEND WITH PING
       await channel.send({
         content: pingMention,
         embeds: [embed],
@@ -1709,32 +1716,6 @@ export class BotManager {
   }
 
   // -------------------------------------------------------------------------
-  // Role Panel (Ping Toggle)
-  // -------------------------------------------------------------------------
-  
-  private async sendRolePanel(): Promise<void> {
-  const panelChannelId = process.env.PANEL_CHANNEL_ID || CONFIG.trackerChannelId;
-  const channel = this.client.channels.cache.get(panelChannelId) as TextChannel | undefined;
-  if (!channel) return;
-  try {
-    const messages = await channel.messages.fetch({ limit: 20 });
-    const oldPanel = messages.find(m =>
-      m.author.id === this.client.user?.id &&
-      m.embeds.length > 0 &&
-      m.embeds[0]?.title === 'Giveaway Notifications'
-    );
-    if (oldPanel) await oldPanel.delete().catch(() => {});
-  } catch {}
-  const embed = new EmbedBuilder()
-    .setColor(0xF1C40F)
-    .setTitle('Giveaway Notifications')
-    .setDescription("Click the button to toggle giveaway pings.\nYou'll get mentioned whenever a new giveaway is detected.");
-  const row = new ActionRowBuilder<ButtonBuilder>()
-    .addComponents(new ButtonBuilder().setCustomId('toggle_ping').setLabel('Toggle Pings').setStyle(ButtonStyle.Primary));
-  await channel.send({ embeds: [embed], components: [row] });
-  }
-
-  // -------------------------------------------------------------------------
   // License Panel (Auto-sends on startup)
   // -------------------------------------------------------------------------
 
@@ -1939,36 +1920,6 @@ export class BotManager {
       logger.error('Failed to assign premium to existing boosters', {
         error: String(error),
       });
-    }
-  }
-
-  private async handlePingToggle(interaction: ButtonInteraction): Promise<void> {
-    const pingRoleId = process.env.PING_ROLE_ID;
-    if (!pingRoleId) {
-      await interaction.reply({ content: 'Ping role not configured.', ephemeral: true });
-      return;
-    }
-    const role = interaction.guild?.roles.cache.get(pingRoleId);
-    if (!role) {
-      await interaction.reply({ content: 'Role not found.', ephemeral: true });
-      return;
-    }
-    const member = interaction.member;
-    if (!member || !('roles' in member)) {
-      await interaction.reply({ content: 'Something went wrong.', ephemeral: true });
-      return;
-    }
-    const hasRole = (member.roles as any).cache?.has(role.id) ?? false;
-    try {
-      if (hasRole) {
-        await (member.roles as any).remove(role);
-        await interaction.reply({ content: 'Removed the role.', ephemeral: true });
-      } else {
-        await (member.roles as any).add(role);
-        await interaction.reply({ content: 'Added the role.', ephemeral: true });
-      }
-    } catch {
-      await interaction.reply({ content: 'Failed.', ephemeral: true });
     }
   }
 
