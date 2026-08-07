@@ -611,22 +611,54 @@ export class BotManager {
   }
 
   // -------------------------------------------------------------------------
-  // Scrim Notification
+  // Scrim Notification - Routes to appropriate channel
   // -------------------------------------------------------------------------
 
   /**
-   * Send a scrim/event notification to the tracker channel
+   * Send a scrim/event notification to the appropriate channel
+   * - Scrims go to SCRIM_CHANNEL_ID (or fallback to tracker channel)
+   * - Events (squid game, gagaball) go to EVENT_CHANNEL_ID (or fallback to tracker channel)
    */
   public async sendScrimNotification(data: any): Promise<boolean> {
-    const channel = this.client.channels.cache.get(CONFIG.trackerChannelId) as TextChannel | undefined;
-    if (!channel) {
-      logger.warn('Tracker channel not found for scrim notification', {
-        component: 'BotManager',
-        channelId: CONFIG.trackerChannelId,
-      });
-      return false;
+    // Determine which channel to send to based on type
+    let channelId: string;
+    let channelName: string;
+    
+    if (data.type === 'scrim') {
+      channelId = CONFIG.scrimChannelId || CONFIG.trackerChannelId;
+      channelName = 'Scrim';
+    } else {
+      // squid_game or gagaball
+      channelId = CONFIG.eventChannelId || CONFIG.trackerChannelId;
+      channelName = 'Event';
     }
+    
+    const channel = this.client.channels.cache.get(channelId) as TextChannel | undefined;
+    if (!channel) {
+      logger.warn(`${channelName} channel not found for notification`, {
+        component: 'BotManager',
+        channelId: channelId,
+        fallbackUsed: !CONFIG.scrimChannelId || !CONFIG.eventChannelId,
+      });
+      
+      // Try fallback to tracker channel
+      const fallbackChannel = this.client.channels.cache.get(CONFIG.trackerChannelId) as TextChannel | undefined;
+      if (!fallbackChannel) {
+        logger.error('No channel available for scrim notification', {
+          component: 'BotManager',
+        });
+        return false;
+      }
+      return this.sendScrimToChannel(data, fallbackChannel);
+    }
+    
+    return this.sendScrimToChannel(data, channel);
+  }
 
+  /**
+   * Send scrim notification to a specific channel
+   */
+  private async sendScrimToChannel(data: any, channel: TextChannel): Promise<boolean> {
     const typeLabel = {
       scrim: 'Scrim',
       squid_game: 'Squid Game',
@@ -1138,7 +1170,7 @@ export class BotManager {
     
     if (!matchedFilter && filter.length < 2) {
       await interaction.reply({ 
-        content: 'Invalid filter. Valid filters: scrim, squid, squid_game, gagaball, 2v2, 3v3, 4v5, 1v1, vrll, vrel, vucl', 
+        content: 'Invalid filter. Valid filters: scrim, squid, squid_game, gagaball, 2v2, 3v3, 4v4, 5v5, 1v1, vrll, vrel, vucl', 
         ephemeral: true 
       });
       return;
@@ -1329,7 +1361,7 @@ export class BotManager {
     const totalEver = await getTotalDetected();
     
     // Also get scrim stats
-    let scrimStats = null;
+    let scrimStats: Awaited<ReturnType<typeof getScrimStats>> | null = null;
     try {
       scrimStats = await getScrimStats();
     } catch {}
