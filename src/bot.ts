@@ -57,6 +57,10 @@ import {
   updateUserToken,
   updateUserWebhook,
   getAutoJoinEntriesCollection,
+  getScrimStats,
+  getActiveScrims,
+  getScrimsByType,
+  getScrimsByGuild,
 } from './database.js';
 import { KeyPanel } from './license/keyPanel.js';
 import { PremiumPanel } from './premium/premiumPanel.js';
@@ -428,6 +432,7 @@ export class BotManager {
 
     this.notifications = new NotificationService(this.client, this.metrics);
 
+    // Giveaway commands
     this.commands.set('stats', this.statsCommand.bind(this));
     this.commands.set('active', this.activeCommand.bind(this));
     this.commands.set('recent', this.recentCommand.bind(this));
@@ -438,7 +443,14 @@ export class BotManager {
     this.commands.set('help', this.helpCommand.bind(this));
     this.commands.set('panel', this.panelCommand.bind(this));
     this.commands.set('purge', this.purgeCommand.bind(this));
-    this.commands.set('watch', this.watchlistCommand.bind(this));
+    
+    // New: Giveaway Track command (renamed from watch)
+    this.commands.set('giveawaytrack', this.giveawayTrackCommand.bind(this));
+    
+    // New: Event Track command
+    this.commands.set('eventtrack', this.eventTrackCommand.bind(this));
+    
+    // License commands
     this.commands.set('licenseadmin', this.licenseAdminCommand.bind(this));
     this.commands.set('revoke', this.revokeCommand.bind(this));
 
@@ -596,6 +608,105 @@ export class BotManager {
     this.metrics.recordDetection(Date.now() - data.detectedAt);
     await this.updatePresence();
     return true;
+  }
+
+  // -------------------------------------------------------------------------
+  // Scrim Notification
+  // -------------------------------------------------------------------------
+
+  /**
+   * Send a scrim/event notification to the tracker channel
+   */
+  public async sendScrimNotification(data: any): Promise<boolean> {
+    const channel = this.client.channels.cache.get(CONFIG.trackerChannelId) as TextChannel | undefined;
+    if (!channel) {
+      logger.warn('Tracker channel not found for scrim notification', {
+        component: 'BotManager',
+        channelId: CONFIG.trackerChannelId,
+      });
+      return false;
+    }
+
+    const typeLabel = {
+      scrim: 'Scrim',
+      squid_game: 'Squid Game',
+      gagaball: 'Gagaball',
+    }[data.type];
+
+    const typeColor = {
+      scrim: 0x5865F2,
+      squid_game: 0xFF6B6B,
+      gagaball: 0x4ECDC4,
+    }[data.type];
+
+    const description = [
+      '### Details',
+      data.host ? `**Host:** ${data.host}` : '',
+      data.coHost ? `**Co-Host:** ${data.coHost}` : '',
+      data.time ? `**Time:** ${data.time}` : '',
+      data.teams ? `**Teams:** ${data.teams}` : '',
+      data.region ? `**Region:** ${data.region}` : '',
+      data.reward ? `**Reward:** ${data.reward}` : '',
+      data.ticks !== null ? `**Ticks:** ${data.ticks}+` : '',
+      '',
+      `**Server:** ${data.guildName}`,
+      `**Channel:** #${data.channelName}`,
+      '',
+      `[View Message](${data.messageUrl})`,
+    ].filter(Boolean).join('\n');
+
+    const embed = new EmbedBuilder()
+      .setAuthor({
+        name: `${typeLabel} Detected`,
+        iconURL: this.client.user?.displayAvatarURL(),
+      })
+      .setTitle(data.reward || `${typeLabel} Event`)
+      .setDescription(description)
+      .setColor(typeColor)
+      .setTimestamp(data.detectedAt)
+      .setFooter({
+        text: `Detected in ${Date.now() - data.detectedAt}ms`,
+        iconURL: this.client.user?.displayAvatarURL(),
+      });
+
+    if (data.guildIcon) {
+      embed.setThumbnail(data.guildIcon);
+    }
+
+    if (data.guildBanner) {
+      embed.setImage(data.guildBanner);
+    }
+
+    const row = new ActionRowBuilder<ButtonBuilder>()
+      .addComponents(
+        new ButtonBuilder()
+          .setLabel('View Message')
+          .setStyle(ButtonStyle.Link)
+          .setURL(data.messageUrl)
+      );
+
+    if (data.inviteUrl && data.inviteUrl.startsWith('http')) {
+      row.addComponents(
+        new ButtonBuilder()
+          .setLabel('Join Server')
+          .setStyle(ButtonStyle.Link)
+          .setURL(data.inviteUrl)
+      );
+    }
+
+    try {
+      await channel.send({
+        embeds: [embed],
+        components: [row],
+      });
+      return true;
+    } catch (error) {
+      logger.error('Failed to send scrim notification', {
+        component: 'BotManager',
+        error: formatError(error),
+      });
+      return false;
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -928,19 +1039,19 @@ export class BotManager {
   }
 
   // -------------------------------------------------------------------------
-  // Watchlist Commands
+  // GIVEAWAY TRACK COMMAND (renamed from watch)
   // -------------------------------------------------------------------------
 
-  private async watchlistCommand(interaction: ChatInputCommandInteraction<CacheType>) {
+  private async giveawayTrackCommand(interaction: ChatInputCommandInteraction<CacheType>) {
     const sub = interaction.options.getSubcommand();
 
-    if (sub === 'add') await this.watchAdd(interaction);
-    else if (sub === 'remove') await this.watchRemove(interaction);
-    else if (sub === 'list') await this.watchList(interaction);
-    else if (sub === 'clear') await this.watchClear(interaction);
+    if (sub === 'add') await this.giveawayAdd(interaction);
+    else if (sub === 'remove') await this.giveawayRemove(interaction);
+    else if (sub === 'list') await this.giveawayList(interaction);
+    else if (sub === 'clear') await this.giveawayClear(interaction);
   }
 
-  private async watchAdd(interaction: ChatInputCommandInteraction<CacheType>) {
+  private async giveawayAdd(interaction: ChatInputCommandInteraction<CacheType>) {
     const item = interaction.options.getString('item', true).trim().toLowerCase();
 
     if (item.length < 2 || item.length > 50) {
@@ -952,17 +1063,17 @@ export class BotManager {
     const items = await getItems(interaction.user.id);
 
     await interaction.reply({
-      content: `Watching **${item}**\n\nYour items:\n${items.map(i => `- ${i}`).join('\n')}`,
+      content: `Tracking giveaway item **${item}**\n\nYour items:\n${items.map(i => `- ${i}`).join('\n')}`,
       ephemeral: true
     });
   }
 
-  private async watchRemove(interaction: ChatInputCommandInteraction<CacheType>) {
+  private async giveawayRemove(interaction: ChatInputCommandInteraction<CacheType>) {
     const item = interaction.options.getString('item', true).trim().toLowerCase();
     const removed = await removeItem(interaction.user.id, item);
 
     if (!removed) {
-      await interaction.reply({ content: `"${item}" not in your watchlist.`, ephemeral: true });
+      await interaction.reply({ content: `"${item}" not in your tracked items.`, ephemeral: true });
       return;
     }
 
@@ -973,34 +1084,128 @@ export class BotManager {
     });
   }
 
-  private async watchList(interaction: ChatInputCommandInteraction<CacheType>) {
+  private async giveawayList(interaction: ChatInputCommandInteraction<CacheType>) {
     const items = await getItems(interaction.user.id);
 
     if (items.length === 0) {
       await interaction.reply({
-        content: 'No items. Use `/watch add <item>` to start tracking giveaways.',
+        content: 'No tracked items. Use `/giveawaytrack add <item>` to start tracking giveaways.',
         ephemeral: true
       });
       return;
     }
 
     await interaction.reply({
-      content: `**Your items (${items.length})**\n${items.map(i => `- ${i}`).join('\n')}`,
+      content: `**Your tracked giveaway items (${items.length})**\n${items.map(i => `- ${i}`).join('\n')}`,
       ephemeral: true
     });
   }
 
-  private async watchClear(interaction: ChatInputCommandInteraction<CacheType>) {
+  private async giveawayClear(interaction: ChatInputCommandInteraction<CacheType>) {
     const items = await getItems(interaction.user.id);
 
     if (items.length === 0) {
-      await interaction.reply({ content: 'Watchlist is empty.', ephemeral: true });
+      await interaction.reply({ content: 'Tracked items list is empty.', ephemeral: true });
       return;
     }
 
     await clearItems(interaction.user.id);
     await interaction.reply({
-      content: `Cleared ${items.length} items.`,
+      content: `Cleared ${items.length} tracked items.`,
+      ephemeral: true
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // EVENT TRACK COMMAND
+  // -------------------------------------------------------------------------
+
+  private async eventTrackCommand(interaction: ChatInputCommandInteraction<CacheType>) {
+    const sub = interaction.options.getSubcommand();
+
+    if (sub === 'add') await this.eventAdd(interaction);
+    else if (sub === 'remove') await this.eventRemove(interaction);
+    else if (sub === 'list') await this.eventList(interaction);
+    else if (sub === 'clear') await this.eventClear(interaction);
+  }
+
+  private async eventAdd(interaction: ChatInputCommandInteraction<CacheType>) {
+    const filter = interaction.options.getString('filter', true).trim().toLowerCase();
+
+    // Validate filter
+    const validFilters = ['scrim', 'squid', 'squid_game', 'gagaball', '2v2', '3v3', '4v4', '5v5', '1v1', 'vrll', 'vrel', 'vucl'];
+    const matchedFilter = validFilters.find(f => filter.includes(f));
+    
+    if (!matchedFilter && filter.length < 2) {
+      await interaction.reply({ 
+        content: 'Invalid filter. Valid filters: scrim, squid, squid_game, gagaball, 2v2, 3v3, 4v5, 1v1, vrll, vrel, vucl', 
+        ephemeral: true 
+      });
+      return;
+    }
+
+    // Use the same items collection but with a prefix for events
+    const eventItem = `event:${filter}`;
+    await addItem(interaction.user.id, eventItem);
+    const items = await getItems(interaction.user.id);
+    const eventItems = items.filter(i => i.startsWith('event:'));
+
+    await interaction.reply({
+      content: `Tracking event filter **${filter}**\n\nYour event filters:\n${eventItems.map(i => `- ${i.replace('event:', '')}`).join('\n')}`,
+      ephemeral: true
+    });
+  }
+
+  private async eventRemove(interaction: ChatInputCommandInteraction<CacheType>) {
+    const filter = interaction.options.getString('filter', true).trim().toLowerCase();
+    const eventItem = `event:${filter}`;
+    const removed = await removeItem(interaction.user.id, eventItem);
+
+    if (!removed) {
+      await interaction.reply({ content: `"${filter}" not in your event filters.`, ephemeral: true });
+      return;
+    }
+
+    const items = await getItems(interaction.user.id);
+    const eventItems = items.filter(i => i.startsWith('event:'));
+    await interaction.reply({
+      content: `Removed event filter **${filter}**\n\nYour event filters:\n${eventItems.map(i => `- ${i.replace('event:', '')}`).join('\n')}`,
+      ephemeral: true
+    });
+  }
+
+  private async eventList(interaction: ChatInputCommandInteraction<CacheType>) {
+    const items = await getItems(interaction.user.id);
+    const eventItems = items.filter(i => i.startsWith('event:'));
+
+    if (eventItems.length === 0) {
+      await interaction.reply({
+        content: 'No event filters. Use `/eventtrack add <filter>` to start tracking events.',
+        ephemeral: true
+      });
+      return;
+    }
+
+    await interaction.reply({
+      content: `**Your event filters (${eventItems.length})**\n${eventItems.map(i => `- ${i.replace('event:', '')}`).join('\n')}`,
+      ephemeral: true
+    });
+  }
+
+  private async eventClear(interaction: ChatInputCommandInteraction<CacheType>) {
+    const items = await getItems(interaction.user.id);
+    const eventItems = items.filter(i => i.startsWith('event:'));
+
+    if (eventItems.length === 0) {
+      await interaction.reply({ content: 'Event filters list is empty.', ephemeral: true });
+      return;
+    }
+
+    for (const item of eventItems) {
+      await removeItem(interaction.user.id, item);
+    }
+    await interaction.reply({
+      content: `Cleared ${eventItems.length} event filters.`,
       ephemeral: true
     });
   }
@@ -1122,16 +1327,34 @@ export class BotManager {
     await deferReply(interaction, false);
     const stats = await getStats();
     const totalEver = await getTotalDetected();
+    
+    // Also get scrim stats
+    let scrimStats = null;
+    try {
+      scrimStats = await getScrimStats();
+    } catch {}
+    
     const embed = new EmbedBuilder()
       .setColor(0x00AAFF)
       .setTitle('Tracker Stats')
       .addFields(
-        { name: 'Total Ever Tracked', value: String(totalEver), inline: true },
-        { name: 'Active Now', value: String(stats.activeGiveaways), inline: true },
+        { name: 'Total Giveaways Tracked', value: String(totalEver), inline: true },
+        { name: 'Active Giveaways', value: String(stats.activeGiveaways), inline: true },
         { name: 'Servers', value: String(stats.serversWithGiveaways), inline: true },
         { name: 'Last Detection', value: stats.lastDetected ? formatTimestamp(stats.lastDetected) : 'Never', inline: false },
-      )
-      .setTimestamp();
+      );
+    
+    if (scrimStats) {
+      embed.addFields(
+        { name: 'Total Events', value: String(scrimStats.total), inline: true },
+        { name: 'Active Events', value: String(scrimStats.active), inline: true },
+        { name: 'Scrims', value: String(scrimStats.byType.scrim), inline: true },
+        { name: 'Squid Games', value: String(scrimStats.byType.squid_game), inline: true },
+        { name: 'Gagaballs', value: String(scrimStats.byType.gagaball), inline: true },
+      );
+    }
+    
+    embed.setTimestamp();
     await interaction.editReply({ embeds: [embed] });
   }
 
@@ -1144,7 +1367,7 @@ export class BotManager {
     }
     const embed = new EmbedBuilder()
       .setColor(0xFFD700)
-      .setTitle(`${active.length} Active`)
+      .setTitle(`${active.length} Active Giveaways`)
       .setTimestamp();
     for (const g of active.slice(0, 10)) {
       const ends = g.endsAt ? `<t:${Math.floor(g.endsAt / 1000)}:R>` : 'Unknown';
@@ -1166,7 +1389,7 @@ export class BotManager {
     }
     const embed = new EmbedBuilder()
       .setColor(0x5865F2)
-      .setTitle('Recent')
+      .setTitle('Recent Giveaways')
       .setTimestamp();
     for (const g of recent) {
       embed.addFields({
@@ -1205,7 +1428,7 @@ export class BotManager {
       .setColor(0x00FF00)
       .setTitle('Running')
       .addFields(
-        { name: 'Total Ever', value: String(totalEver), inline: true },
+        { name: 'Total Giveaways', value: String(totalEver), inline: true },
         { name: 'Active', value: String(stats.activeGiveaways), inline: true },
         { name: 'Servers', value: String(stats.serversWithGiveaways), inline: true },
         { name: 'Channel', value: `<#${CONFIG.trackerChannelId}>`, inline: false },
@@ -1249,10 +1472,16 @@ export class BotManager {
         { name: '/revoke', value: 'Revoke premium from user (admin)', inline: false },
         { name: '/panel', value: 'Send license management panel (owner)', inline: false },
         { name: '/licenseadmin', value: 'Send admin license management panel (owner)', inline: false },
-        { name: '/watch add <item>', value: 'Track giveaway items', inline: false },
-        { name: '/watch remove <item>', value: 'Stop tracking item', inline: false },
-        { name: '/watch list', value: 'Show tracked items', inline: false },
-        { name: '/watch clear', value: 'Clear all items', inline: false },
+        { name: '', value: '────────────────────', inline: false },
+        { name: '/giveawaytrack add <item>', value: 'Track giveaway items', inline: false },
+        { name: '/giveawaytrack remove <item>', value: 'Stop tracking item', inline: false },
+        { name: '/giveawaytrack list', value: 'Show tracked items', inline: false },
+        { name: '/giveawaytrack clear', value: 'Clear all tracked items', inline: false },
+        { name: '', value: '────────────────────', inline: false },
+        { name: '/eventtrack add <filter>', value: 'Track events (scrim, squid, gagaball, 2v2, 3v3, vrll, etc.)', inline: false },
+        { name: '/eventtrack remove <filter>', value: 'Remove event filter', inline: false },
+        { name: '/eventtrack list', value: 'Show event filters', inline: false },
+        { name: '/eventtrack clear', value: 'Clear all event filters', inline: false },
         { name: '', value: '────────────────────', inline: false },
         { name: 'Premium Access', value: 'Click the "Activate Premium" button in the license panel', inline: false },
         { name: 'AutoJoiner', value: 'Click the "AutoJoiner" button in the premium panel', inline: false },
@@ -1628,12 +1857,13 @@ export class BotManager {
             .setRequired(true)
         )
         .setDefaultMemberPermissions(0),
+      // /giveawaytrack command (renamed from /watch)
       new SlashCommandBuilder()
-        .setName('watch')
-        .setDescription('Manage giveaway watchlist')
+        .setName('giveawaytrack')
+        .setDescription('Manage giveaway tracking')
         .addSubcommand(sub =>
           sub.setName('add')
-            .setDescription('Add an item to watch')
+            .setDescription('Add an item to track')
             .addStringOption(opt =>
               opt.setName('item')
                 .setDescription('Item to track (e.g., "VFA", "VSL")')
@@ -1644,7 +1874,7 @@ export class BotManager {
         )
         .addSubcommand(sub =>
           sub.setName('remove')
-            .setDescription('Remove an item from watchlist')
+            .setDescription('Remove an item from tracking')
             .addStringOption(opt =>
               opt.setName('item')
                 .setDescription('Item to remove')
@@ -1658,6 +1888,38 @@ export class BotManager {
         .addSubcommand(sub =>
           sub.setName('clear')
             .setDescription('Clear all tracked items')
+        ),
+      // /eventtrack command (NEW)
+      new SlashCommandBuilder()
+        .setName('eventtrack')
+        .setDescription('Manage event tracking (scrims, squid games, gagaball, etc.)')
+        .addSubcommand(sub =>
+          sub.setName('add')
+            .setDescription('Add an event filter')
+            .addStringOption(opt =>
+              opt.setName('filter')
+                .setDescription('Filter: scrim, squid, squid_game, gagaball, 2v2, 3v3, vrll, vrel, vucl')
+                .setRequired(true)
+                .setMinLength(2)
+                .setMaxLength(30)
+            )
+        )
+        .addSubcommand(sub =>
+          sub.setName('remove')
+            .setDescription('Remove an event filter')
+            .addStringOption(opt =>
+              opt.setName('filter')
+                .setDescription('Filter to remove')
+                .setRequired(true)
+            )
+        )
+        .addSubcommand(sub =>
+          sub.setName('list')
+            .setDescription('Show your event filters')
+        )
+        .addSubcommand(sub =>
+          sub.setName('clear')
+            .setDescription('Clear all event filters')
         ),
       new SlashCommandBuilder()
         .setName('panel')
