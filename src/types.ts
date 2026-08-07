@@ -55,6 +55,23 @@ export interface GiveawayData {
 }
 
 // ============================================================
+// Scrim/Event Notification Data
+// ============================================================
+
+export interface ScrimNotificationData extends GiveawayData {
+  type: 'scrim' | 'squid_game' | 'gagaball';
+  host: string | null;
+  coHost: string | null;
+  time: string | null;
+  reward: string | null;
+  teams: string | null;
+  region: string | null;
+  ticks: number | null;
+  rawContent: string;
+  messageUrl: string;
+}
+
+// ============================================================
 // Stats
 // ============================================================
 
