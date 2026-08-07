@@ -678,61 +678,60 @@ export class BotManager {
   // -------------------------------------------------------------------------
 
   private async sendNotificationPanel(): Promise<void> {
-    const panelChannelId = process.env.PANEL_CHANNEL_ID || CONFIG.trackerChannelId;
-    const channel = this.client.channels.cache.get(panelChannelId) as TextChannel | undefined;
-    if (!channel) {
-      logger.warn('Notification panel channel not found', { 
-        component: 'BotManager',
-        channelId: panelChannelId 
-      });
-      return;
-    }
-
-    try {
-      const messages = await channel.messages.fetch({ limit: 20 });
-      const oldPanel = messages.find(m =>
-        m.author.id === this.client.user?.id &&
-        m.embeds.length > 0 &&
-        m.embeds[0]?.title === 'Notifications'
-      );
-      if (oldPanel) await oldPanel.delete().catch(() => {});
-    } catch {}
-
-    const embed = new EmbedBuilder()
-      .setColor(0x5865F2)
-      .setTitle('Notifications')
-      .setDescription('Click the buttons below to toggle your notification preferences')
-      .addFields(
-        { name: 'Giveaways', value: 'Receive notifications for new giveaways', inline: false },
-        { name: 'Scrims', value: 'Receive notifications for scrim announcements', inline: false },
-        { name: 'Events', value: 'Receive notifications for events (Squid Game, Gagaball, etc.)', inline: false },
-      )
-      .setFooter({ text: 'Changes only affect you' })
-      .setTimestamp();
-
-    const row = new ActionRowBuilder<ButtonBuilder>()
-      .addComponents(
-        new ButtonBuilder()
-          .setCustomId('toggle_giveaway')
-          .setLabel('Giveaway')
-          .setStyle(ButtonStyle.Primary),
-        new ButtonBuilder()
-          .setCustomId('toggle_scrim')
-          .setLabel('Scrim')
-          .setStyle(ButtonStyle.Primary),
-        new ButtonBuilder()
-          .setCustomId('toggle_event')
-          .setLabel('Event')
-          .setStyle(ButtonStyle.Primary),
-      );
-
-    await channel.send({
-      embeds: [embed],
-      components: [row],
+  const panelChannelId = process.env.PANEL_CHANNEL_ID || CONFIG.trackerChannelId;
+  const channel = this.client.channels.cache.get(panelChannelId) as TextChannel | undefined;
+  if (!channel) {
+    logger.warn('Notification panel channel not found', { 
+      component: 'BotManager',
+      channelId: panelChannelId 
     });
-
-    logger.info('Notification panel sent', { channelId: panelChannelId });
+    return;
   }
+
+  try {
+    const messages = await channel.messages.fetch({ limit: 20 });
+    const oldPanel = messages.find(m =>
+      m.author.id === this.client.user?.id &&
+      m.embeds.length > 0 &&
+      m.embeds[0]?.title === 'Notifications'
+    );
+    if (oldPanel) await oldPanel.delete().catch(() => {});
+  } catch {}
+
+  const embed = new EmbedBuilder()
+    .setColor(0x5865F2)
+    .setTitle('Notifications')
+    .setDescription('Click the buttons below to toggle your notification preferences')
+    .addFields(
+      { name: 'Giveaways', value: 'Receive notifications for new giveaways', inline: false },
+      { name: 'Scrims', value: 'Receive notifications for scrim announcements', inline: false },
+      { name: 'Events', value: 'Receive notifications for events (Squid Game, Gagaball, etc.)', inline: false },
+    )
+    .setTimestamp();
+
+  const row = new ActionRowBuilder<ButtonBuilder>()
+    .addComponents(
+      new ButtonBuilder()
+        .setCustomId('toggle_giveaway')
+        .setLabel('Giveaway')
+        .setStyle(ButtonStyle.Primary),
+      new ButtonBuilder()
+        .setCustomId('toggle_scrim')
+        .setLabel('Scrim')
+        .setStyle(ButtonStyle.Primary),
+      new ButtonBuilder()
+        .setCustomId('toggle_event')
+        .setLabel('Event')
+        .setStyle(ButtonStyle.Primary),
+    );
+
+  await channel.send({
+    embeds: [embed],
+    components: [row],
+  });
+
+  logger.info('Notification panel sent', { channelId: panelChannelId });
+}
 
   private async handleNotificationToggle(interaction: ButtonInteraction, type: 'giveaways' | 'scrims' | 'events'): Promise<void> {
     await interaction.deferReply({ ephemeral: true });
