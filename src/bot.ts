@@ -732,25 +732,60 @@ export class BotManager {
   }
 
   private async handleNotificationToggle(interaction: ButtonInteraction, type: 'giveaways' | 'scrims' | 'events'): Promise<void> {
-    await interaction.deferReply({ ephemeral: true });
+  await interaction.deferReply({ ephemeral: true });
 
-    const userId = interaction.user.id;
-    const settings = await getUserNotificationSettings(userId);
-    const currentState = settings[type];
-    const newState = !currentState;
+  const userId = interaction.user.id;
+  const settings = await getUserNotificationSettings(userId);
+  const currentState = settings[type];
+  const newState = !currentState;
 
-    await updateUserNotificationSetting(userId, type, newState);
+  await updateUserNotificationSetting(userId, type, newState);
 
-    const typeLabel = {
-      giveaways: 'Giveaway',
-      scrims: 'Scrim',
-      events: 'Event',
-    }[type];
+  // Get the role ID based on type
+  let roleId: string | undefined;
+  const typeLabel = {
+    giveaways: 'Giveaway',
+    scrims: 'Scrim',
+    events: 'Event',
+  }[type];
 
-    await interaction.editReply({
-      content: `${typeLabel} notifications ${newState ? 'ENABLED' : 'DISABLED'} for you.`,
-    });
+  if (type === 'giveaways') {
+    roleId = process.env.PING_ROLE_ID; // 1525266999465213962
+  } else if (type === 'scrims') {
+    roleId = process.env.SCRIM_ROLE_ID; // 1535393352386609346
+  } else if (type === 'events') {
+    roleId = process.env.EVENT_ROLE_ID; // 1535393470552870932
   }
+
+  // Add or remove the role
+  if (roleId && interaction.guild) {
+    try {
+      const member = await interaction.guild.members.fetch(userId);
+      const role = interaction.guild.roles.cache.get(roleId);
+      
+      if (role) {
+        if (newState) {
+          await member.roles.add(role);
+          logger.debug(`Added ${type} role to user ${userId}`);
+        } else {
+          await member.roles.remove(role);
+          logger.debug(`Removed ${type} role from user ${userId}`);
+        }
+      } else {
+        logger.warn(`Role not found for ${type}: ${roleId}`);
+      }
+    } catch (error) {
+      logger.error(`Failed to ${newState ? 'add' : 'remove'} role for ${type}`, {
+        userId,
+        error: String(error),
+      });
+    }
+  }
+
+  await interaction.editReply({
+    content: `${typeLabel} notifications ${newState ? 'ENABLED ✅' : 'DISABLED ❌'} for you. ${newState ? 'You will be pinged!' : 'You will not be pinged.'}`,
+  });
+}
 
   // -------------------------------------------------------------------------
   // Scrim Notification - Routes to appropriate channel with ping
