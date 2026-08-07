@@ -1,6 +1,6 @@
 /**
  * @module bot
- * Production bot – notification queue, retries, metrics, event‑driven.
+ * Production bot - notification queue, retries, metrics, event-driven.
  */
 
 import {
@@ -757,7 +757,6 @@ export class BotManager {
       content: `${typeLabel} notifications ${newState ? 'ENABLED' : 'DISABLED'}`,
     });
 
-    // Update the panel buttons
     if (interaction.message) {
       await this.updateNotificationPanelButtons(interaction.message, userId);
     }
@@ -790,7 +789,7 @@ export class BotManager {
   }
 
   // -------------------------------------------------------------------------
-  // Scrim Notification - Routes to appropriate channel
+  // Scrim Notification - Routes to appropriate channel with ping
   // -------------------------------------------------------------------------
 
   public async sendScrimNotification(data: any): Promise<boolean> {
@@ -876,6 +875,11 @@ export class BotManager {
 
     const detectionTime = Date.now() - data.detectedAt;
 
+    // PING MENTION
+    const pingMention = process.env.PING_ROLE_ID
+      ? `<@&${process.env.PING_ROLE_ID}>`
+      : '@everyone';
+
     const description = [
       `### Details`,
       `**Server:** ${guildName}`,
@@ -929,7 +933,9 @@ export class BotManager {
     );
 
     try {
+      // SEND WITH PING
       await channel.send({
+        content: pingMention,
         embeds: [embed],
         components: [row],
       });
@@ -1722,7 +1728,7 @@ export class BotManager {
     const embed = new EmbedBuilder()
       .setColor(0xF1C40F)
       .setTitle('Giveaway Notifications')
-      .setDescription('Click the button to toggle giveaway pings.\nYou\'ll get mentioned whenever a new giveaway is detected.')
+      .setDescription('Click the button to toggle giveaway pings.\nYou'll get mentioned whenever a new giveaway is detected.')
       .setFooter({ text: 'Toggle anytime' });
     const row = new ActionRowBuilder<ButtonBuilder>()
       .addComponents(new ButtonBuilder().setCustomId('toggle_ping').setLabel('Toggle Pings').setStyle(ButtonStyle.Primary));
