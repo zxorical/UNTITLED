@@ -20,6 +20,8 @@
  * 15. ADDED: Time parsing and Discord timestamp formatting for scrim/event times
  * 16. FIXED: Webhook detection to block other giveaway tracker webhooks
  * 17. FIXED: Smart bot filter to allow official giveaway bot but block other bots
+ * 18. FIXED: Detection time now uses message.createdTimestamp for accurate timing
+ * 19. FIXED: Better own notification detection to prevent self-detection loops
  */
 
 import { Client, Message, TextChannel } from 'discord.js-selfbot-v13';
@@ -883,15 +885,43 @@ function extractScrimTicks(text: string): number | null {
 
 function isOwnNotification(message: Message): boolean {
   const content = message.content || '';
-  if (content.includes('Scrim Detected') || content.includes('Event Detected') || content.includes('Giveaway')) {
+  
+  // Check for our notification titles
+  if (content.includes('Scrim Detected') || 
+      content.includes('Event Detected') || 
+      content.includes('Squid Game Detected') ||
+      content.includes('Gagaball Detected') ||
+      content.includes('New Giveaway')) {
     return true;
   }
   
   const embed = message.embeds?.[0];
   if (embed) {
+    // Our notification colors
     const botColors = [0x5865F2, 0xFF6B6B, 0x4ECDC4, 0x00AAFF, 0xFFD700];
+    
+    // Check color
     if (embed.color !== null && botColors.includes(embed.color)) {
-      if (embed.footer?.text?.includes('Detected in')) {
+      // Check footer - our notifications have "Detected in Xms"
+      if (embed.footer?.text && 
+          embed.footer.text.includes('Detected in') && 
+          embed.footer.text.includes('ms')) {
+        return true;
+      }
+      
+      // Check author - our notifications have "Scrim Detected" etc.
+      if (embed.author?.name && 
+          (embed.author.name.includes('Detected') || 
+           embed.author.name.includes('Giveaway'))) {
+        return true;
+      }
+    }
+    
+    // Check description for our patterns
+    if (embed.description) {
+      const desc = embed.description.toLowerCase();
+      if (desc.includes('server:') && 
+          (desc.includes('view message') || desc.includes('join server'))) {
         return true;
       }
     }
@@ -1072,13 +1102,10 @@ function quickReject(message: Message, selfUserId: string, now: number): string 
   // Skip if it's the bot's own notification
   if (isOwnNotification(message)) return 'self_notification';
 
-  // ─── WEBHOOK DETECTION (block all webhook messages) ───
+  // ─── BLOCK ALL WEBHOOK MESSAGES ───
+  // Webhooks are almost always automated messages from other bots/trackers
+  // We want to block ALL webhooks to prevent detecting other trackers
   if (message.webhookId) {
-    // Check if it looks like a giveaway tracker webhook
-    if (isTrackerMessage(message)) {
-      return 'webhook_tracker';
-    }
-    // If it's a webhook and we're not sure, block it anyway to be safe
     return 'webhook_blocked';
   }
 
@@ -1088,11 +1115,7 @@ function quickReject(message: Message, selfUserId: string, now: number): string 
     if (ALLOWED_GIVEAWAY_BOT_IDS.has(message.author.id)) {
       // Allow this bot - it's the real giveaway bot
     } else {
-      // BLOCK: Other bot messages (like Jimbo's tracker, other trackers)
-      if (isTrackerMessage(message)) {
-        return 'other_tracker_bot';
-      }
-      // Block any other bot that's not the official giveaway bot
+      // BLOCK: All other bots
       return 'not_allowed_bot';
     }
   }
@@ -1344,7 +1367,8 @@ export class GiveawayManager extends EventEmitter {
   ): Promise<void> {
     if (!this.botManager) return;
 
-    const now = Date.now();
+    // Use the message creation timestamp for accurate detection time
+    const detectionTime = message.createdTimestamp;
     const guild = message.guild!;
     const guildIcon = guild.iconURL({ size: 512 }) || null;
     const guildBanner = (guild as any).bannerURL?.({ size: 1024 }) || null;
@@ -1387,11 +1411,11 @@ export class GiveawayManager extends EventEmitter {
         channelName: (message.channel as any).name || 'unknown',
         authorId: message.author?.id || '',
         prize: scrimResult.reward || `${typeLabel} Event`,
-        detectedAt: now,
+        detectedAt: detectionTime,  // Use message creation timestamp for accurate detection time
         endsAt: null,
         status: 'active',
         notifiedAt: null,
-        lastSeenAt: now,
+        lastSeenAt: detectionTime,
         inviteUrl,
         guildIcon,
         guildBanner,
@@ -1519,7 +1543,8 @@ export class GiveawayManager extends EventEmitter {
           guildId: guild.id, guildName: guild.name,
           channelName: (message.channel as any).name || 'unknown',
           authorId: parsed.botId, prize: parsed.prize,
-          detectedAt: now, endsAt: parsed.timestamps.end,
+          detectedAt: message.createdTimestamp,  // Use message creation timestamp for accurate detection time
+          endsAt: parsed.timestamps.end,
           detectionTimeMs: gatewayLatency,
           guildIcon, guildBanner, memberCount,
         };
