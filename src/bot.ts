@@ -402,6 +402,59 @@ async function requireOwner(interaction: ChatInputCommandInteraction<CacheType>)
 }
 
 // ============================================================================
+// Notification Settings Storage
+// ============================================================================
+
+interface UserNotificationSettings {
+  giveaways: boolean;
+  scrims: boolean;
+  events: boolean;
+}
+
+const notificationSettingsCache = new Map<string, UserNotificationSettings>();
+
+function getDefaultSettings(): UserNotificationSettings {
+  return {
+    giveaways: true,
+    scrims: true,
+    events: true,
+  };
+}
+
+async function getUserNotificationSettings(userId: string): Promise<UserNotificationSettings> {
+  const cached = notificationSettingsCache.get(userId);
+  if (cached) return cached;
+  
+  const items = await getItems(userId);
+  const settings: UserNotificationSettings = {
+    giveaways: true,
+    scrims: true,
+    events: true,
+  };
+  
+  if (items.includes('notif:giveaways:off')) settings.giveaways = false;
+  if (items.includes('notif:scrims:off')) settings.scrims = false;
+  if (items.includes('notif:events:off')) settings.events = false;
+  
+  notificationSettingsCache.set(userId, settings);
+  return settings;
+}
+
+async function updateUserNotificationSetting(userId: string, type: 'giveaways' | 'scrims' | 'events', enabled: boolean): Promise<void> {
+  const settings = await getUserNotificationSettings(userId);
+  settings[type] = enabled;
+  notificationSettingsCache.set(userId, settings);
+  
+  const keyOff = `notif:${type}:off`;
+  
+  if (enabled) {
+    await removeItem(userId, keyOff);
+  } else {
+    await addItem(userId, keyOff);
+  }
+}
+
+// ============================================================================
 // BotManager
 // ============================================================================
 
@@ -441,13 +494,12 @@ export class BotManager {
     this.commands.set('status', this.statusCommand.bind(this));
     this.commands.set('metrics', this.metricsCommand.bind(this));
     this.commands.set('help', this.helpCommand.bind(this));
-    this.commands.set('panel', this.panelCommand.bind(this));
     this.commands.set('purge', this.purgeCommand.bind(this));
     
-    // New: Giveaway Track command (renamed from watch)
+    // Giveaway Track command
     this.commands.set('giveawaytrack', this.giveawayTrackCommand.bind(this));
     
-    // New: Event Track command
+    // Event Track command
     this.commands.set('eventtrack', this.eventTrackCommand.bind(this));
     
     // License commands
@@ -469,6 +521,7 @@ export class BotManager {
       await this.sendRolePanel();
       await this.sendLicensePanel();
       await this.sendPremiumPanel();
+      await this.sendNotificationPanel();
 
       await this.assignPremiumToExistingBoosters();
 
@@ -478,6 +531,19 @@ export class BotManager {
     // Interaction Handler
     this.client.on('interactionCreate', async (interaction: Interaction) => {
       if (interaction.isButton()) {
+        if (interaction.customId === 'toggle_giveaway') {
+          await this.handleNotificationToggle(interaction, 'giveaways');
+          return;
+        }
+        if (interaction.customId === 'toggle_scrim') {
+          await this.handleNotificationToggle(interaction, 'scrims');
+          return;
+        }
+        if (interaction.customId === 'toggle_event') {
+          await this.handleNotificationToggle(interaction, 'events');
+          return;
+        }
+
         if (interaction.customId === 'toggle_ping') {
           await this.handlePingToggle(interaction);
           return;
@@ -611,16 +677,123 @@ export class BotManager {
   }
 
   // -------------------------------------------------------------------------
+  // Notification Panel
+  // -------------------------------------------------------------------------
+
+  private async sendNotificationPanel(): Promise<void> {
+    const panelChannelId = '1535393352386609346';
+    const channel = this.client.channels.cache.get(panelChannelId) as TextChannel | undefined;
+    if (!channel) {
+      logger.warn('Notification panel channel not found', { 
+        component: 'BotManager',
+        channelId: panelChannelId 
+      });
+      return;
+    }
+
+    try {
+      const messages = await channel.messages.fetch({ limit: 20 });
+      const oldPanel = messages.find(m =>
+        m.author.id === this.client.user?.id &&
+        m.embeds.length > 0 &&
+        m.embeds[0]?.title === 'Notifications'
+      );
+      if (oldPanel) await oldPanel.delete().catch(() => {});
+    } catch {}
+
+    const embed = new EmbedBuilder()
+      .setColor(0x5865F2)
+      .setTitle('Notifications')
+      .setDescription('Choose what notifications you want to enable')
+      .addFields(
+        { name: 'Giveaways', value: 'Receive notifications for new giveaways', inline: false },
+        { name: 'Scrims', value: 'Receive notifications for scrim announcements', inline: false },
+        { name: 'Events', value: 'Receive notifications for events (Squid Game, Gagaball, etc.)', inline: false },
+      )
+      .setFooter({ text: 'Click the buttons below to toggle notifications' })
+      .setTimestamp();
+
+    const row = new ActionRowBuilder<ButtonBuilder>()
+      .addComponents(
+        new ButtonBuilder()
+          .setCustomId('toggle_giveaway')
+          .setLabel('Giveaway')
+          .setStyle(ButtonStyle.Primary),
+        new ButtonBuilder()
+          .setCustomId('toggle_scrim')
+          .setLabel('Scrim')
+          .setStyle(ButtonStyle.Primary),
+        new ButtonBuilder()
+          .setCustomId('toggle_event')
+          .setLabel('Event')
+          .setStyle(ButtonStyle.Primary),
+      );
+
+    await channel.send({
+      embeds: [embed],
+      components: [row],
+    });
+
+    logger.info('Notification panel sent', { channelId: panelChannelId });
+  }
+
+  private async handleNotificationToggle(interaction: ButtonInteraction, type: 'giveaways' | 'scrims' | 'events'): Promise<void> {
+    await interaction.deferReply({ ephemeral: true });
+
+    const userId = interaction.user.id;
+    const settings = await getUserNotificationSettings(userId);
+    const currentState = settings[type];
+    const newState = !currentState;
+
+    await updateUserNotificationSetting(userId, type, newState);
+
+    const typeLabel = {
+      giveaways: 'Giveaway',
+      scrims: 'Scrim',
+      events: 'Event',
+    }[type];
+
+    await interaction.editReply({
+      content: `${typeLabel} notifications ${newState ? 'ENABLED' : 'DISABLED'}`,
+    });
+
+    // Update the panel buttons
+    if (interaction.message) {
+      await this.updateNotificationPanelButtons(interaction.message, userId);
+    }
+  }
+
+  private async updateNotificationPanelButtons(message: any, userId: string): Promise<void> {
+    const settings = await getUserNotificationSettings(userId);
+    
+    const row = new ActionRowBuilder<ButtonBuilder>()
+      .addComponents(
+        new ButtonBuilder()
+          .setCustomId('toggle_giveaway')
+          .setLabel(`Giveaway ${settings.giveaways ? 'ON' : 'OFF'}`)
+          .setStyle(settings.giveaways ? ButtonStyle.Success : ButtonStyle.Secondary),
+        new ButtonBuilder()
+          .setCustomId('toggle_scrim')
+          .setLabel(`Scrim ${settings.scrims ? 'ON' : 'OFF'}`)
+          .setStyle(settings.scrims ? ButtonStyle.Success : ButtonStyle.Secondary),
+        new ButtonBuilder()
+          .setCustomId('toggle_event')
+          .setLabel(`Event ${settings.events ? 'ON' : 'OFF'}`)
+          .setStyle(settings.events ? ButtonStyle.Success : ButtonStyle.Secondary),
+      );
+
+    try {
+      await message.edit({ components: [row] });
+    } catch {
+      // Message might be deleted or not editable
+    }
+  }
+
+  // -------------------------------------------------------------------------
   // Scrim Notification - Routes to appropriate channel
   // -------------------------------------------------------------------------
 
-  /**
-   * Send a scrim/event notification to the appropriate channel
-   * - Scrims go to SCRIM_CHANNEL_ID (or fallback to tracker channel)
-   * - Events (squid game, gagaball) go to EVENT_CHANNEL_ID (or fallback to tracker channel)
-   */
   public async sendScrimNotification(data: any): Promise<boolean> {
-    // Determine which channel to send to based on type
     let channelId: string;
     let channelName: string;
     
@@ -628,7 +801,6 @@ export class BotManager {
       channelId = CONFIG.scrimChannelId || CONFIG.trackerChannelId;
       channelName = 'Scrim';
     } else {
-      // squid_game or gagaball
       channelId = CONFIG.eventChannelId || CONFIG.trackerChannelId;
       channelName = 'Event';
     }
@@ -638,10 +810,8 @@ export class BotManager {
       logger.warn(`${channelName} channel not found for notification`, {
         component: 'BotManager',
         channelId: channelId,
-        fallbackUsed: !CONFIG.scrimChannelId || !CONFIG.eventChannelId,
       });
       
-      // Try fallback to tracker channel
       const fallbackChannel = this.client.channels.cache.get(CONFIG.trackerChannelId) as TextChannel | undefined;
       if (!fallbackChannel) {
         logger.error('No channel available for scrim notification', {
@@ -655,9 +825,6 @@ export class BotManager {
     return this.sendScrimToChannel(data, channel);
   }
 
-  /**
-   * Send scrim notification to a specific channel
-   */
   private async sendScrimToChannel(data: any, channel: TextChannel): Promise<boolean> {
     const typeLabel = {
       scrim: 'Scrim',
@@ -671,8 +838,48 @@ export class BotManager {
       gagaball: 0x4ECDC4,
     }[data.type];
 
+    const guild = this.client.guilds.cache.get(data.guildId);
+    const guildName = guild?.name || data.guildName || 'Unknown';
+    const guildIcon = data.guildIcon || guild?.iconURL({ size: 512 }) || null;
+    const guildBanner = data.guildBanner || guild?.bannerURL({ size: 1024 }) || null;
+    const memberCount = data.memberCount || guild?.memberCount ?? null;
+    
+    let inviteUrl = data.inviteUrl || 'No invite available';
+    
+    if (inviteUrl === 'No invite available' && data.guildId) {
+      try {
+        const guild = this.client.guilds.cache.get(data.guildId);
+        if (guild) {
+          const invites = await guild.invites.fetch().catch(() => new Collection<string, Invite>());
+          const existingInvite = invites.find((inv: Invite) => inv.channelId === data.channelId && inv.maxUses === 0);
+          if (existingInvite) {
+            inviteUrl = existingInvite.url;
+          } else {
+            const channel = guild.channels.cache.get(data.channelId);
+            if (channel && channel.isTextBased() && 'createInvite' in channel) {
+              const perms = channel.permissionsFor(this.client.user?.id || '');
+              if (perms?.has('CreateInstantInvite')) {
+                const newInvite = await channel.createInvite({
+                  maxAge: 86400,
+                  maxUses: 0,
+                  reason: 'Scrim notification'
+                });
+                inviteUrl = newInvite.url;
+              }
+            }
+          }
+        }
+      } catch (err) {
+        logger.debug(`Could not generate invite for scrim notification: ${formatError(err)}`);
+      }
+    }
+
+    const detectionTime = Date.now() - data.detectedAt;
+
     const description = [
-      '### Details',
+      `### Details`,
+      `**Server:** ${guildName}`,
+      `**Channel:** #${data.channelName}`,
       data.host ? `**Host:** ${data.host}` : '',
       data.coHost ? `**Co-Host:** ${data.coHost}` : '',
       data.time ? `**Time:** ${data.time}` : '',
@@ -680,51 +887,46 @@ export class BotManager {
       data.region ? `**Region:** ${data.region}` : '',
       data.reward ? `**Reward:** ${data.reward}` : '',
       data.ticks !== null ? `**Ticks:** ${data.ticks}+` : '',
-      '',
-      `**Server:** ${data.guildName}`,
-      `**Channel:** #${data.channelName}`,
-      '',
-      `[View Message](${data.messageUrl})`,
+      ``,
+      `### Time`,
+      `**Detected:** <t:${Math.floor(data.detectedAt / 1000)}:R>`,
+      ``,
+      `### Links`,
+      `**Invite:** ${inviteUrl}`,
+      memberCount ? `**Members:** ${memberCount.toLocaleString()}` : '',
     ].filter(Boolean).join('\n');
 
     const embed = new EmbedBuilder()
-      .setAuthor({
-        name: `${typeLabel} Detected`,
-        iconURL: this.client.user?.displayAvatarURL(),
+      .setAuthor({ 
+        name: `${typeLabel} Detected`, 
+        iconURL: this.client.user?.displayAvatarURL() 
       })
       .setTitle(data.reward || `${typeLabel} Event`)
       .setDescription(description)
       .setColor(typeColor)
-      .setTimestamp(data.detectedAt)
-      .setFooter({
-        text: `Detected in ${Date.now() - data.detectedAt}ms`,
-        iconURL: this.client.user?.displayAvatarURL(),
-      });
+      .setTimestamp(data.detectedAt);
 
-    if (data.guildIcon) {
-      embed.setThumbnail(data.guildIcon);
+    if (guildIcon) {
+      embed.setThumbnail(guildIcon);
     }
 
-    if (data.guildBanner) {
-      embed.setImage(data.guildBanner);
+    if (guildBanner) {
+      embed.setImage(guildBanner);
     }
 
-    const row = new ActionRowBuilder<ButtonBuilder>()
-      .addComponents(
-        new ButtonBuilder()
-          .setLabel('View Message')
-          .setStyle(ButtonStyle.Link)
-          .setURL(data.messageUrl)
-      );
+    embed.setFooter({ 
+      text: `Detected in ${detectionTime}ms`, 
+      iconURL: this.client.user?.displayAvatarURL() 
+    });
 
-    if (data.inviteUrl && data.inviteUrl.startsWith('http')) {
-      row.addComponents(
-        new ButtonBuilder()
-          .setLabel('Join Server')
-          .setStyle(ButtonStyle.Link)
-          .setURL(data.inviteUrl)
-      );
+    const messageUrl = `https://discord.com/channels/${data.guildId}/${data.channelId}/${data.messageId}`;
+    const row = new ActionRowBuilder<ButtonBuilder>();
+    if (inviteUrl.startsWith('http')) {
+      row.addComponents(new ButtonBuilder().setLabel('Join Server').setStyle(ButtonStyle.Link).setURL(inviteUrl));
     }
+    row.addComponents(
+      new ButtonBuilder().setLabel('Message').setStyle(ButtonStyle.Link).setURL(messageUrl),
+    );
 
     try {
       await channel.send({
@@ -745,24 +947,11 @@ export class BotManager {
   // DELETE ALL PREMIUM DATA - COMPLETE IMPLEMENTATION
   // -------------------------------------------------------------------------
 
-  /**
-   * Delete ALL premium-related data for a user
-   * This includes: premium status, tokens, webhooks, booster status, and auto-join entries
-   */
   private async deleteAllPremiumData(userId: string, guildId: string): Promise<void> {
-    // 1. Remove from premium_users (sets isPremium: false)
     await removePremiumUser(userId, guildId);
-
-    // 2. Remove from booster_premium
     await removeBoosterPremium(userId, guildId);
-
-    // 3. Clear token (set to null/empty)
     await updateUserToken(userId, guildId, '', '');
-
-    // 4. Clear webhook (set to null/empty)
     await updateUserWebhook(userId, guildId, '');
-
-    // 5. Delete all auto-join entries for this user
     try {
       const autoJoinCol = await getAutoJoinEntriesCollection();
       await autoJoinCol.deleteMany({ userId });
@@ -772,23 +961,18 @@ export class BotManager {
         error: String(error),
       });
     }
-
-    // 6. Clear any session cache
     try {
       const { stopTokenSession } = await import('./premium/tokenManager.js');
       stopTokenSession(userId, guildId);
     } catch {}
-
-    // 7. Clear premium cache in license middleware
     try {
       clearPremiumCache(userId);
     } catch {}
-
     logger.debug('All premium data deleted for user', { userId, guildId });
   }
 
   // -------------------------------------------------------------------------
-  // Premium Role Verification (Security)
+  // Premium Role Verification
   // -------------------------------------------------------------------------
 
   private async verifyAllPremiumRoles(): Promise<void> {
@@ -1071,7 +1255,7 @@ export class BotManager {
   }
 
   // -------------------------------------------------------------------------
-  // GIVEAWAY TRACK COMMAND (renamed from watch)
+  // GIVEAWAY TRACK COMMAND
   // -------------------------------------------------------------------------
 
   private async giveawayTrackCommand(interaction: ChatInputCommandInteraction<CacheType>) {
@@ -1164,7 +1348,6 @@ export class BotManager {
   private async eventAdd(interaction: ChatInputCommandInteraction<CacheType>) {
     const filter = interaction.options.getString('filter', true).trim().toLowerCase();
 
-    // Validate filter
     const validFilters = ['scrim', 'squid', 'squid_game', 'gagaball', '2v2', '3v3', '4v4', '5v5', '1v1', 'vrll', 'vrel', 'vucl'];
     const matchedFilter = validFilters.find(f => filter.includes(f));
     
@@ -1176,7 +1359,6 @@ export class BotManager {
       return;
     }
 
-    // Use the same items collection but with a prefix for events
     const eventItem = `event:${filter}`;
     await addItem(interaction.user.id, eventItem);
     const items = await getItems(interaction.user.id);
@@ -1246,26 +1428,6 @@ export class BotManager {
   // License Commands
   // -------------------------------------------------------------------------
 
-  private async panelCommand(interaction: ChatInputCommandInteraction<CacheType>) {
-    if (!await requireOwner(interaction)) return;
-
-    const channel = interaction.channel as TextChannel;
-    if (!channel) {
-      await interaction.reply({ 
-        content: 'This command must be used in a channel.', 
-        ephemeral: true 
-      });
-      return;
-    }
-
-    await interaction.deferReply({ ephemeral: true });
-
-    const panel = new KeyPanel(channel);
-    await panel.sendPanel();
-
-    await interaction.editReply({ content: 'License management panel sent to this channel.' });
-  }
-
   private async licenseAdminCommand(interaction: ChatInputCommandInteraction<CacheType>) {
     if (!await requireOwner(interaction)) return;
 
@@ -1308,10 +1470,8 @@ export class BotManager {
       const premiumUser = await getPremiumUser(user.id, guildId);
       const source = premiumUser?.source || 'unknown';
 
-      // Delete ALL premium data
       await this.deleteAllPremiumData(user.id, guildId);
 
-      // Remove Discord role
       try {
         const guild = await this.client.guilds.fetch(guildId);
         const member = await guild.members.fetch(user.id).catch(() => null);
@@ -1336,7 +1496,7 @@ export class BotManager {
       });
 
       await interaction.editReply({
-        content: `✅ Successfully revoked premium from <@${user.id}>. All associated data (tokens, webhooks, auto-join entries) has been deleted.`,
+        content: `Successfully revoked premium from <@${user.id}>. All associated data has been deleted.`,
       });
 
     } catch (error) {
@@ -1360,7 +1520,6 @@ export class BotManager {
     const stats = await getStats();
     const totalEver = await getTotalDetected();
     
-    // Also get scrim stats
     let scrimStats: Awaited<ReturnType<typeof getScrimStats>> | null = null;
     try {
       scrimStats = await getScrimStats();
@@ -1502,7 +1661,6 @@ export class BotManager {
         { name: '/setchannel', value: 'Set notify channel (admin)', inline: false },
         { name: '/reset', value: 'Clear database (admin)', inline: false },
         { name: '/revoke', value: 'Revoke premium from user (admin)', inline: false },
-        { name: '/panel', value: 'Send license management panel (owner)', inline: false },
         { name: '/licenseadmin', value: 'Send admin license management panel (owner)', inline: false },
         { name: '', value: '────────────────────', inline: false },
         { name: '/giveawaytrack add <item>', value: 'Track giveaway items', inline: false },
@@ -1669,7 +1827,6 @@ export class BotManager {
     const hadBooster = oldRoles.has(boosterRoleId);
     const hasBooster = newRoles.has(boosterRoleId);
 
-    // Booster gained → add premium
     if (!hadBooster && hasBooster) {
       try {
         await newMember.roles.add(premiumRoleId);
@@ -1685,15 +1842,10 @@ export class BotManager {
       return;
     }
 
-    // Booster lost → remove premium and DELETE ALL DATA
     if (hadBooster && !hasBooster) {
       try {
-        // Remove Discord role
         await newMember.roles.remove(premiumRoleId);
-        
-        // Delete ALL premium data for this user in this guild
         await this.deleteAllPremiumData(newMember.id, guildId);
-        
         logger.info('Premium data fully deleted for unbooster', { 
           userId: newMember.id,
           guildId 
@@ -1879,7 +2031,6 @@ export class BotManager {
         .addIntegerOption(opt => opt.setName('amount').setDescription('How many'))
         .setDefaultMemberPermissions(0),
       new SlashCommandBuilder().setName('help').setDescription('List commands'),
-      // /revoke command
       new SlashCommandBuilder()
         .setName('revoke')
         .setDescription('Revoke premium access from a user (admin)')
@@ -1889,7 +2040,6 @@ export class BotManager {
             .setRequired(true)
         )
         .setDefaultMemberPermissions(0),
-      // /giveawaytrack command (renamed from /watch)
       new SlashCommandBuilder()
         .setName('giveawaytrack')
         .setDescription('Manage giveaway tracking')
@@ -1921,7 +2071,6 @@ export class BotManager {
           sub.setName('clear')
             .setDescription('Clear all tracked items')
         ),
-      // /eventtrack command (NEW)
       new SlashCommandBuilder()
         .setName('eventtrack')
         .setDescription('Manage event tracking (scrims, squid games, gagaball, etc.)')
@@ -1953,10 +2102,6 @@ export class BotManager {
           sub.setName('clear')
             .setDescription('Clear all event filters')
         ),
-      new SlashCommandBuilder()
-        .setName('panel')
-        .setDescription('Send license management panel (owner only)')
-        .setDefaultMemberPermissions(0),
       new SlashCommandBuilder()
         .setName('licenseadmin')
         .setDescription('Send admin license management panel (owner only)')
