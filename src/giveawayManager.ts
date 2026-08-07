@@ -16,6 +16,7 @@
  * 11. Startup grace period to skip old replayed messages
  * 12. Gateway latency capping to prevent misleading 200k+ ms stats
  * 13. SCRIM/EVENT DETECTION - scans all messages for scrims, squid game, gagaball
+ * 14. FIXED: Removed bot-only filter in quickReject() to allow human scrim messages
  */
 
 import { Client, Message, TextChannel } from 'discord.js-selfbot-v13';
@@ -826,7 +827,7 @@ function detectScrim(parsed: ParsedGiveawayData): ScrimDetectionResult | null {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// QUICK REJECT (Stage 1) - FIXED: Age check moved to top
+// QUICK REJECT (Stage 1) - FIXED: Removed bot-only filter
 // ═══════════════════════════════════════════════════════════════════════════
 
 function quickReject(message: Message, selfUserId: string, now: number): string | null {
@@ -843,9 +844,10 @@ function quickReject(message: Message, selfUserId: string, now: number): string 
     return 'not_monitored';
   }
 
-  if (!message.author?.bot || !ALLOWED_GIVEAWAY_BOT_IDS.has(message.author.id)) {
-    return 'not_allowed_bot';
-  }
+  // REMOVED: Bot-only filter that was blocking all human messages
+  // if (!message.author?.bot || !ALLOWED_GIVEAWAY_BOT_IDS.has(message.author.id)) {
+  //   return 'not_allowed_bot';
+  // }
 
   const rawContent = (message.content || '').toLowerCase();
   if (rawContent.length < 200) {
