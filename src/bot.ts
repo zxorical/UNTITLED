@@ -841,7 +841,7 @@ export class BotManager {
     const guildName = guild?.name || data.guildName || 'Unknown';
     const guildIcon = data.guildIcon || guild?.iconURL({ size: 512 }) || null;
     const guildBanner = data.guildBanner || guild?.bannerURL({ size: 1024 }) || null;
-    const memberCount = data.memberCount || guild?.memberCount ?? null;
+    const memberCount = (data.memberCount || guild?.memberCount) ?? null;
     
     let inviteUrl = data.inviteUrl || 'No invite available';
     
