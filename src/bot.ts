@@ -1713,26 +1713,25 @@ export class BotManager {
   // -------------------------------------------------------------------------
   
   private async sendRolePanel(): Promise<void> {
-    const panelChannelId = process.env.PANEL_CHANNEL_ID || CONFIG.trackerChannelId;
-    const channel = this.client.channels.cache.get(panelChannelId) as TextChannel | undefined;
-    if (!channel) return;
-    try {
-      const messages = await channel.messages.fetch({ limit: 20 });
-      const oldPanel = messages.find(m =>
-        m.author.id === this.client.user?.id &&
-        m.embeds.length > 0 &&
-        m.embeds[0]?.title === 'Giveaway Notifications'
-      );
-      if (oldPanel) await oldPanel.delete().catch(() => {});
-    } catch {}
-    const embed = new EmbedBuilder()
-      .setColor(0xF1C40F)
-      .setTitle('Giveaway Notifications')
-      .setDescription('Click the button to toggle giveaway pings.\nYou'll get mentioned whenever a new giveaway is detected.')
-      .setFooter({ text: 'Toggle anytime' });
-    const row = new ActionRowBuilder<ButtonBuilder>()
-      .addComponents(new ButtonBuilder().setCustomId('toggle_ping').setLabel('Toggle Pings').setStyle(ButtonStyle.Primary));
-    await channel.send({ embeds: [embed], components: [row] });
+  const panelChannelId = process.env.PANEL_CHANNEL_ID || CONFIG.trackerChannelId;
+  const channel = this.client.channels.cache.get(panelChannelId) as TextChannel | undefined;
+  if (!channel) return;
+  try {
+    const messages = await channel.messages.fetch({ limit: 20 });
+    const oldPanel = messages.find(m =>
+      m.author.id === this.client.user?.id &&
+      m.embeds.length > 0 &&
+      m.embeds[0]?.title === 'Giveaway Notifications'
+    );
+    if (oldPanel) await oldPanel.delete().catch(() => {});
+  } catch {}
+  const embed = new EmbedBuilder()
+    .setColor(0xF1C40F)
+    .setTitle('Giveaway Notifications')
+    .setDescription("Click the button to toggle giveaway pings.\nYou'll get mentioned whenever a new giveaway is detected.");
+  const row = new ActionRowBuilder<ButtonBuilder>()
+    .addComponents(new ButtonBuilder().setCustomId('toggle_ping').setLabel('Toggle Pings').setStyle(ButtonStyle.Primary));
+  await channel.send({ embeds: [embed], components: [row] });
   }
 
   // -------------------------------------------------------------------------
