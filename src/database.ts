@@ -36,11 +36,12 @@
  * 18. FIXED: Type errors when iterating cache.entries() - use .value.doc
  * 19. FIXED: updateUserToken now handles clearing token (empty string = null)
  * 20. FIXED: updateUserWebhook now handles clearing webhook (empty string = null)
+ * 21. ADDED: Scrim/Event storage with proper indexing and CRUD operations
  */
 
 import { MongoClient, Db, Collection, AnyBulkWriteOperation } from 'mongodb';
 import { logger } from './logger.js';
-import { GiveawayData, GiveawayStats, UserWatchlist, LicenseKey } from './types.js';
+import { GiveawayData, GiveawayStats, UserWatchlist, LicenseKey, ScrimNotificationData } from './types.js';
 
 // ============================================================================
 // Interfaces
@@ -64,6 +65,37 @@ interface StoredGiveaway {
   notificationSentAt?: number;
   notificationError?: string;
   version?: number; // Optimistic locking
+}
+
+// ============================================================================
+// SCRIM/EVENT INTERFACES
+// ============================================================================
+
+interface StoredScrim {
+  messageId: string;
+  channelId: string;
+  guildId: string;
+  guildName: string;
+  channelName: string;
+  authorId: string;
+  type: 'scrim' | 'squid_game' | 'gagaball';
+  host: string | null;
+  coHost: string | null;
+  time: string | null;
+  reward: string | null;
+  teams: string | null;
+  region: string | null;
+  ticks: number | null;
+  rawContent: string;
+  detectedAt: number;
+  status: 'active' | 'ended';
+  notifiedAt: number | null;
+  lastSeenAt: number;
+  notificationMessageId?: string;
+  notificationStatus?: string;
+  notificationSentAt?: number;
+  notificationError?: string;
+  version?: number;
 }
 
 interface TotalCounter {
@@ -165,6 +197,7 @@ const BULK_WRITE_BATCH_SIZE = 50; // 🔥 REDUCED from 500 to 50 for more freque
 let client: MongoClient;
 let db: Db;
 let giveawaysCol: Collection<StoredGiveaway>;
+let scrimsCol: Collection<StoredScrim>;
 let countersCol: Collection<TotalCounter>;
 let watchlistCol: Collection<UserWatchlist>;
 let licenseKeysCol: Collection<LicenseKey>;
@@ -570,6 +603,7 @@ async function connect(): Promise<void> {
       
       // Initialize collections
       giveawaysCol = db.collection<StoredGiveaway>('giveaways');
+      scrimsCol = db.collection<StoredScrim>('scrims');
       countersCol = db.collection<TotalCounter>('counters');
       watchlistCol = db.collection<UserWatchlist>('watchlists');
       licenseKeysCol = db.collection<LicenseKey>('license_keys');
@@ -630,6 +664,14 @@ async function createIndexes(): Promise<void> {
     await giveawaysCol.createIndex({ notificationStatus: 1 });
     await giveawaysCol.createIndex({ guildId: 1, status: 1 });
     await giveawaysCol.createIndex({ endsAt: 1, status: 1 });
+    
+    // Scrims indexes
+    await scrimsCol.createIndex({ messageId: 1, channelId: 1 }, { unique: true });
+    await scrimsCol.createIndex({ type: 1 });
+    await scrimsCol.createIndex({ status: 1 });
+    await scrimsCol.createIndex({ detectedAt: -1 });
+    await scrimsCol.createIndex({ guildId: 1, status: 1 });
+    await scrimsCol.createIndex({ notificationStatus: 1 });
     
     // Watchlist indexes
     await watchlistCol.createIndex({ userId: 1 }, { unique: true });
@@ -1221,6 +1263,7 @@ export async function resetDatabase(): Promise<void> {
 
   if (connected) {
     await giveawaysCol.deleteMany({});
+    await scrimsCol.deleteMany({});
     await countersCol.updateOne(
       { _id: 'total_detected' }, 
       { $set: { total: 0, lastUpdated: Date.now() } }, 
@@ -1292,6 +1335,179 @@ export async function purgeEndedGiveaways(): Promise<GiveawayData[]> {
   }
 
   return removed;
+}
+
+// ============================================================================
+// Public API - Scrim/Event Management
+// ============================================================================
+
+export async function insertScrim(
+  data: Omit<ScrimNotificationData, 'status' | 'notifiedAt' | 'lastSeenAt'>
+): Promise<boolean> {
+  if (!data.messageId || !data.channelId || !data.guildId) {
+    logger.warn('Invalid scrim data', { component: 'Database', data });
+    return false;
+  }
+  
+  await ensureConnected();
+  
+  const doc: StoredScrim = {
+    messageId: data.messageId,
+    channelId: data.channelId,
+    guildId: data.guildId,
+    guildName: data.guildName || 'Unknown',
+    channelName: data.channelName || 'Unknown',
+    authorId: data.authorId,
+    type: data.type,
+    host: data.host || null,
+    coHost: data.coHost || null,
+    time: data.time || null,
+    reward: data.reward || null,
+    teams: data.teams || null,
+    region: data.region || null,
+    ticks: data.ticks || null,
+    rawContent: data.rawContent || '',
+    detectedAt: data.detectedAt || Date.now(),
+    status: 'active',
+    notifiedAt: null,
+    lastSeenAt: Date.now(),
+    notificationStatus: 'pending',
+    version: 1,
+  };
+
+  try {
+    await scrimsCol.insertOne(doc);
+    logger.debug('Scrim inserted', { 
+      component: 'Database', 
+      messageId: data.messageId,
+      type: data.type,
+      host: data.host,
+      time: data.time,
+      reward: data.reward?.substring(0, 50) 
+    });
+    return true;
+  } catch (err) {
+    // Check for duplicate key error
+    if (err && typeof err === 'object' && 'code' in err && (err as { code?: number }).code === 11000) {
+      logger.debug('Scrim already exists', { 
+        component: 'Database', 
+        messageId: data.messageId,
+        channelId: data.channelId 
+      });
+      return false;
+    }
+    logger.error('Failed to insert scrim', { 
+      component: 'Database', 
+      error: err instanceof Error ? err.message : String(err),
+      messageId: data.messageId 
+    });
+    return false;
+  }
+}
+
+export async function getScrim(messageId: string, channelId: string): Promise<StoredScrim | null> {
+  if (!messageId || !channelId) return null;
+  
+  await ensureConnected();
+  return scrimsCol.findOne({ messageId, channelId });
+}
+
+export async function getActiveScrims(limit: number = 50): Promise<StoredScrim[]> {
+  await ensureConnected();
+  return scrimsCol.find({ status: 'active' })
+    .sort({ detectedAt: -1 })
+    .limit(limit)
+    .toArray();
+}
+
+export async function markScrimNotified(messageId: string, channelId: string): Promise<void> {
+  if (!messageId || !channelId) return;
+  
+  await ensureConnected();
+  await scrimsCol.updateOne(
+    { messageId, channelId },
+    { 
+      $set: { 
+        notifiedAt: Date.now(),
+        notificationStatus: 'sent',
+        notificationSentAt: Date.now(),
+        version: 1,
+      } 
+    }
+  );
+}
+
+export async function markScrimEnded(messageId: string, channelId: string): Promise<void> {
+  if (!messageId || !channelId) return;
+  
+  await ensureConnected();
+  await scrimsCol.updateOne(
+    { messageId, channelId },
+    { $set: { status: 'ended', version: 1 } }
+  );
+}
+
+export async function getScrimsByGuild(guildId: string, limit: number = 50): Promise<StoredScrim[]> {
+  if (!guildId) return [];
+  
+  await ensureConnected();
+  return scrimsCol.find({ guildId })
+    .sort({ detectedAt: -1 })
+    .limit(limit)
+    .toArray();
+}
+
+export async function getScrimsByType(
+  type: 'scrim' | 'squid_game' | 'gagaball',
+  limit: number = 50
+): Promise<StoredScrim[]> {
+  await ensureConnected();
+  return scrimsCol.find({ type, status: 'active' })
+    .sort({ detectedAt: -1 })
+    .limit(limit)
+    .toArray();
+}
+
+export async function getScrimStats(): Promise<{
+  total: number;
+  active: number;
+  byType: { scrim: number; squid_game: number; gagaball: number };
+  servers: number;
+}> {
+  await ensureConnected();
+  
+  const total = await scrimsCol.countDocuments();
+  const active = await scrimsCol.countDocuments({ status: 'active' });
+  const byType = {
+    scrim: await scrimsCol.countDocuments({ type: 'scrim' }),
+    squid_game: await scrimsCol.countDocuments({ type: 'squid_game' }),
+    gagaball: await scrimsCol.countDocuments({ type: 'gagaball' }),
+  };
+  
+  const guilds = await scrimsCol.distinct('guildId');
+  
+  return {
+    total,
+    active,
+    byType,
+    servers: guilds.length,
+  };
+}
+
+export async function cleanupOldScrims(days: number = 30): Promise<number> {
+  const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+  
+  await ensureConnected();
+  const result = await scrimsCol.deleteMany({
+    status: 'ended',
+    detectedAt: { $lt: cutoff },
+  });
+  
+  if (result.deletedCount > 0) {
+    logger.info(`Cleaned up ${result.deletedCount} old scrims`, { component: 'Database' });
+  }
+  
+  return result.deletedCount || 0;
 }
 
 // ============================================================================
@@ -2414,6 +2630,17 @@ export default {
   resetDatabase,
   cleanupOldGiveaways,
   purgeEndedGiveaways,
+  
+  // Scrim functions
+  insertScrim,
+  getScrim,
+  getActiveScrims,
+  markScrimNotified,
+  markScrimEnded,
+  getScrimsByGuild,
+  getScrimsByType,
+  getScrimStats,
+  cleanupOldScrims,
   
   // Watchlist functions
   addItem,
