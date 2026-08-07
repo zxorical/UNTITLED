@@ -17,6 +17,7 @@
  * 11. FIX: Force GC after every shutdown
  * 12. FIX: Max listeners warning prevention
  * 13. FIX: Session cleanup on boot retry
+ * 14. ADDED: Scrim/Event detection stats in logging
  */
 
 import http from 'http';
@@ -29,7 +30,7 @@ import { logger, reconfigureLogger } from './logger.js';
 import GiveawayManager from './giveawayManager.js';
 import { BotManager } from './bot.js';
 import { delay, formatError, formatDuration } from './utils.js';
-import { getDb, closeDb, cleanupOldGiveaways } from './database.js';
+import { getDb, closeDb, cleanupOldGiveaways, getScrimStats } from './database.js';
 import { AutoJoinManager } from './autoJoin/index.js';
 import { restoreTokenSessionsFromDatabase } from './premium/tokenManager.js';
 
@@ -463,12 +464,42 @@ async function main(): Promise<void> {
     } catch {}
   }
 
-  // Stats interval
+  // Log initial scrim stats
+  try {
+    const scrimStats = await getScrimStats();
+    logger.info(`📊 Scrim Stats: ${scrimStats.total} total, ${scrimStats.active} active, ${scrimStats.servers} servers`, {
+      component: 'Bootstrap',
+      scrims: scrimStats.byType.scrim,
+      squidGames: scrimStats.byType.squid_game,
+      gagaballs: scrimStats.byType.gagaball,
+    });
+  } catch {}
+
+  // Stats interval - now includes scrim stats
   statsInterval = setInterval(() => {
     if (shuttingDown) return;
+    
+    // Log giveaway stats
     for (const m of activeManagers) {
       try { m.logStats(); } catch {}
     }
+    
+    // Log scrim stats
+    if (!shuttingDown) {
+      try {
+        getScrimStats().then(scrimStats => {
+          logger.info(`📊 Scrim Stats: ${scrimStats.total} total, ${scrimStats.active} active`, {
+            component: 'Bootstrap',
+            scrims: scrimStats.byType.scrim,
+            squidGames: scrimStats.byType.squid_game,
+            gagaballs: scrimStats.byType.gagaball,
+            servers: scrimStats.servers,
+          });
+        }).catch(() => {});
+      } catch {}
+    }
+    
+    // Log AutoJoiner stats
     if (autoJoiner && !shuttingDown) {
       try {
         const stats = autoJoiner.getStats();
