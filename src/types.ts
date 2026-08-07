@@ -11,6 +11,8 @@ export interface AppConfig {
   tokens: string[];
   botToken: string;
   trackerChannelId: string;
+  scrimChannelId: string;    // NEW: Channel for scrim notifications
+  eventChannelId: string;    // NEW: Channel for event notifications (squid game, gagaball)
   monitoredChannels: string[];
   dbPath: string;
   logLevel: string;
