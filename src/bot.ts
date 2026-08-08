@@ -315,8 +315,7 @@ class NotificationService {
       })
       .setTitle(data.prize || 'Unknown Prize')
       .setDescription(description)
-      .setColor(0x5865F2)
-      .setTimestamp(data.detectedAt);
+      .setColor(0x5865F2);
 
     if (guildIcon) {
       embed.setThumbnail(guildIcon);
@@ -697,8 +696,7 @@ export class BotManager {
         { name: 'Giveaways', value: 'Receive notifications for new giveaways', inline: false },
         { name: 'Scrims', value: 'Receive notifications for scrim announcements', inline: false },
         { name: 'Events', value: 'Receive notifications for events (Squid Game, Gagaball, etc.)', inline: false },
-      )
-      .setTimestamp();
+      );
 
     const row = new ActionRowBuilder<ButtonBuilder>()
       .addComponents(
@@ -903,8 +901,7 @@ export class BotManager {
       })
       .setTitle(data.reward || `${typeLabel} Event`)
       .setDescription(description)
-      .setColor(typeColor)
-      .setTimestamp(data.detectedAt);
+      .setColor(typeColor);
 
     if (guildIcon) {
       embed.setThumbnail(guildIcon);
@@ -1135,8 +1132,7 @@ export class BotManager {
         })
         .setTitle(prize || 'Unknown Prize')
         .setDescription(description)
-        .setColor(0x5865F2)
-        .setTimestamp(detectedAt);
+        .setColor(0x5865F2);
 
       if (guildIcon) {
         embed.setThumbnail(guildIcon);
@@ -1218,8 +1214,7 @@ export class BotManager {
           '',
           `[View giveaway](${messageUrl})`
         ].join('\n'))
-        .setColor(0xFF0000)
-        .setTimestamp();
+        .setColor(0xFF0000);
 
       if (guildIcon) {
         embed.setThumbnail(guildIcon);
@@ -1531,7 +1526,6 @@ export class BotManager {
       );
     }
     
-    embed.setTimestamp();
     await interaction.editReply({ embeds: [embed] });
   }
 
@@ -1544,8 +1538,7 @@ export class BotManager {
     }
     const embed = new EmbedBuilder()
       .setColor(0xFFD700)
-      .setTitle(`${active.length} Active Giveaways`)
-      .setTimestamp();
+      .setTitle(`${active.length} Active Giveaways`);
     for (const g of active.slice(0, 10)) {
       const ends = g.endsAt ? `<t:${Math.floor(g.endsAt / 1000)}:R>` : 'Unknown';
       embed.addFields({
@@ -1566,8 +1559,7 @@ export class BotManager {
     }
     const embed = new EmbedBuilder()
       .setColor(0x5865F2)
-      .setTitle('Recent Giveaways')
-      .setTimestamp();
+      .setTitle('Recent Giveaways');
     for (const g of recent) {
       embed.addFields({
         name: `${g.status === 'active' ? '[Active]' : '[Ended]'} ${truncate(g.prize, 40)}`,
@@ -1609,8 +1601,7 @@ export class BotManager {
         { name: 'Active', value: String(stats.activeGiveaways), inline: true },
         { name: 'Servers', value: String(stats.serversWithGiveaways), inline: true },
         { name: 'Channel', value: `<#${CONFIG.trackerChannelId}>`, inline: false },
-      )
-      .setTimestamp();
+      );
     await interaction.editReply({ embeds: [embed] });
   }
 
@@ -1628,8 +1619,7 @@ export class BotManager {
         { name: 'Retry Attempts', value: String(m.retryAttempts), inline: true },
         { name: 'Avg Detection to Notify', value: `${m.avgDetectionLatency}ms`, inline: true },
         { name: 'Avg Discord Latency', value: `${m.avgDiscordLatency}ms`, inline: true },
-      )
-      .setTimestamp();
+      );
     await interaction.editReply({ embeds: [embed] });
   }
 
@@ -1662,8 +1652,7 @@ export class BotManager {
         { name: 'Premium Access', value: 'Click the "Activate Premium" button in the license panel', inline: false },
         { name: 'AutoJoiner', value: 'Click the "AutoJoiner" button in the premium panel', inline: false },
       )
-      .setFooter({ text: 'made by gab' })
-      .setTimestamp();
+      .setFooter({ text: 'made by gab' });
     await interaction.editReply({ embeds: [embed] });
   }
 
