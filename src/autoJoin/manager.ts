@@ -1,7 +1,3 @@
-
-AutoJoinManager.ts
-
-
 /**
  * @module autoJoin/manager
  * 
@@ -1542,7 +1538,6 @@ export class AutoJoinManager extends EventEmitter {
         makeCache: Options.cacheWithLimits({
           MessageManager: 100,
           UserManager: 1000,
-          GuildManager: 100,
           ChannelManager: 500,
           GuildMemberManager: 1000,
           PresenceManager: 0,
