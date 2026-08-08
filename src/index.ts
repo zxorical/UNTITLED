@@ -3,21 +3,24 @@
  * Application entry point – with BotManager timeout and fallback.
  * Now includes AutoJoiner for premium users (monitors ALL servers).
  * 
- * MEMORY FIXES:
- * 1. Proper cleanup of all managers on shutdown
- * 2. Forced GC when memory exceeds thresholds
- * 3. Session cleanup on boot retry
- * 4. Health check with memory metrics
- * 5. Graceful shutdown with timeout
- * 6. Destroy clients that time out during startup (was leaking sockets/listeners)
- * 7. Gate noisy `debug` event listener behind log level
- * 8. Prune GiveawayManager invite cache when the bot leaves a guild
- * 9. FIX: Memory thresholds adjusted for 8GB RAM (was too aggressive)
- * 10. FIX: Unhandled rejection handler no longer exits process
- * 11. FIX: Force GC after every shutdown
- * 12. FIX: Max listeners warning prevention
- * 13. FIX: Session cleanup on boot retry
- * 14. ADDED: Scrim/Event detection stats in logging
+ * MEMORY FIXES v2:
+ * 1. REMOVED duplicate token session restore (was causing double clients)
+ * 2. AutoJoiner is now the ONLY system that starts self-bot clients
+ * 3. Proper cleanup of all managers on shutdown
+ * 4. Forced GC when memory exceeds thresholds
+ * 5. Session cleanup on boot retry
+ * 6. Health check with memory metrics
+ * 7. Graceful shutdown with timeout
+ * 8. Destroy clients that time out during startup (was leaking sockets/listeners)
+ * 9. Gate noisy `debug` event listener behind log level
+ * 10. Prune GiveawayManager invite cache when the bot leaves a guild
+ * 11. Memory thresholds adjusted for 8GB RAM
+ * 12. Unhandled rejection handler no longer exits process
+ * 13. Force GC after every shutdown
+ * 14. Max listeners warning prevention
+ * 15. Session cleanup on boot retry
+ * 16. Scrim/Event detection stats in logging
+ * 17. FIXED: AutoJoiner starts AFTER BotManager, not before
  */
 
 import http from 'http';
@@ -32,7 +35,6 @@ import { BotManager } from './bot.js';
 import { delay, formatError, formatDuration } from './utils.js';
 import { getDb, closeDb, cleanupOldGiveaways, getScrimStats } from './database.js';
 import { AutoJoinManager } from './autoJoin/index.js';
-import { restoreTokenSessionsFromDatabase } from './premium/tokenManager.js';
 
 // ----------------------------------------------------------------------------
 // MEMORY MANAGEMENT - 8GB RAM Optimized
@@ -258,17 +260,7 @@ async function main(): Promise<void> {
   cleanupOldGiveaways(30).catch(err => logger.warn('cleanupOldGiveaways error', { error: err }));
 
   // --------------------------------------------------------------------------
-  // RESTORE TOKEN SESSIONS
-  // --------------------------------------------------------------------------
-  try {
-    const restored = await restoreTokenSessionsFromDatabase();
-    logger.info(`Restored ${restored} token sessions from database`, { component: 'Bootstrap' });
-  } catch (err) {
-    logger.warn('Failed to restore token sessions:', { component: 'Bootstrap', error: formatError(err) });
-  }
-
-  // --------------------------------------------------------------------------
-  // START BOTMANAGER
+  // START BOTMANAGER (REAL BOT) - MUST BE FIRST
   // --------------------------------------------------------------------------
   logger.info('Initializing BotManager...', { component: 'Bootstrap' });
   try {
@@ -290,38 +282,7 @@ async function main(): Promise<void> {
   }
 
   // --------------------------------------------------------------------------
-  // START AUTOJOINER
-  // --------------------------------------------------------------------------
-  try {
-    logger.info('Starting AutoJoiner (monitors all servers)...', { component: 'Bootstrap' });
-    
-    autoJoiner = new AutoJoinManager();
-    
-    await Promise.race([
-      autoJoiner.startAllSessions(),
-      delay(60000).then(() => { throw new Error('AutoJoiner start timed out'); })
-    ]);
-    
-    await Promise.race([
-      autoJoiner.restoreSessionsFromDatabase(),
-      delay(30000).then(() => { throw new Error('AutoJoiner restore timed out'); })
-    ]);
-    
-    const stats = autoJoiner.getStats();
-    logger.info(`✅ AutoJoiner running with ${stats.activeSessions}/${stats.totalSessions} active sessions`, {
-      component: 'Bootstrap',
-    });
-    
-  } catch (err) {
-    logger.warn('AutoJoiner failed to start:', {
-      component: 'Bootstrap',
-      error: formatError(err),
-    });
-    autoJoiner = null;
-  }
-
-  // --------------------------------------------------------------------------
-  // START ACCOUNT CLIENTS
+  // START ACCOUNT CLIENTS (TRACKER SELF-BOTS)
   // --------------------------------------------------------------------------
   activeManagers = [];
   let authFailures = 0;
@@ -455,13 +416,41 @@ async function main(): Promise<void> {
     memory: getMemoryUsage(),
   });
 
-  if (autoJoiner) {
-    try {
-      const stats = autoJoiner.getStats();
-      logger.info(`✅ AutoJoiner running with ${stats.activeSessions}/${stats.totalSessions} active sessions`, {
-        component: 'Bootstrap',
-      });
-    } catch {}
+  // --------------------------------------------------------------------------
+  // START AUTOJOINER (PREMIUM SELF-BOTS) - MUST BE AFTER TRACKER SELF-BOTS
+  // --------------------------------------------------------------------------
+  // ✅ CRITICAL FIX: AutoJoiner starts AFTER all tracker accounts.
+  // No duplicate session restore called here - AutoJoiner handles its own.
+  // The old code called restoreTokenSessionsFromDatabase() which started
+  // ANOTHER set of clients. Now AutoJoiner is the ONLY system that starts
+  // premium self-bot clients.
+  // --------------------------------------------------------------------------
+  try {
+    logger.info('Starting AutoJoiner (premium self-bots)...', { component: 'Bootstrap' });
+    
+    autoJoiner = new AutoJoinManager();
+    
+    await Promise.race([
+      autoJoiner.startAllSessions(),
+      delay(60000).then(() => { throw new Error('AutoJoiner start timed out'); })
+    ]);
+    
+    await Promise.race([
+      autoJoiner.restoreSessionsFromDatabase(),
+      delay(30000).then(() => { throw new Error('AutoJoiner restore timed out'); })
+    ]);
+    
+    const stats = autoJoiner.getStats();
+    logger.info(`✅ AutoJoiner running with ${stats.activeSessions}/${stats.totalSessions} active sessions`, {
+      component: 'Bootstrap',
+    });
+    
+  } catch (err) {
+    logger.warn('AutoJoiner failed to start:', {
+      component: 'Bootstrap',
+      error: formatError(err),
+    });
+    autoJoiner = null;
   }
 
   // Log initial scrim stats
