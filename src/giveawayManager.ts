@@ -118,52 +118,52 @@ const MINIMUM_SCORE_THRESHOLD = 6;
 const CREATION_SCORE_THRESHOLD = 7;
 const MAX_MESSAGE_AGE_MS = 30 * 60 * 1000;
 
-const MAX_CREATION_CACHE = 2000;
-const MAX_INVITE_CACHE = 500;
-const MAX_DUPLICATE_CACHE = 1000;
-const MAX_FAILED_INVITE_CACHE = 200;
-const WATCHLIST_CACHE_TTL = 60000;
+const MAX_CREATION_CACHE = 1000;
+const MAX_INVITE_CACHE = 250;
+const MAX_DUPLICATE_CACHE = 2000;
+const MAX_FAILED_INVITE_CACHE = 100;
+const WATCHLIST_CACHE_TTL = 60_000;
 const INVITE_CACHE_TTL = 30 * 60 * 1000;
 const FAILED_INVITE_RETRY_MS = 15 * 60 * 1000;
 const AHOCORASICK_THRESHOLD = 100;
+
+// Memory safety limits
+const MAX_GUILD_STATS = 2000;
+const MAX_SCRIM_HISTORY = 5000;
+const SCRIM_HISTORY_TTL_MS = 2 * 60 * 60 * 1000;
+const SCRIM_CLEANUP_INTERVAL = 5 * 60 * 1000;
+const MAX_PROCESSING_MESSAGES = 5000;
+const PARSED_CACHE_TTL_MS = 30_000;
+const MAX_PARSED_CACHE_SIZE = 2000;
 
 // Startup grace period constants
 const STARTUP_GRACE_PERIOD_MS = 30_000; // 30 seconds
 const MAX_STARTUP_MESSAGE_AGE_MS = 10_000; // 10 seconds during startup
 const MAX_GATEWAY_LATENCY_MS = 60_000; // Cap gateway latency at 60 seconds
 
-// ─── Parsed Message Cache with TTL ──────────────────────────────────────
-const PARSED_CACHE_TTL_MS = 60000; // 1 minute
-const MAX_PARSED_CACHE_SIZE = 10000;
+// ─── Parsed Message Cache with bounded opportunistic cleanup ───────────────
+// Kept global so multiple managers do not duplicate the cache. There is no
+// permanent module-level timer; cleanup happens while the cache is used.
 const parsedMessageCache = new Map<string, { data: ParsedGiveawayData; timestamp: number }>();
 
-// Periodic cleanup for parsed message cache
-setInterval(() => {
-  const now = Date.now();
-  let removed = 0;
+function cleanupParsedMessageCache(now: number): void {
+  if (parsedMessageCache.size === 0) return;
+
   for (const [key, entry] of parsedMessageCache) {
     if (now - entry.timestamp > PARSED_CACHE_TTL_MS) {
       parsedMessageCache.delete(key);
-      removed++;
     }
   }
-  // Also trim if over max size
-  if (parsedMessageCache.size > MAX_PARSED_CACHE_SIZE) {
-    const entries = Array.from(parsedMessageCache.entries());
-    entries.sort((a, b) => a[1].timestamp - b[1].timestamp);
-    const toRemove = parsedMessageCache.size - Math.floor(MAX_PARSED_CACHE_SIZE * 0.8);
-    for (let i = 0; i < toRemove && i < entries.length; i++) {
-      parsedMessageCache.delete(entries[i][0]);
-      removed++;
-    }
+
+  if (parsedMessageCache.size <= MAX_PARSED_CACHE_SIZE) return;
+
+  const removeCount = parsedMessageCache.size - MAX_PARSED_CACHE_SIZE;
+  let removed = 0;
+  for (const key of parsedMessageCache.keys()) {
+    parsedMessageCache.delete(key);
+    if (++removed >= removeCount) break;
   }
-  if (removed > 0) {
-    logger.debug(`Cleaned ${removed} parsed message cache entries`, {
-      component: 'GiveawayManager',
-      remaining: parsedMessageCache.size
-    });
-  }
-}, PARSED_CACHE_TTL_MS);
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // SCRIM/EVENT DETECTION CONSTANTS
@@ -524,6 +524,8 @@ function getParsedCacheKey(message: Message): string {
 }
 
 function parseMessage(message: Message, now: number): ParsedGiveawayData {
+  cleanupParsedMessageCache(now);
+
   const cacheKey = getParsedCacheKey(message);
   const cached = parsedMessageCache.get(cacheKey);
   
@@ -598,19 +600,10 @@ function parseMessage(message: Message, now: number): ParsedGiveawayData {
     contentHash,
   };
 
-  // Store in cache with timestamp
+  // Store in cache with timestamp and immediately enforce the hard cap.
   parsedMessageCache.set(cacheKey, { data: parsed, timestamp: now });
-  
-  // Trim cache if needed (already handled by interval, but just in case)
-  if (parsedMessageCache.size > MAX_PARSED_CACHE_SIZE * 1.2) {
-    const entries = Array.from(parsedMessageCache.entries());
-    entries.sort((a, b) => a[1].timestamp - b[1].timestamp);
-    const toRemove = parsedMessageCache.size - MAX_PARSED_CACHE_SIZE;
-    for (let i = 0; i < toRemove && i < entries.length; i++) {
-      parsedMessageCache.delete(entries[i][0]);
-    }
-  }
-  
+  cleanupParsedMessageCache(now);
+
   return parsed;
 }
 
@@ -1392,6 +1385,7 @@ interface ScrimHistoryEntry {
   recentDetections: number[];
   falsePositiveCount: number;
   cooldownUntil: number;
+  lastActivity: number;
 }
 
 export class GiveawayManager extends EventEmitter {
@@ -1418,14 +1412,13 @@ export class GiveawayManager extends EventEmitter {
   private totalWatchlistItems = 0;
 
   private pendingInvites = new Map<string, Promise<string>>();
-  private inviteRefresherInterval: NodeJS.Timeout | null = null;
-  private watchlistRefreshInterval: NodeJS.Timeout | null = null;
 
   // ─── NEW: Startup grace period properties ──────────────────────────
   private readyEventReceived = false;
   private readonly startupTime: number;
   private pendingStartupMessages = new Set<string>();
   private startupGraceTimer: NodeJS.Timeout | null = null;
+  private destroyed = false;
 
   private stats = {
     detected: 0, notified: 0, skipped: 0, errors: 0,
@@ -1436,7 +1429,12 @@ export class GiveawayManager extends EventEmitter {
     scrimsNotified: 0,
   };
 
-  private guildStats = new Map<string, { detected: number; notified: number; falsePositives: number }>();
+  private guildStats = new Map<string, {
+    detected: number;
+    notified: number;
+    falsePositives: number;
+    lastSeen: number;
+  }>();
 
   // Log sampling to reduce spam
   private logSampleCounter = 0;
@@ -1454,8 +1452,6 @@ export class GiveawayManager extends EventEmitter {
     this.selfUserId = client.user?.id || '';
     this.startupTime = Date.now();
 
-    this.startInviteRefresher();
-    this.startWatchlistRefresher();
     this.startScrimCleanup();
     this.setupReadyHandler();
   }
@@ -1467,6 +1463,7 @@ export class GiveawayManager extends EventEmitter {
   private setupReadyHandler(): void {
     this.client.once('ready', () => {
       setTimeout(() => {
+        if (this.destroyed) return;
         this.readyEventReceived = true;
         
         const startupDuration = Date.now() - this.startupTime;
@@ -1484,6 +1481,7 @@ export class GiveawayManager extends EventEmitter {
       }, 2000);
       
       this.startupGraceTimer = setTimeout(() => {
+        if (this.destroyed) return;
         if (!this.readyEventReceived) {
           this.readyEventReceived = true;
           this.log.warn('Ready event not received within grace period, forcing startup complete', {
@@ -1504,69 +1502,86 @@ export class GiveawayManager extends EventEmitter {
   private shouldThrottleScrim(guildId: string, channelId: string): boolean {
     const key = `${guildId}:${channelId}`;
     const now = Date.now();
-    
+
     let history = this.scrimHistory.get(key);
     if (!history) {
-      history = { recentDetections: [], falsePositiveCount: 0, cooldownUntil: 0 };
+      if (this.scrimHistory.size >= MAX_SCRIM_HISTORY) {
+        let oldestKey: string | null = null;
+        let oldestTime = Infinity;
+        for (const [existingKey, existing] of this.scrimHistory) {
+          if (existing.lastActivity < oldestTime) {
+            oldestTime = existing.lastActivity;
+            oldestKey = existingKey;
+          }
+        }
+        if (oldestKey) this.scrimHistory.delete(oldestKey);
+      }
+
+      history = {
+        recentDetections: [],
+        falsePositiveCount: 0,
+        cooldownUntil: 0,
+        lastActivity: now,
+      };
       this.scrimHistory.set(key, history);
     }
-    
-    // Check if channel is in cooldown
-    if (now < history.cooldownUntil) {
-      return true;
-    }
-    
-    // Clean old detections (older than 1 hour)
+
+    history.lastActivity = now;
+
+    if (now < history.cooldownUntil) return true;
+
     history.recentDetections = history.recentDetections.filter(
       ts => now - ts < SCRIM_THROTTLE_WINDOW_MS
     );
-    
-    // If too many detections in short time, increase cooldown
+
     if (history.recentDetections.length > SCRIM_THROTTLE_MAX) {
       const cooldownMs = Math.min(
-        300000, // Max 5 minutes
-        history.recentDetections.length * 30000 // 30 seconds per detection
+        300000,
+        history.recentDetections.length * 30000
       );
       history.cooldownUntil = now + cooldownMs;
-      
-      // Track as potential false positive burst
       history.falsePositiveCount++;
-      
+
       this.log.debug(`Throttling scrim detection in channel ${channelId}`, {
         detectionRate: history.recentDetections.length,
         cooldownMs,
         falsePositiveCount: history.falsePositiveCount
       });
-      
       return true;
     }
-    
-    // Record this detection
+
     history.recentDetections.push(now);
+    history.lastActivity = now;
     return false;
   }
 
   private startScrimCleanup(): void {
+    if (this.scrimCleanupInterval) clearInterval(this.scrimCleanupInterval);
+
     this.scrimCleanupInterval = setInterval(() => {
+      if (this.destroyed) return;
+
       const now = Date.now();
       for (const [key, history] of this.scrimHistory) {
-        // Remove channels with no recent activity
-        if (history.recentDetections.length === 0 && 
-            now > history.cooldownUntil) {
+        history.recentDetections = history.recentDetections.filter(
+          ts => now - ts < SCRIM_THROTTLE_WINDOW_MS
+        );
+
+        if (
+          now - history.lastActivity > SCRIM_HISTORY_TTL_MS &&
+          now > history.cooldownUntil
+        ) {
           this.scrimHistory.delete(key);
+          continue;
         }
-        
-        // Reset false positive count for channels with no recent issues
-        if (history.falsePositiveCount > 0 && 
-            history.recentDetections.every(ts => now - ts > 7200000)) { // 2 hours
-          history.falsePositiveCount = Math.max(0, history.falsePositiveCount - 1);
+
+        if (history.falsePositiveCount > 0 && history.recentDetections.length === 0) {
+          history.falsePositiveCount = 0;
         }
       }
-    }, 600000); // Run every 10 minutes
-    
-    if (this.scrimCleanupInterval.unref) {
-      this.scrimCleanupInterval.unref();
-    }
+    }, SCRIM_CLEANUP_INTERVAL);
+
+    this.scrimCleanupInterval.unref?.();
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -1672,6 +1687,8 @@ export class GiveawayManager extends EventEmitter {
   // ═══════════════════════════════════════════════════════════════════════
 
   public async handleMessage(message: Message): Promise<void> {
+    if (this.destroyed) return;
+
     const now = Date.now();
     const processingStart = performance.now();
 
@@ -1680,7 +1697,9 @@ export class GiveawayManager extends EventEmitter {
       if (messageAge > MAX_STARTUP_MESSAGE_AGE_MS) {
         return;
       }
-      this.pendingStartupMessages.add(message.id);
+      if (this.pendingStartupMessages.size < MAX_PROCESSING_MESSAGES) {
+        this.pendingStartupMessages.add(message.id);
+      }
     }
 
     if (now - message.createdTimestamp > MAX_MESSAGE_AGE_MS) {
@@ -1692,6 +1711,10 @@ export class GiveawayManager extends EventEmitter {
 
     const key = `${message.id}-${message.channel.id}`;
     if (this.processingMessages.has(key)) return;
+    if (this.processingMessages.size >= MAX_PROCESSING_MESSAGES) {
+      this.stats.skipped++;
+      return;
+    }
     this.processingMessages.add(key);
 
     try {
@@ -1867,6 +1890,7 @@ export class GiveawayManager extends EventEmitter {
   // ═══════════════════════════════════════════════════════════════════════
 
   public async handleMessageUpdate(_oldMessage: Message, newMessage: Message): Promise<void> {
+    if (this.destroyed) return;
     if (!newMessage.guild || !newMessage.author?.bot) return;
     if (!ALLOWED_GIVEAWAY_BOT_IDS.has(newMessage.author.id)) return;
 
@@ -2056,14 +2080,6 @@ export class GiveawayManager extends EventEmitter {
   // BACKGROUND REFRESHERS
   // ═══════════════════════════════════════════════════════════════════════
 
-  private startWatchlistRefresher(): void {
-    if (this.watchlistRefreshInterval) clearInterval(this.watchlistRefreshInterval);
-    this.watchlistRefreshInterval = setInterval(() => {
-      this.watchlistCacheExpiry = 0;
-    }, WATCHLIST_CACHE_TTL);
-    if (this.watchlistRefreshInterval.unref) this.watchlistRefreshInterval.unref();
-  }
-
   // ═══════════════════════════════════════════════════════════════════════
   // INVITE GENERATION WITH FAILED CACHE
   // ═══════════════════════════════════════════════════════════════════════
@@ -2171,20 +2187,6 @@ export class GiveawayManager extends EventEmitter {
     this.failedInviteCache.set(guildId, now + FAILED_INVITE_RETRY_MS);
   }
 
-  private startInviteRefresher(): void {
-    if (this.inviteRefresherInterval) clearInterval(this.inviteRefresherInterval);
-    this.inviteRefresherInterval = setInterval(() => {
-      const now = Date.now();
-      for (const guildId of this.client.guilds.cache.keys()) {
-        const cached = this.inviteCache.get(guildId);
-        if (!cached || cached.expiresAt <= now) {
-          this.fetchInviteForGuild(guildId).catch(() => {});
-        }
-      }
-    }, 5 * 60 * 1000);
-    if (this.inviteRefresherInterval.unref) this.inviteRefresherInterval.unref();
-  }
-
   public clearInviteCache(guildId: string): void {
     this.inviteCache.delete(guildId);
     this.failedInviteCache.delete(guildId);
@@ -2196,15 +2198,42 @@ export class GiveawayManager extends EventEmitter {
   // ═══════════════════════════════════════════════════════════════════════
 
   private recordGuildStat(guildId: string, type: 'detected' | 'notified' | 'falsePositive'): void {
+    const now = Date.now();
     let stats = this.guildStats.get(guildId);
-    if (!stats) { stats = { detected: 0, notified: 0, falsePositives: 0 }; this.guildStats.set(guildId, stats); }
+
+    if (!stats) {
+      if (this.guildStats.size >= MAX_GUILD_STATS) {
+        let oldestId: string | null = null;
+        let oldestTime = Infinity;
+        for (const [id, value] of this.guildStats) {
+          if (value.lastSeen < oldestTime) {
+            oldestTime = value.lastSeen;
+            oldestId = id;
+          }
+        }
+        if (oldestId) this.guildStats.delete(oldestId);
+      }
+
+      stats = { detected: 0, notified: 0, falsePositives: 0, lastSeen: now };
+      this.guildStats.set(guildId, stats);
+    }
+
+    stats.lastSeen = now;
     if (type === 'detected') stats.detected++;
     else if (type === 'notified') stats.notified++;
     else stats.falsePositives++;
   }
 
   public getGuildStats(): Map<string, { detected: number; notified: number; falsePositives: number }> {
-    return new Map(this.guildStats);
+    const result = new Map<string, { detected: number; notified: number; falsePositives: number }>();
+    for (const [guildId, stats] of this.guildStats) {
+      result.set(guildId, {
+        detected: stats.detected,
+        notified: stats.notified,
+        falsePositives: stats.falsePositives,
+      });
+    }
+    return result;
   }
 
   public getStats() {
@@ -2284,36 +2313,40 @@ export class GiveawayManager extends EventEmitter {
   // ═══════════════════════════════════════════════════════════════════════
 
   public async shutdown(): Promise<void> {
-    if (this.inviteRefresherInterval) { 
-      clearInterval(this.inviteRefresherInterval); 
-      this.inviteRefresherInterval = null; 
+    if (this.destroyed) return;
+    this.destroyed = true;
+
+    if (this.scrimCleanupInterval) {
+      clearInterval(this.scrimCleanupInterval);
+      this.scrimCleanupInterval = null;
     }
-    if (this.watchlistRefreshInterval) { 
-      clearInterval(this.watchlistRefreshInterval); 
-      this.watchlistRefreshInterval = null; 
-    }
-    if (this.scrimCleanupInterval) { 
-      clearInterval(this.scrimCleanupInterval); 
-      this.scrimCleanupInterval = null; 
-    }
-    if (this.startupGraceTimer) { 
+
+    if (this.startupGraceTimer) {
       clearTimeout(this.startupGraceTimer);
-      this.startupGraceTimer = null; 
+      this.startupGraceTimer = null;
     }
-    
+
     this.creationCache.clear();
     this.inviteCache.clear();
     this.failedInviteCache.clear();
     this.duplicateCache.clear();
     this.processingMessages.clear();
     this.pendingStartupMessages.clear();
+    this.pendingInvites.clear();
     this.scrimHistory.clear();
-    
+    this.guildStats.clear();
+
+    this.reverseWatchlistIndex.clear();
+    this.watchlistAhoCorasick = null;
+    this.totalWatchlistItems = 0;
+    this.watchlistCacheExpiry = 0;
+
     parsedMessageCache.clear();
-    
-    this.log.info(`Shutting down ${this.accountLabel}...`, { 
+    this.removeAllListeners();
+
+    this.log.info(`Shutting down ${this.accountLabel}...`, {
       component: 'GiveawayManager',
-      stats: this.stats 
+      stats: this.stats
     });
     this.logStats();
   }
