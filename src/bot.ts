@@ -139,8 +139,8 @@ interface NotificationJob {
   messageId: string;
 }
 
-const DEDUP_TTL_MS = 10 * 60 * 1000; // 10 minutes
-const DEDUP_SWEEP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+const DEDUP_TTL_MS = 10 * 60 * 1000;
+const DEDUP_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
 
 class NotificationService {
   private queue: NotificationJob[] = [];
@@ -288,7 +288,6 @@ class NotificationService {
     const endsAt = data.endsAt || Date.now() + 3600000;
     const endTimestamp = Math.floor(endsAt / 1000);
     const winnerCount = extractWinnerCount(data.prize);
-    const detectionTime = data.detectionTimeMs ?? (Date.now() - data.detectedAt);
 
     const pingMention = process.env.PING_ROLE_ID
       ? `<@&${process.env.PING_ROLE_ID}>`
@@ -326,11 +325,6 @@ class NotificationService {
     if (guildBanner) {
       embed.setImage(guildBanner);
     }
-
-    embed.setFooter({ 
-      text: `Detected in ${detectionTime}ms`, 
-      iconURL: this.bot.user?.displayAvatarURL() 
-    });
 
     const messageUrl = `https://discord.com/channels/${data.guildId}/${data.channelId}/${data.messageId}`;
     const row = new ActionRowBuilder<ButtonBuilder>();
@@ -518,7 +512,7 @@ export class BotManager {
       await this.purgeAndUpdatePresence();
       this.cleanupInterval = setInterval(() => this.purgeAndUpdatePresence(), 60_000);
       await this.registerCommands();
-      await this.sendNotificationPanel(); // Panel 5 replaces Panel 6
+      await this.sendNotificationPanel();
       await this.sendLicensePanel();
       await this.sendPremiumPanel();
 
@@ -530,7 +524,6 @@ export class BotManager {
     // Interaction Handler
     this.client.on('interactionCreate', async (interaction: Interaction) => {
       if (interaction.isButton()) {
-        // Per-user notification toggles
         if (interaction.customId === 'toggle_giveaway') {
           await this.handleNotificationToggle(interaction, 'giveaways');
           return;
@@ -741,7 +734,6 @@ export class BotManager {
 
   await updateUserNotificationSetting(userId, type, newState);
 
-  // Get the role ID based on type
   let roleId: string | undefined;
   const typeLabel = {
     giveaways: 'Giveaway',
@@ -750,14 +742,13 @@ export class BotManager {
   }[type];
 
   if (type === 'giveaways') {
-    roleId = process.env.PING_ROLE_ID; // 1525266999465213962
+    roleId = process.env.PING_ROLE_ID;
   } else if (type === 'scrims') {
-    roleId = process.env.SCRIM_ROLE_ID; // 1535393352386609346
+    roleId = process.env.SCRIM_ROLE_ID;
   } else if (type === 'events') {
-    roleId = process.env.EVENT_ROLE_ID; // 1535393470552870932
+    roleId = process.env.EVENT_ROLE_ID;
   }
 
-  // Add or remove the role
   if (roleId && interaction.guild) {
     try {
       const member = await interaction.guild.members.fetch(userId);
@@ -872,9 +863,6 @@ export class BotManager {
       }
     }
 
-    const detectionTime = Date.now() - data.detectedAt;
-
-    // PING MENTION - Use specific role based on type
     let pingMention = '@everyone';
     if (data.type === 'scrim') {
       const scrimRoleId = process.env.SCRIM_ROLE_ID;
@@ -882,7 +870,6 @@ export class BotManager {
         pingMention = `<@&${scrimRoleId}>`;
       }
     } else {
-      // Events (squid_game, gagaball, etc.)
       const eventRoleId = process.env.EVENT_ROLE_ID;
       if (eventRoleId) {
         pingMention = `<@&${eventRoleId}>`;
@@ -926,11 +913,6 @@ export class BotManager {
     if (guildBanner) {
       embed.setImage(guildBanner);
     }
-
-    embed.setFooter({ 
-      text: `Detected in ${detectionTime}ms`, 
-      iconURL: this.client.user?.displayAvatarURL() 
-    });
 
     const messageUrl = `https://discord.com/channels/${data.guildId}/${data.channelId}/${data.messageId}`;
     const row = new ActionRowBuilder<ButtonBuilder>();
@@ -1130,7 +1112,6 @@ export class BotManager {
         ? Math.floor(endsAt / 1000)
         : Math.floor((Date.now() + 3600000) / 1000);
       const winnerCount = extractWinnerCount(prize);
-      const detectionTime = detectedAt ? Date.now() - detectedAt : 0;
 
       const description = [
         `### Details`,
@@ -1164,11 +1145,6 @@ export class BotManager {
       if (guildBanner) {
         embed.setImage(guildBanner);
       }
-
-      embed.setFooter({ 
-        text: `Detected in ${detectionTime}ms`, 
-        iconURL: this.client.user?.displayAvatarURL() 
-      });
 
       const row = new ActionRowBuilder<ButtonBuilder>();
       if (resolvedInvite.startsWith('http')) {
@@ -1243,10 +1219,6 @@ export class BotManager {
           `[View giveaway](${messageUrl})`
         ].join('\n'))
         .setColor(0xFF0000)
-        .setFooter({ 
-          text: 'Giveaway tracker', 
-          iconURL: this.client.user?.displayAvatarURL() 
-        })
         .setTimestamp();
 
       if (guildIcon) {
