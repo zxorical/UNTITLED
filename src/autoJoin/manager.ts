@@ -9,6 +9,8 @@
  * 3. 🔥 FIXED: Null checks for message.guild throughout
  * 4. 🔥 FIXED: Rate limit reconnections with exponential backoff
  * 5. 🔥 FIXED: Prevent overlapping session starts with promise handling
+ * 6. 🔥 FIXED: Memory leaks - proper cleanup on shutdown
+ * 7. 🔥 FIXED: All methods restored for index.ts compatibility
  * 
  * SPEED OPTIMIZATIONS:
  * 1. Parallel session startup - ALL sessions start at once
@@ -142,9 +144,6 @@ interface UserSession {
   startedAt: number;
   isActive: boolean;
   stats: SessionStats;
-  reconnectAttempts: number;
-  maxReconnectAttempts: number;
-  rateLimiter: TokenBucket;
   listeners: {
     messageCreate?: (message: Message) => void;
     messageUpdate?: (oldMessage: Message | PartialMessage, newMessage: Message | PartialMessage) => void;
@@ -365,6 +364,7 @@ const RETRY_CHECK_INTERVAL_MS = 5 * 60 * 1000;
 const INITIAL_RETRY_DELAY_MS = 5000;
 const MAX_RETRY_DELAY_MS = 60000;
 const TOKEN_REACTIVATION_THRESHOLD_MS = 60 * 1000;
+const HEALTH_CHECK_INTERVAL_MS = 60000; // 🔥 FIXED: Added missing constant
 
 const MAX_CONCURRENT_ENTRIES_PER_ACCOUNT = 5;
 
@@ -1036,8 +1036,7 @@ class JoinQueue {
 }
 
 // ---------------------------------------------------------------------------
-// AutoJoinManager - Main Class
-// ---------------------------------------------------------------------------
+// AutoJoinManager - Main Class// ---------------------------------------------------------------------------
 
 export class AutoJoinManager extends EventEmitter {
   // Sessions
@@ -1077,7 +1076,7 @@ export class AutoJoinManager extends EventEmitter {
   
   // State
   private isShuttingDown = false;
-  private sessionStartPromises: Map<string, Promise<boolean>> = new Map(); // 🔥 FIXED: Prevent overlapping starts
+  private sessionStartPromises: Map<string, Promise<boolean>> = new Map();
   private workerId: string;
   private memoryWarningLogged = false;
   private healthStatus: 'healthy' | 'warning' | 'critical' = 'healthy';
@@ -1403,11 +1402,9 @@ export class AutoJoinManager extends EventEmitter {
     }
   }
 
-  // 🔥 FIXED: Prevent overlapping session starts with promise handling
   async startSession(userId: string, guildId: string): Promise<boolean> {
     const sessionKey = this.makeSessionKey(userId);
     
-    // Check if session already exists and is active
     if (this.sessions.has(sessionKey)) {
       const session = this.sessions.get(sessionKey);
       if (session && session.isActive && !session.destroyed) {
@@ -1418,7 +1415,6 @@ export class AutoJoinManager extends EventEmitter {
       }
     }
     
-    // 🔥 FIXED: Return existing promise if one is already running
     if (this.sessionStartPromises.has(sessionKey)) {
       this.asyncLogger.debug('Session start already in progress, waiting...', { userId });
       return this.sessionStartPromises.get(sessionKey)!;
@@ -1537,9 +1533,6 @@ export class AutoJoinManager extends EventEmitter {
         startedAt: Date.now(),
         isActive: true,
         stats: { detected: 0, entered: 0, failed: 0, wins: 0, falsePositives: 0, queueWaitTimes: [] },
-        reconnectAttempts: 0,
-        maxReconnectAttempts: MAX_RECONNECT_ATTEMPTS,
-        rateLimiter: new TokenBucket(10, 5000),
         listeners: {},
         sessionId,
         destroyed: false,
@@ -1553,7 +1546,6 @@ export class AutoJoinManager extends EventEmitter {
       session.gatewaySessionId = await this.getGatewaySessionId(client);
       session.lastSessionIdFetch = Date.now();
 
-      // 🔥 FIXED: Register events with proper guild checks
       this.registerEvents(session);
       
       this.tokenManager.clearCache(userId, guildId);
@@ -1618,7 +1610,7 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   // -------------------------------------------------------------------------
-  // 🔥 FIXED: Retry Scheduler with exponential backoff
+  // Retry Scheduler with exponential backoff
   // -------------------------------------------------------------------------
 
   private async scheduleRetry(userId: string, guildId: string): Promise<void> {
@@ -1634,7 +1626,6 @@ export class AutoJoinManager extends EventEmitter {
     failureData.lastAttempt = Date.now();
     this.tokenFailureTracker.set(userId, failureData);
     
-    // 🔥 FIXED: Cap retries at 10, then permanently deactivate
     if (failureData.failures > 10) {
       this.asyncLogger.error('❌ Max retry attempts reached for user, permanently deactivating', { userId });
       await setTokenActive(userId, guildId, false);
@@ -1642,7 +1633,6 @@ export class AutoJoinManager extends EventEmitter {
       return;
     }
     
-    // 🔥 FIXED: Exponential backoff with jitter
     const baseDelay = INITIAL_RETRY_DELAY_MS * Math.pow(2, Math.min(failureData.failures - 1, 6));
     const jitter = Math.random() * 2000;
     const backoffMs = Math.min(baseDelay + jitter, MAX_RETRY_DELAY_MS);
@@ -1686,15 +1676,14 @@ export class AutoJoinManager extends EventEmitter {
     client.removeAllListeners('disconnect');
     client.removeAllListeners('ready');
     client.removeAllListeners('warn');
+    client.removeAllListeners('reconnecting');
+    client.removeAllListeners('resumed');
     
     try {
       (client as any).ws?.removeAllListeners?.();
     } catch {}
 
-    const GIVEAWAY_BOT_ID = '530082442967646230';
-
     const messageCreateHandler = async (message: Message) => {
-      // 🔥 FIXED: Skip DMs early - buttons only work in guilds
       if (!message.guild) {
         this.purgeMessageFromCache(message);
         return;
@@ -1733,7 +1722,6 @@ export class AutoJoinManager extends EventEmitter {
     };
 
     const messageUpdateHandler = async (_old: Message | PartialMessage, updated: Message | PartialMessage) => {
-      // 🔥 FIXED: Skip DMs early
       if (!(updated as Message).guild) {
         this.purgeMessageFromCache(updated as Message);
         return;
@@ -1761,22 +1749,15 @@ export class AutoJoinManager extends EventEmitter {
       }
     };
 
-    const errorHandler = (_error: Error) => {
-      // Silent - library handles it
+    const readyHandler = () => {
+      session.isActive = true;
+      session.gatewaySessionId = null;
+      this.asyncLogger.info('✅ Session ready', { userId: session.userId });
     };
 
     const disconnectHandler = () => {
       session.isActive = false;
-      this.asyncLogger.warn('⚠️ Session disconnected, waiting for reconnect', { userId: session.userId });
-    };
-
-    // 🔥 FIXED: Let the library handle reconnections
-    const readyHandler = () => {
-      session.isActive = true;
-      session.reconnectAttempts = 0;
-      session.gatewaySessionId = null;
-      session.lastSessionIdFetch = 0;
-      this.asyncLogger.info('✅ Session ready', { userId: session.userId });
+      this.asyncLogger.warn('⚠️ Session disconnected (auto-reconnect in progress)', { userId: session.userId });
     };
 
     const reconnectingHandler = () => {
@@ -1785,24 +1766,49 @@ export class AutoJoinManager extends EventEmitter {
 
     const resumedHandler = () => {
       session.isActive = true;
+      session.gatewaySessionId = null;
       this.asyncLogger.info('✅ Session resumed', { userId: session.userId });
+    };
+
+    const errorHandler = (error: Error) => {
+      if (error.message?.includes('token')) {
+        this.asyncLogger.error('Client error', { userId: session.userId, error: formatError(error) });
+      }
     };
 
     session.listeners.messageCreate = messageCreateHandler;
     session.listeners.messageUpdate = messageUpdateHandler;
-    session.listeners.error = errorHandler;
-    session.listeners.disconnect = disconnectHandler;
     session.listeners.ready = readyHandler;
+    session.listeners.disconnect = disconnectHandler;
     session.listeners.reconnecting = reconnectingHandler;
     session.listeners.resumed = resumedHandler;
+    session.listeners.error = errorHandler;
 
     client.on('messageCreate', messageCreateHandler);
     client.on('messageUpdate', messageUpdateHandler);
-    client.on('error', errorHandler);
-    client.on('disconnect', disconnectHandler);
     client.on('ready', readyHandler);
+    client.on('disconnect', disconnectHandler);
     client.on('reconnecting', reconnectingHandler);
     client.on('resumed', resumedHandler);
+    client.on('error', errorHandler);
+  }
+
+  private cleanupSessionListeners(session: UserSession): void {
+    const { client } = session;
+    
+    const events = ['messageCreate', 'messageUpdate', 'error', 'disconnect', 'ready', 'warn', 'debug', 'reconnecting', 'resumed'];
+    
+    for (const event of events) {
+      try {
+        client.removeAllListeners(event);
+      } catch {}
+    }
+    
+    try {
+      (client as any).ws?.removeAllListeners?.();
+    } catch {}
+    
+    session.listeners = {};
   }
 
   // -------------------------------------------------------------------------
@@ -1810,7 +1816,6 @@ export class AutoJoinManager extends EventEmitter {
   // -------------------------------------------------------------------------
 
   private async handleMessage(message: Message, session: UserSession): Promise<void> {
-    // 🔥 FIXED: Skip if no guild (early return)
     if (!message.guild) {
       return;
     }
@@ -2370,7 +2375,6 @@ export class AutoJoinManager extends EventEmitter {
     }
   }
 
-  // 🔥 FIXED: enterViaButton with guild context check
   private async enterViaButton(entry: GiveawayEntry, session: UserSession): Promise<boolean> {
     if (!entry.buttonCustomId) throw new Error('No buttonCustomId set');
 
@@ -2398,7 +2402,6 @@ export class AutoJoinManager extends EventEmitter {
     
     if (!message) throw new Error(`Message ${entry.messageId} not found`);
 
-    // 🔥 FIXED: CRITICAL - Check guild exists before clicking
     if (!message.guild) {
       throw new Error('Cannot enter giveaway in DM - buttons require guild context');
     }
@@ -2442,9 +2445,7 @@ export class AutoJoinManager extends EventEmitter {
     await this.postInteraction(message, button, session);
   }
 
-  // 🔥 FIXED: postInteraction - guild_id is NEVER null
   private async postInteraction(message: Message, button: GiveawayButton, session: UserSession): Promise<void> {
-    // 🔥 FIXED: CRITICAL - Check guild exists before sending interaction
     if (!message.guild) {
       throw new Error('Cannot click buttons in DMs - guild context required');
     }
@@ -2493,7 +2494,7 @@ export class AutoJoinManager extends EventEmitter {
       const payload = {
         type: 3,
         nonce,
-        guild_id: message.guild.id,  // ✅ ALWAYS a string
+        guild_id: message.guild!.id,  // ✅ ALWAYS a string
         channel_id: message.channel.id,
         message_id: message.id,
         application_id: applicationId,
@@ -2609,7 +2610,6 @@ export class AutoJoinManager extends EventEmitter {
   // -------------------------------------------------------------------------
 
   private async handleWin(message: Message, userId: string): Promise<void> {
-    // 🔥 FIXED: Skip if no guild
     if (!message.guild || !message.author?.bot) return;
 
     const myId = message.client.user?.id;
@@ -2785,7 +2785,7 @@ export class AutoJoinManager extends EventEmitter {
                              client.ws?.connection?.readyState === 1;
           
           if (isConnected) {
-            session.lastHealthCheck = Date.now();
+            // Session is healthy
           }
         } catch (error) {
           // Silent
@@ -2796,7 +2796,36 @@ export class AutoJoinManager extends EventEmitter {
     if (this.healthCheckInterval.unref) this.healthCheckInterval.unref();
   }
 
-  // 🔥 FIXED: Removed stall checker - library handles it
+  private startStallChecker(): void {
+    this.stallCheckInterval = setInterval(() => {
+      if (this.isShuttingDown) return;
+
+      let stalled = 0;
+      for (const [_, session] of this.sessions) {
+        if (!session.isActive || session.destroyed) {
+          stalled++;
+          continue;
+        }
+        
+        try {
+          const client = session.client as any;
+          if (!client.isReady() || client.ws?.connection?.readyState !== 1) {
+            stalled++;
+          }
+        } catch {
+          stalled++;
+        }
+      }
+      
+      if (stalled > 0) {
+        this.asyncLogger.debug(`⚠️ ${stalled} sessions appear stalled`, {
+          worker: this.workerId,
+          totalSessions: this.sessions.size,
+        });
+      }
+    }, 60000);
+    if (this.stallCheckInterval.unref) this.stallCheckInterval.unref();
+  }
 
   // -------------------------------------------------------------------------
   // Batch Database Writer
@@ -3001,6 +3030,334 @@ export class AutoJoinManager extends EventEmitter {
       this.logStats();
     }, 5 * 60_000);
     if (this.metricsInterval.unref) this.metricsInterval.unref();
+  }
+
+  // ============================================================
+  // 🔥 FIXED: COMPLETE getStats() - Needed for index.ts
+  // ============================================================
+
+  getStats() {
+    const sessionStats: Array<{ userId: string; stats: SessionStats }> = [];
+    let active = 0;
+    let totalDetected = 0;
+    let totalEntered = 0;
+    let totalWins = 0;
+    
+    for (const [key, session] of this.sessions) {
+      if (session.isActive && !session.destroyed) active++;
+      sessionStats.push({ userId: session.userId, stats: { ...session.stats } });
+      totalDetected += session.stats.detected;
+      totalEntered += session.stats.entered;
+      totalWins += session.stats.wins;
+    }
+    
+    const mem = this.getMemoryUsage();
+    const metrics = this.metrics.getMetrics();
+    
+    return {
+      totalSessions: this.sessions.size,
+      activeSessions: active,
+      totalDetected,
+      totalEntered,
+      totalWins,
+      sessionStats,
+      worker: this.workerId,
+      healthStatus: this.healthStatus,
+      circuitBreakerState: this.apiCircuitBreaker.getState(),
+      caches: {
+        processedMessages: this.processedMessages.size,
+        processing: this.processingCache.size,
+        recentWins: this.recentWins.size,
+        noResponseCooldown: this.noResponseCooldown.size,
+        tokenCache: this.tokenManager.getCacheStats(),
+        crosspostCache: this.crosspostCache.size,
+        messageCache: this.messageCache.size,
+      },
+      memory: {
+        heapUsedMB: mem.heapUsedMB,
+        heapTotalMB: mem.heapTotalMB,
+        rssMB: mem.rssMB,
+        percentageUsed: Math.round((mem.heapUsedMB / 8000) * 100),
+      },
+      metrics: {
+        averageDetectionTime: metrics.averageDetectionTime,
+        averageEntryTime: metrics.averageEntryTime,
+        apiCalls: metrics.apiCalls,
+        apiErrors: metrics.apiErrors,
+        cacheHits: metrics.cacheHits,
+        cacheMisses: metrics.cacheMisses,
+        dbQueries: metrics.dbQueries,
+      },
+      logStats: this.asyncLogger.getStats(),
+      sessionStartPromises: this.sessionStartPromises.size,
+      uptime: Math.round((Date.now() - metrics.startTime) / 1000 / 60),
+      queue: this.joinQueue.getStats(),
+      retryScheduled: this.retryScheduled.size,
+      tokenFailures: Array.from(this.tokenFailureTracker.entries()).map(([userId, data]) => ({
+        userId,
+        failures: data.failures,
+        lastAttempt: new Date(data.lastAttempt).toISOString()
+      })),
+    };
+  }
+
+  // ============================================================
+  // 🔥 FIXED: restoreSessionsFromDatabase() - Needed for index.ts
+  // ============================================================
+
+  async restoreSessionsFromDatabase(): Promise<void> {
+    if (!this.checkMemory()) return;
+
+    this.asyncLogger.info('🔄 Restoring AutoJoin sessions from database...', { worker: this.workerId });
+    
+    try {
+      const allPremiumUsers = await this.getAllPremiumUsersAcrossAllGuilds();
+      let restored = 0, failed = 0, skipped = 0;
+      
+      for (const user of allPremiumUsers) {
+        if (!this.checkMemory()) break;
+        if (!user.token) { skipped++; continue; }
+        if (this.sessions.has(this.makeSessionKey(user.userId))) { skipped++; continue; }
+        
+        const success = await this.startSession(user.userId, user.guildId);
+        if (success) restored++;
+        else failed++;
+        await delay(200);
+      }
+      
+      this.asyncLogger.info(`✅ Restored ${restored} AutoJoin sessions (${failed} failed, ${skipped} skipped)`, {
+        worker: this.workerId, total: this.sessions.size, memory: this.getMemoryUsage(),
+      });
+    } catch (error) {
+      this.asyncLogger.error('Failed to restore AutoJoin sessions', { error: formatError(error) });
+    }
+  }
+
+  // ============================================================
+  // 🔥 FIXED: refreshSessions() - Needed for index.ts
+  // ============================================================
+
+  async refreshSessions(): Promise<void> {
+    if (this.isShuttingDown) return;
+    if (!this.checkMemory()) return;
+
+    try {
+      const allPremiumUsers = await this.getAllPremiumUsersAcrossAllGuilds();
+      const activeUserIds = new Set(allPremiumUsers.filter(u => u.token).map(u => u.userId));
+
+      for (const [key, session] of this.sessions) {
+        if (!activeUserIds.has(session.userId)) {
+          await this.stopSession(session.userId, session.guildId);
+        }
+      }
+
+      for (const user of allPremiumUsers) {
+        if (!this.checkMemory()) break;
+        if (!user.token) continue;
+        const sessionKey = this.makeSessionKey(user.userId);
+        if (!this.sessions.has(sessionKey)) {
+          await this.startSession(user.userId, user.guildId);
+          await delay(100);
+        }
+      }
+
+      this.logStats();
+    } catch (error) {
+      this.asyncLogger.error('Failed to refresh sessions', { error: formatError(error) });
+    }
+  }
+
+  // ============================================================
+  // 🔥 FIXED: retryFailedSessions() - Needed for index.ts
+  // ============================================================
+
+  async retryFailedSessions(): Promise<void> {
+    if (this.isShuttingDown) return;
+    if (!this.checkMemory()) return;
+    
+    try {
+      const allPremiumUsers = await this.getAllPremiumUsersAcrossAllGuilds();
+      const now = Date.now();
+      
+      for (const user of allPremiumUsers) {
+        if (!user.token) continue;
+        
+        const sessionKey = this.makeSessionKey(user.userId);
+        const hasSession = this.sessions.has(sessionKey);
+        const session = this.sessions.get(sessionKey);
+        
+        const isDeadSession = hasSession && session && (!session.isActive || session.destroyed);
+        const isInactive = user.tokenActive === false;
+        
+        const lastAttempt = user.lastLoginAttempt || 0;
+        const cooldownMs = TOKEN_REACTIVATION_THRESHOLD_MS;
+        const shouldRetry = (isDeadSession || isInactive) && (now - lastAttempt > cooldownMs);
+        
+        if (shouldRetry) {
+          this.asyncLogger.info(`🔄 Reactivating session for ${user.userId}`, {
+            currentStatus: user.tokenActive,
+            hasSession,
+            isActive: session?.isActive,
+            destroyed: session?.destroyed,
+            lastAttempt: new Date(lastAttempt).toISOString()
+          });
+          
+          if (isDeadSession) {
+            this.sessions.delete(sessionKey);
+            this.sessionsByUserId.delete(user.userId);
+          }
+          
+          const success = await this.startSession(user.userId, user.guildId);
+          
+          if (success) {
+            this.asyncLogger.info(`✅ Reactivated ${user.userId}`);
+            this.tokenFailureTracker.delete(user.userId);
+          } else {
+            await this.updateLastAttempt(user.userId, user.guildId);
+          }
+        }
+      }
+    } catch (error) {
+      this.asyncLogger.error('Failed to retry sessions', { error: formatError(error) });
+    }
+  }
+
+  private async updateLastAttempt(userId: string, guildId: string): Promise<void> {
+    try {
+      const key = `${userId}:${guildId}`;
+      this.tokenFailureTracker.set(userId, {
+        failures: (this.tokenFailureTracker.get(userId)?.failures || 0) + 1,
+        lastAttempt: Date.now()
+      });
+    } catch (error) {
+      // Silent fail
+    }
+  }
+
+  // ============================================================
+  // 🔥 FIXED: stopSession() - Proper cleanup
+  // ============================================================
+
+  async stopSession(userId: string, guildId: string): Promise<void> {
+    const sessionKey = this.makeSessionKey(userId);
+    const session = this.sessions.get(sessionKey);
+    if (!session) return;
+
+    session.destroyed = true;
+    session.isActive = false;
+
+    try {
+      this.cleanupSessionListeners(session);
+      this.clearClientCaches(session.client);
+      
+      try {
+        await session.client.destroy();
+      } catch {}
+      
+      this.sessions.delete(sessionKey);
+      this.sessionsByUserId.delete(userId);
+      this.tokenManager.clearCache(userId, guildId);
+      
+      this.asyncLogger.info('⏹️ AutoJoin session stopped', { 
+        userId, guildId, sessionId: session.sessionId, memory: this.getMemoryUsage(),
+      });
+      
+      this.emit('sessionStopped', { userId, guildId });
+    } catch (error) {
+      this.sessions.delete(sessionKey);
+      this.sessionsByUserId.delete(userId);
+    }
+  }
+
+  // ============================================================
+  // 🔥 FIXED: shutdown() - Complete cleanup
+  // ============================================================
+
+  async shutdown(): Promise<void> {
+    if (this.isShuttingDown) return;
+    
+    this.isShuttingDown = true;
+
+    this.asyncLogger.info('🛑 Shutting down AutoJoinManager...', {
+      worker: this.workerId, sessions: this.sessions.size, queueSize: this.joinQueue.getTotalSize(),
+    });
+
+    const intervals = [
+      this.refreshInterval, this.cleanupInterval, this.memoryCheckInterval,
+      this.reconnectCheckInterval, this.cacheCleanInterval, this.metricsInterval,
+      this.healthCheckInterval, this.queuePersistInterval, this.stallCheckInterval,
+      this.batchDbInterval, this.archiveInterval, this.statsCleanInterval,
+    ];
+    intervals.forEach(interval => {
+      if (interval) clearInterval(interval);
+    });
+
+    for (const [key, timeout] of this.retryScheduled) {
+      clearTimeout(timeout);
+    }
+    this.retryScheduled.clear();
+
+    await this.joinQueue.persist();
+
+    if (this.joinOutcomeBuffer.length > 0) {
+      try { await batchSaveJoinOutcomes(this.joinOutcomeBuffer); } catch {}
+      this.joinOutcomeBuffer = [];
+    }
+
+    if (this.sessionStartPromises.size > 0) {
+      try {
+        await Promise.race([
+          Promise.allSettled(this.sessionStartPromises.values()),
+          delay(5000),
+        ]);
+      } catch {}
+      this.sessionStartPromises.clear();
+    }
+
+    const sessionsToStop = Array.from(this.sessions.values());
+    
+    for (const session of sessionsToStop) {
+      session.destroyed = true;
+      session.isActive = false;
+      
+      this.cleanupSessionListeners(session);
+      this.clearClientCaches(session.client);
+      
+      try { 
+        session.client.removeAllListeners();
+        await session.client.destroy(); 
+      } catch {}
+      
+      this.sessions.delete(this.makeSessionKey(session.userId));
+      this.sessionsByUserId.delete(session.userId);
+      this.tokenManager.clearCache(session.userId, session.guildId);
+    }
+
+    this.sessions.clear();
+    this.sessionsByUserId.clear();
+    this.processedMessages.clear();
+    this.processingCache.clear();
+    this.recentWins.clear();
+    this.noResponseCooldown.clear();
+    this.crosspostCache.clear();
+    this.messageCache.clear();
+    this.tokenManager.clearAll();
+    this.sessionStartPromises.clear();
+    this.guildStatsCache.clear();
+    this.accountStatsCache.clear();
+    this.reconnectCountMap.clear();
+    this.tokenFailureTracker.clear();
+    
+    try { this.httpAgent.destroy(); } catch {}
+    try { this.httpsAgent.destroy(); } catch {}
+    
+    this.asyncLogger.shutdown();
+    
+    if (global.gc) global.gc();
+    
+    this.asyncLogger.info('✅ AutoJoin shutdown complete', { 
+      worker: this.workerId, memory: this.getMemoryUsage(),
+    });
   }
 
   private logStats(): void {
