@@ -1306,24 +1306,28 @@ export class AutoJoinManager extends EventEmitter {
   // 🔥 NEW: Get Gateway Session ID
   // -------------------------------------------------------------------------
 
-  private async getGatewaySessionId(client: Client): Promise<string | null> {
+  private async clickButton(message: Message, button: GiveawayButton, session: UserSession): Promise<void> {
+  const selfbotMsg = message as Message & { clickButton?: (id: string) => Promise<unknown> };
+  
+  if (typeof selfbotMsg.clickButton === 'function') {
     try {
-      // @ts-ignore - internal property
-      const shard = client.ws?.shards?.first?.() || client.ws?.shards?.get?.(0);
-      if (shard?.sessionId) {
-        return shard.sessionId;
+      // 🔥 This handles session IDs internally - no need for manual post
+      await selfbotMsg.clickButton(button.customId);
+      return;
+    } catch (error) {
+      const errorMsg = formatError(error);
+      // Only fallback if the built-in method fails
+      if (errorMsg.includes('No responsed from Application') || 
+          errorMsg.includes('No response from Application')) {
+        await this.postInteraction(message, button, session);
+        return;
       }
-      for (let i = 0; i < 5; i++) {
-        await delay(500);
-        // @ts-ignore
-        const sid = client.ws?.shards?.first?.()?.sessionId || 
-                    client.ws?.shards?.get?.(0)?.sessionId;
-        if (sid) return sid;
-      }
-      return null;
-    } catch {
-      return null;
+      throw error;
     }
+  }
+
+  // Fallback: manual post (use the any-cast version above)
+  await this.postInteraction(message, button, session);
   }
 
   // -------------------------------------------------------------------------
