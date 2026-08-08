@@ -152,7 +152,6 @@ interface UserSession {
   decryptedToken: string;
   loginFailures: number;
   lastLoginAttempt: number;
-  // 🔥 NEW: Cached gateway session ID
   gatewaySessionId: string | null;
   lastSessionIdFetch: number;
 }
@@ -181,7 +180,6 @@ interface QueueItem {
   maxAttempts: number;
   lastError?: string;
   buttonCustomId?: string;
-  // 🔥 NEW: Cached data to avoid DB re-fetch
   cachedButtonId?: string;
   cachedPrize?: string;
   cachedGuildName?: string;
@@ -213,7 +211,6 @@ interface AccountStats {
   reconnectCount: number;
 }
 
-// 🔥 NEW: Cached message data
 interface CachedMessageData {
   buttonCustomId: string;
   prize: string;
@@ -227,7 +224,7 @@ interface CachedMessageData {
 }
 
 // ---------------------------------------------------------------------------
-// Constants - 🔥 SPEED OPTIMIZED
+// Constants - SPEED OPTIMIZED
 // ---------------------------------------------------------------------------
 
 const GIVEAWAY_BOT_ID = '530082442967646230';
@@ -310,7 +307,7 @@ const PATTERNS = {
   TIMESTAMP: /<t:(\d{10,13})(?::[a-zA-Z])?>/,
 } as const;
 
-// 🔥 SPEED OPTIMIZED: Reduced TTLs
+// SPEED OPTIMIZED: Reduced TTLs
 const ENTRY_TTL_MS = 5 * 60 * 1000;
 const WIN_DEDUP_TTL_MS = 5 * 60 * 1000;
 const COMPONENT_RETRY_DELAY_MS = 50;
@@ -319,7 +316,7 @@ const SESSION_REFRESH_INTERVAL_MS = 60000;
 const HEARTBEAT_INTERVAL_MS = 300000;
 const HEALTH_CHECK_INTERVAL_MS = 60000;
 const STALL_TIMEOUT_MS = 120000;
-const MAX_SESSIONS_PER_WORKER = 999999; // 🔥 NO CAP
+const MAX_SESSIONS_PER_WORKER = 999999;
 const PROCESSING_CACHE_TTL_MS = 5000;
 const MAX_RECONNECT_ATTEMPTS = 10;
 const RECONNECT_DELAY_MS = 5000;
@@ -335,7 +332,7 @@ const QUEUE_PERSIST_INTERVAL_MS = 30000;
 const DEAD_LETTER_RESTORE_MAX_AGE_MS = 5 * 60 * 1000;
 const PENDING_RESTORE_MAX_AGE_MS = 30 * 60 * 1000;
 
-// 🔥 SPEED OPTIMIZED: Larger caches
+// SPEED OPTIMIZED: Larger caches
 const CACHE_PROCESSED_MESSAGES = 20000;
 const CACHE_MAX_PROCESSING = 5000;
 const CACHE_MAX_WINS = 500;
@@ -365,7 +362,7 @@ const INITIAL_RETRY_DELAY_MS = 5000;
 const MAX_RETRY_DELAY_MS = 60000;
 const TOKEN_REACTIVATION_THRESHOLD_MS = 60 * 1000;
 
-// 🔥 NEW: Concurrent entry limit per account
+// Concurrent entry limit per account
 const MAX_CONCURRENT_ENTRIES_PER_ACCOUNT = 5;
 
 // ---------------------------------------------------------------------------
@@ -855,7 +852,6 @@ class JoinQueue {
     return highestPriority;
   }
 
-  // 🔥 NEW: Dequeue multiple items at once
   dequeueBatch(guildId: string, count: number): QueueItem[] {
     const guildQueue = this.queues.get(guildId);
     if (!guildQueue || guildQueue.length === 0) return [];
@@ -1051,7 +1047,7 @@ export class AutoJoinManager extends EventEmitter {
   private recentWins: LRUCache<string, number>;
   private noResponseCooldown: LRUCache<string, number>;
   private crosspostCache: LRUCache<string, string>;
-  private messageCache: LRUCache<string, CachedMessageData>; // 🔥 NEW
+  private messageCache: LRUCache<string, CachedMessageData>;
   
   // Systems
   private joinQueue: JoinQueue;
@@ -1114,7 +1110,7 @@ export class AutoJoinManager extends EventEmitter {
     this.recentWins = new LRUCache<string, number>(CACHE_MAX_WINS, WIN_DEDUP_TTL_MS);
     this.noResponseCooldown = new LRUCache<string, number>(CACHE_MAX_COOLDOWN);
     this.crosspostCache = new LRUCache<string, string>(CACHE_CROSSPOST, 3600000);
-    this.messageCache = new LRUCache<string, CachedMessageData>(CACHE_MESSAGES, 30000); // 🔥 NEW
+    this.messageCache = new LRUCache<string, CachedMessageData>(CACHE_MESSAGES, 30000);
     
     // Initialize systems
     this.joinQueue = new JoinQueue();
@@ -1306,35 +1302,46 @@ export class AutoJoinManager extends EventEmitter {
   // 🔥 NEW: Get Gateway Session ID
   // -------------------------------------------------------------------------
 
-  private async clickButton(message: Message, button: GiveawayButton, session: UserSession): Promise<void> {
-  const selfbotMsg = message as Message & { clickButton?: (id: string) => Promise<unknown> };
-  
-  if (typeof selfbotMsg.clickButton === 'function') {
+  private async getGatewaySessionId(client: Client): Promise<string | null> {
     try {
-      // 🔥 This handles session IDs internally - no need for manual post
-      await selfbotMsg.clickButton(button.customId);
-      return;
-    } catch (error) {
-      const errorMsg = formatError(error);
-      // Only fallback if the built-in method fails
-      if (errorMsg.includes('No responsed from Application') || 
-          errorMsg.includes('No response from Application')) {
-        await this.postInteraction(message, button, session);
-        return;
+      // Cast to any to bypass TypeScript's private access
+      const ws = client as any;
+      if (!ws.ws) return null;
+      
+      // Get shards
+      const shards = ws.ws.shards;
+      if (!shards) return null;
+      
+      // Get first shard
+      const shard = shards.first?.() || shards.get?.(0);
+      if (!shard) return null;
+      
+      // sessionId is private but accessible at runtime
+      const sessionId = shard.sessionId;
+      if (sessionId) return sessionId;
+      
+      // Try internal state
+      const state = shard._state || shard.state;
+      if (state && state.sessionId) {
+        return state.sessionId;
       }
-      throw error;
+      
+      // Try connection object
+      const connection = shard.connection;
+      if (connection && connection.sessionId) {
+        return connection.sessionId;
+      }
+      
+      return null;
+    } catch {
+      return null;
     }
-  }
-
-  // Fallback: manual post (use the any-cast version above)
-  await this.postInteraction(message, button, session);
   }
 
   // -------------------------------------------------------------------------
   // Public API
   // -------------------------------------------------------------------------
 
-  // 🔥 FIXED: Start ALL sessions in parallel - NO CAP, NO BATCHING
   async startAllSessions(): Promise<void> {
     if (!this.checkMemory()) return;
 
@@ -1353,7 +1360,6 @@ export class AutoJoinManager extends EventEmitter {
 
       this.asyncLogger.info(`🔥 Starting ${usersToStart.length} sessions ALL AT ONCE (no batching)...`);
 
-      // 🔥 START ALL SESSIONS IN PARALLEL
       const startPromises = usersToStart.map(user => 
         this.startSession(user.userId, user.guildId)
       );
@@ -1549,11 +1555,10 @@ export class AutoJoinManager extends EventEmitter {
         decryptedToken,
         loginFailures: 0,
         lastLoginAttempt: Date.now(),
-        gatewaySessionId: null, // 🔥 NEW
-        lastSessionIdFetch: 0, // 🔥 NEW
+        gatewaySessionId: null,
+        lastSessionIdFetch: 0,
       };
 
-      // 🔥 NEW: Get and cache gateway session ID
       session.gatewaySessionId = await this.getGatewaySessionId(client);
       session.lastSessionIdFetch = Date.now();
 
@@ -1605,7 +1610,6 @@ export class AutoJoinManager extends EventEmitter {
     });
   }
 
-  // 🔥 FIXED: 2 second ready timeout (was 10)
   private async waitForReady(client: Client): Promise<void> {
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => reject(new Error('Ready timeout')), 2000);
@@ -1698,7 +1702,6 @@ export class AutoJoinManager extends EventEmitter {
         session.lastHealthCheck = Date.now();
         session.stallCount = 0;
         
-        // 🔥 Refresh session ID periodically
         if (!session.gatewaySessionId || (Date.now() - session.lastSessionIdFetch > 60000)) {
           this.getGatewaySessionId(client).then(sid => {
             if (sid) {
@@ -1741,7 +1744,6 @@ export class AutoJoinManager extends EventEmitter {
                   const newSession = this.sessionsByUserId.get(session.userId);
                   if (newSession) {
                     newSession.reconnectAttempts = 0;
-                    // 🔥 Restore session ID
                     newSession.gatewaySessionId = session.gatewaySessionId;
                     newSession.lastSessionIdFetch = Date.now();
                   }
@@ -2299,7 +2301,6 @@ export class AutoJoinManager extends EventEmitter {
 
       const correlationId = uuidv4();
 
-      // 🔥 Cache message data for fast access
       const cacheKey = `${message.channel.id}:${message.id}`;
       this.messageCache.set(cacheKey, {
         buttonCustomId: detected.button.customId,
@@ -2485,7 +2486,6 @@ export class AutoJoinManager extends EventEmitter {
       attempts: 0,
       maxAttempts: CONFIG.maxRetries + 1,
       buttonCustomId: entry.buttonCustomId,
-      // 🔥 Cache data
       cachedButtonId: entry.buttonCustomId,
       cachedPrize: entry.prize,
       cachedGuildName: entry.guildName,
@@ -2497,7 +2497,6 @@ export class AutoJoinManager extends EventEmitter {
     if (enqueued) {
       await updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'queued', {});
 
-      // 🔥 Process queue in parallel
       this.processQueueParallel(session.userId, entry.guildId).catch(error => {
         this.asyncLogger.error('Queue processing error', { correlationId, error: formatError(error) });
       });
@@ -2536,7 +2535,6 @@ export class AutoJoinManager extends EventEmitter {
         
         const entryId = this.makeEntryIdFromMessage(userId, item.channelId, item.messageId);
         
-        // 🔥 Build entry from queue item (NO DB FETCH)
         const entry: GiveawayEntry = {
           _id: entryId,
           userId: session.userId,
@@ -2558,7 +2556,6 @@ export class AutoJoinManager extends EventEmitter {
           detectionReasons: [],
         };
 
-        // 🔥 Check message cache for button data
         const cacheKey = `${item.channelId}:${item.messageId}`;
         const cached = this.messageCache.get(cacheKey);
         if (cached) {
@@ -2575,7 +2572,6 @@ export class AutoJoinManager extends EventEmitter {
         
         activePromises.add(promise);
         
-        // Small jitter to avoid rate limit spikes
         await delay(50 + Math.random() * 100);
       }
 
@@ -2723,7 +2719,6 @@ export class AutoJoinManager extends EventEmitter {
       } catch (error) {
         const errorMsg = formatError(error);
         
-        // 🔥 Don't retry these
         if (errorMsg.includes('already entered') || 
             errorMsg.includes('already joined') ||
             errorMsg.includes('already participating')) {
@@ -2827,12 +2822,10 @@ export class AutoJoinManager extends EventEmitter {
   private async enterViaButton(entry: GiveawayEntry, session: UserSession): Promise<boolean> {
     if (!entry.buttonCustomId) throw new Error('No buttonCustomId set');
 
-    // 🔥 50ms delay (was 500ms)
     if (CONFIG.buttonDelayMs > 0) {
       await delay(Math.min(CONFIG.buttonDelayMs, 50));
     }
 
-    // 🔥 Check cache first
     const cacheKey = `${entry.channelId}:${entry.messageId}`;
     const cached = this.messageCache.get(cacheKey);
     
@@ -2892,7 +2885,6 @@ export class AutoJoinManager extends EventEmitter {
     await this.postInteraction(message, button, session);
   }
 
-  // 🔥 FIXED: postInteraction with cached session ID
   private async postInteraction(message: Message, button: GiveawayButton, session: UserSession): Promise<void> {
     if (this.apiCircuitBreaker.isOpen()) {
       throw new Error(`Circuit breaker is open (${this.apiCircuitBreaker.getState()})`);
@@ -2901,7 +2893,6 @@ export class AutoJoinManager extends EventEmitter {
     await this.apiCircuitBreaker.execute(async () => {
       const client = message.client as any;
       
-      // 🔥 Use cached session ID
       let wsSessionId = session.gatewaySessionId;
       
       if (!wsSessionId || (Date.now() - session.lastSessionIdFetch > 30000)) {
