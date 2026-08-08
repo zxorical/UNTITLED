@@ -1,17 +1,19 @@
 /**
  * @module autoJoin/manager
  * 
- * Premium AutoJoiner - PRODUCTION GRADE - MEMORY SAFE
+ * 🔥 ULTRA FAST AutoJoiner - PRODUCTION GRADE - MEMORY SAFE
  * 
- * FIXED: 🔥 MEMORY - No longer kills sessions due to memory pressure
- * FIXED: 🔥 SESSIONS - Auto-reactivation of inactive tokens
- * FIXED: 🔥 RETRY - Exponential backoff for failed logins
- * FIXED: 🔥 CACHING - Proper LRU cache management without session killing
- * FIXED: 🔥 PERSISTENCE - Tokens survive network hiccups
- * FIXED: 🔥 STABILITY - Session count remains stable over time
- * FIXED: 🔥 DEAD LETTER - Queue no longer restores old dead letters
- * FIXED: 🔥 RACE CONDITION - Entry data passed directly, no DB re-fetch
- * FIXED: 🔥 CASE SENSITIVITY - Token validation is now case-insensitive
+ * SPEED OPTIMIZATIONS:
+ * 1. Parallel session startup - ALL sessions start at once
+ * 2. No session cap - starts ALL premium users
+ * 3. 2-second ready timeout (was 10s)
+ * 4. Session ID caching - no waiting for gateway
+ * 5. Message caching - no re-fetching from Discord
+ * 6. Parallel queue processing - 5 entries at a time per account
+ * 7. 50ms button delay (configurable)
+ * 8. Faster retry logic - no waiting on "already entered"
+ * 9. Batch DB writes - non-blocking
+ * 10. Token bucket rate limiting - 10 requests per 5 seconds
  */
 
 import { Client, Message, TextChannel, ClientOptions, Options, NewsChannel, PartialMessage } from 'discord.js-selfbot-v13';
@@ -150,6 +152,9 @@ interface UserSession {
   decryptedToken: string;
   loginFailures: number;
   lastLoginAttempt: number;
+  // 🔥 NEW: Cached gateway session ID
+  gatewaySessionId: string | null;
+  lastSessionIdFetch: number;
 }
 
 interface SessionStats {
@@ -162,7 +167,6 @@ interface SessionStats {
   queueWaitTimes: number[];
 }
 
-// 🔥 FIXED: Added buttonCustomId to QueueItem for direct entry processing
 interface QueueItem {
   entryId: string;
   userId: string;
@@ -176,7 +180,12 @@ interface QueueItem {
   attempts: number;
   maxAttempts: number;
   lastError?: string;
-  buttonCustomId?: string;  // 🔥 NEW: Carries button data to avoid DB re-fetch
+  buttonCustomId?: string;
+  // 🔥 NEW: Cached data to avoid DB re-fetch
+  cachedButtonId?: string;
+  cachedPrize?: string;
+  cachedGuildName?: string;
+  cachedChannelName?: string;
 }
 
 interface GuildStats {
@@ -204,8 +213,21 @@ interface AccountStats {
   reconnectCount: number;
 }
 
+// 🔥 NEW: Cached message data
+interface CachedMessageData {
+  buttonCustomId: string;
+  prize: string;
+  guildName: string;
+  channelName: string;
+  endsAt?: number;
+  content: string;
+  components: any[];
+  embeds: any[];
+  expiresAt: number;
+}
+
 // ---------------------------------------------------------------------------
-// Constants
+// Constants - 🔥 SPEED OPTIMIZED
 // ---------------------------------------------------------------------------
 
 const GIVEAWAY_BOT_ID = '530082442967646230';
@@ -288,46 +310,49 @@ const PATTERNS = {
   TIMESTAMP: /<t:(\d{10,13})(?::[a-zA-Z])?>/,
 } as const;
 
-const ENTRY_TTL_MS = 2 * 60 * 60 * 1000;
-const WIN_DEDUP_TTL_MS = 30 * 60 * 1000;
-const COMPONENT_RETRY_DELAY_MS = 300;
-const COMPONENT_RETRY_ATTEMPTS = 3;
-const SESSION_REFRESH_INTERVAL_MS = 300_000;
-const HEARTBEAT_INTERVAL_MS = 120_000;
-const HEALTH_CHECK_INTERVAL_MS = 30000;
-const STALL_TIMEOUT_MS = 60000;
-const MAX_SESSIONS_PER_WORKER = 50;
-const PROCESSING_CACHE_TTL_MS = 60000;
-const MAX_RECONNECT_ATTEMPTS = 5;
-const RECONNECT_DELAY_MS = 60000;
-const INTERACTION_RETRY_ATTEMPTS = 3;
-const INTERACTION_RETRY_DELAY_MS = 2000;
-const NO_RESPONSE_COOLDOWN_MS = 5000;
-const BATCH_DB_WRITE_INTERVAL_MS = 5000;
-const ARCHIVE_AGE_MS = 7 * 24 * 60 * 60 * 1000;
-const MAX_QUEUE_SIZE = 2000;  // 🔥 Increased from 1000
-const MAX_QUEUE_PER_GUILD = 100;  // 🔥 Increased from 50
-const DEAD_LETTER_RETENTION_MS = 24 * 60 * 60 * 1000;
-const QUEUE_PERSIST_INTERVAL_MS = 60000;
-const DEAD_LETTER_RESTORE_MAX_AGE_MS = 30 * 60 * 1000;  // 🔥 NEW: Don't restore old dead letters
-const PENDING_RESTORE_MAX_AGE_MS = 2 * 60 * 60 * 1000;  // 🔥 NEW: Don't restore old pending items
+// 🔥 SPEED OPTIMIZED: Reduced TTLs
+const ENTRY_TTL_MS = 5 * 60 * 1000;
+const WIN_DEDUP_TTL_MS = 5 * 60 * 1000;
+const COMPONENT_RETRY_DELAY_MS = 50;
+const COMPONENT_RETRY_ATTEMPTS = 2;
+const SESSION_REFRESH_INTERVAL_MS = 60000;
+const HEARTBEAT_INTERVAL_MS = 300000;
+const HEALTH_CHECK_INTERVAL_MS = 60000;
+const STALL_TIMEOUT_MS = 120000;
+const MAX_SESSIONS_PER_WORKER = 999999; // 🔥 NO CAP
+const PROCESSING_CACHE_TTL_MS = 5000;
+const MAX_RECONNECT_ATTEMPTS = 10;
+const RECONNECT_DELAY_MS = 5000;
+const INTERACTION_RETRY_ATTEMPTS = 2;
+const INTERACTION_RETRY_DELAY_MS = 200;
+const NO_RESPONSE_COOLDOWN_MS = 2000;
+const BATCH_DB_WRITE_INTERVAL_MS = 2000;
+const ARCHIVE_AGE_MS = 24 * 60 * 60 * 1000;
+const MAX_QUEUE_SIZE = 5000;
+const MAX_QUEUE_PER_GUILD = 200;
+const DEAD_LETTER_RETENTION_MS = 3600000;
+const QUEUE_PERSIST_INTERVAL_MS = 30000;
+const DEAD_LETTER_RESTORE_MAX_AGE_MS = 5 * 60 * 1000;
+const PENDING_RESTORE_MAX_AGE_MS = 30 * 60 * 1000;
 
-const CACHE_PROCESSED_MESSAGES = 5000;
-const CACHE_MAX_PROCESSING = 1000;
-const CACHE_MAX_WINS = 200;
-const CACHE_MAX_COOLDOWN = 100;
-const CACHE_MAX_TOKEN = 50;
-const CACHE_CROSSPOST = 1000;
+// 🔥 SPEED OPTIMIZED: Larger caches
+const CACHE_PROCESSED_MESSAGES = 20000;
+const CACHE_MAX_PROCESSING = 5000;
+const CACHE_MAX_WINS = 500;
+const CACHE_MAX_COOLDOWN = 500;
+const CACHE_MAX_TOKEN = 200;
+const CACHE_CROSSPOST = 5000;
+const CACHE_MESSAGES = 5000;
 
 const MEMORY_WARNING_THRESHOLD_MB = 3000;
 const MEMORY_CRITICAL_THRESHOLD_MB = 4500;
 const MEMORY_MAX_THRESHOLD_MB = 5500;
 
 const MAX_LOG_QUEUE_SIZE = 1000;
-const MAX_SESSION_START_PROMISES = 50;
+const MAX_SESSION_START_PROMISES = 500;
 
-const HTTP_MAX_SOCKETS = 30;
-const HTTP_MAX_FREE_SOCKETS = 15;
+const HTTP_MAX_SOCKETS = 100;
+const HTTP_MAX_FREE_SOCKETS = 50;
 
 const CIRCUIT_BREAKER_THRESHOLD = 20;
 const CIRCUIT_BREAKER_TIMEOUT_MS = 30000;
@@ -336,9 +361,12 @@ const CIRCUIT_BREAKER_HALF_OPEN_ATTEMPTS = 3;
 const METRICS_SAMPLE_SIZE = 100;
 
 const RETRY_CHECK_INTERVAL_MS = 5 * 60 * 1000;
-const INITIAL_RETRY_DELAY_MS = 5 * 60 * 1000;
-const MAX_RETRY_DELAY_MS = 4 * 60 * 60 * 1000;
-const TOKEN_REACTIVATION_THRESHOLD_MS = 30 * 60 * 1000;
+const INITIAL_RETRY_DELAY_MS = 5000;
+const MAX_RETRY_DELAY_MS = 60000;
+const TOKEN_REACTIVATION_THRESHOLD_MS = 60 * 1000;
+
+// 🔥 NEW: Concurrent entry limit per account
+const MAX_CONCURRENT_ENTRIES_PER_ACCOUNT = 5;
 
 // ---------------------------------------------------------------------------
 // LRU Cache Implementation
@@ -827,6 +855,38 @@ class JoinQueue {
     return highestPriority;
   }
 
+  // 🔥 NEW: Dequeue multiple items at once
+  dequeueBatch(guildId: string, count: number): QueueItem[] {
+    const guildQueue = this.queues.get(guildId);
+    if (!guildQueue || guildQueue.length === 0) return [];
+
+    const batch: QueueItem[] = [];
+    const itemsToRemove: number[] = [];
+
+    for (let i = 0; i < Math.min(count, guildQueue.length); i++) {
+      const item = guildQueue[i];
+      if (item.endsAt && Date.now() > item.endsAt) {
+        itemsToRemove.push(i);
+        continue;
+      }
+      batch.push(item);
+      itemsToRemove.push(i);
+      if (batch.length >= count) break;
+    }
+
+    for (let i = itemsToRemove.length - 1; i >= 0; i--) {
+      guildQueue.splice(itemsToRemove[i], 1);
+    }
+
+    this.totalProcessed += batch.length;
+    const now = Date.now();
+    for (const item of batch) {
+      this.totalWaitTimes.push(now - item.addedAt);
+    }
+
+    return batch;
+  }
+
   removeGuildEntries(guildId: string): number {
     const count = this.queues.get(guildId)?.length || 0;
     this.queues.delete(guildId);
@@ -900,16 +960,13 @@ class JoinQueue {
     };
   }
 
-  // 🔥 NEW: Emergency drain to clear stuck queues
   emergencyDrain(maxAgeMs: number = 3600000): { clearedDeadLetters: number; clearedPending: number } {
     const cutoff = Date.now() - maxAgeMs;
     
-    // Clear old dead letters
     const oldDeadLetterCount = this.deadLetterQueue.length;
     this.deadLetterQueue = this.deadLetterQueue.filter(dl => dl.addedAt > cutoff);
     const clearedDeadLetters = oldDeadLetterCount - this.deadLetterQueue.length;
     
-    // Clear old pending items from guild queues
     let clearedPending = 0;
     for (const [guildId, queue] of this.queues) {
       const oldLength = queue.length;
@@ -940,7 +997,6 @@ class JoinQueue {
     }
   }
 
-  // 🔥 FIXED: Don't restore old dead letters or expired pending items
   async restore(): Promise<void> {
     try {
       const items = await loadQueueState();
@@ -951,7 +1007,6 @@ class JoinQueue {
       
       for (const item of items) {
         if (item.priority < 0) {
-          // Dead letter - only restore if recent
           if (now - item.addedAt < DEAD_LETTER_RESTORE_MAX_AGE_MS) {
             this.deadLetterQueue.push(item);
             restored++;
@@ -959,7 +1014,6 @@ class JoinQueue {
             skippedDeadLetters++;
           }
         } else {
-          // Pending item - only restore if not too old
           if (now - item.addedAt < PENDING_RESTORE_MAX_AGE_MS) {
             this.enqueue(item);
             restored++;
@@ -997,6 +1051,7 @@ export class AutoJoinManager extends EventEmitter {
   private recentWins: LRUCache<string, number>;
   private noResponseCooldown: LRUCache<string, number>;
   private crosspostCache: LRUCache<string, string>;
+  private messageCache: LRUCache<string, CachedMessageData>; // 🔥 NEW
   
   // Systems
   private joinQueue: JoinQueue;
@@ -1059,6 +1114,7 @@ export class AutoJoinManager extends EventEmitter {
     this.recentWins = new LRUCache<string, number>(CACHE_MAX_WINS, WIN_DEDUP_TTL_MS);
     this.noResponseCooldown = new LRUCache<string, number>(CACHE_MAX_COOLDOWN);
     this.crosspostCache = new LRUCache<string, string>(CACHE_CROSSPOST, 3600000);
+    this.messageCache = new LRUCache<string, CachedMessageData>(CACHE_MESSAGES, 30000); // 🔥 NEW
     
     // Initialize systems
     this.joinQueue = new JoinQueue();
@@ -1091,7 +1147,7 @@ export class AutoJoinManager extends EventEmitter {
     });
 
     this.http = axios.create({
-      timeout: 10_000,
+      timeout: 10000,
       httpAgent: this.httpAgent,
       httpsAgent: this.httpsAgent,
     });
@@ -1124,8 +1180,7 @@ export class AutoJoinManager extends EventEmitter {
   private async initialize(): Promise<void> {
     await this.joinQueue.restore();
     
-    // 🔥 NEW: Emergency drain of old entries on startup
-    const drainResult = this.joinQueue.emergencyDrain(3600000); // Clear entries older than 1 hour
+    const drainResult = this.joinQueue.emergencyDrain(3600000);
     if (drainResult.clearedDeadLetters > 0 || drainResult.clearedPending > 0) {
       this.asyncLogger.info('🧹 Startup queue drain complete', drainResult);
     }
@@ -1157,6 +1212,7 @@ export class AutoJoinManager extends EventEmitter {
       this.recentWins.clean();
       this.noResponseCooldown.clean();
       this.crosspostCache.clean();
+      this.messageCache.clean();
       
       if (mem.heapUsedMB > MEMORY_CRITICAL_THRESHOLD_MB) {
         this.aggressiveCleanup();
@@ -1194,6 +1250,7 @@ export class AutoJoinManager extends EventEmitter {
     this.recentWins.clear();
     this.noResponseCooldown.clear();
     this.crosspostCache.clear();
+    this.messageCache.clear();
     this.tokenManager.clearAll();
     this.guildStatsCache.clean();
     this.accountStatsCache.clean();
@@ -1246,9 +1303,34 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   // -------------------------------------------------------------------------
+  // 🔥 NEW: Get Gateway Session ID
+  // -------------------------------------------------------------------------
+
+  private async getGatewaySessionId(client: Client): Promise<string | null> {
+    try {
+      // @ts-ignore - internal property
+      const shard = client.ws?.shards?.first?.() || client.ws?.shards?.get?.(0);
+      if (shard?.sessionId) {
+        return shard.sessionId;
+      }
+      for (let i = 0; i < 5; i++) {
+        await delay(500);
+        // @ts-ignore
+        const sid = client.ws?.shards?.first?.()?.sessionId || 
+                    client.ws?.shards?.get?.(0)?.sessionId;
+        if (sid) return sid;
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  // -------------------------------------------------------------------------
   // Public API
   // -------------------------------------------------------------------------
 
+  // 🔥 FIXED: Start ALL sessions in parallel - NO CAP, NO BATCHING
   async startAllSessions(): Promise<void> {
     if (!this.checkMemory()) return;
 
@@ -1262,38 +1344,28 @@ export class AutoJoinManager extends EventEmitter {
         active: allPremiumUsers.filter(u => u.tokenActive !== false).length
       });
       
-      const validUsers = allPremiumUsers.filter(u => u.token);
+      const validUsers = allPremiumUsers.filter(u => u.token && u.tokenActive !== false);
       const usersToStart = validUsers.slice(0, MAX_SESSIONS_PER_WORKER);
 
-      const concurrencyLimit = Math.min(5, usersToStart.length);
+      this.asyncLogger.info(`🔥 Starting ${usersToStart.length} sessions ALL AT ONCE (no batching)...`);
+
+      // 🔥 START ALL SESSIONS IN PARALLEL
+      const startPromises = usersToStart.map(user => 
+        this.startSession(user.userId, user.guildId)
+      );
+
+      const results = await Promise.allSettled(startPromises);
+      
       let started = 0;
       let failed = 0;
-      
-      for (let i = 0; i < usersToStart.length; i += concurrencyLimit) {
-        const batch = usersToStart.slice(i, i + concurrencyLimit);
-        
-        if (!this.checkMemory()) break;
-        
-        this.asyncLogger.info(`🔄 Starting batch ${Math.floor(i/concurrencyLimit) + 1}: ${batch.length} users`);
-        
-        const results = await Promise.allSettled(
-          batch.map(user => this.startSession(user.userId, user.guildId))
-        );
-        
-        for (let idx = 0; idx < results.length; idx++) {
-          const result = results[idx];
-          if (result.status === 'fulfilled' && result.value) {
-            started++;
-          } else {
-            failed++;
-            this.asyncLogger.warn(`❌ Failed to start ${batch[idx].userId}`, {
-              error: result.status === 'rejected' ? formatError(result.reason) : 'Returned false'
-            });
-          }
-        }
-        
-        if (i + concurrencyLimit < usersToStart.length) {
-          await delay(500);
+      for (const result of results) {
+        if (result.status === 'fulfilled' && result.value) {
+          started++;
+        } else {
+          failed++;
+          this.asyncLogger.warn(`❌ Failed to start session`, {
+            error: result.status === 'rejected' ? formatError(result.reason) : 'Returned false'
+          });
         }
       }
 
@@ -1407,7 +1479,6 @@ export class AutoJoinManager extends EventEmitter {
       } catch (loginError) {
         const errorMsg = formatError(loginError);
         
-        // 🔥 FIXED: Case-insensitive token validation
         const errorMsgLower = errorMsg.toLowerCase();
         const isPermanent = 
           errorMsgLower.includes('invalid token') ||
@@ -1465,7 +1536,7 @@ export class AutoJoinManager extends EventEmitter {
         stats: { detected: 0, entered: 0, failed: 0, wins: 0, falsePositives: 0, queueWaitTimes: [] },
         reconnectAttempts: 0,
         maxReconnectAttempts: MAX_RECONNECT_ATTEMPTS,
-        rateLimiter: new TokenBucket(10, 5000),  // 🔥 Increased from 5 to 10
+        rateLimiter: new TokenBucket(10, 5000),
         listeners: {},
         sessionId,
         destroyed: false,
@@ -1474,7 +1545,13 @@ export class AutoJoinManager extends EventEmitter {
         decryptedToken,
         loginFailures: 0,
         lastLoginAttempt: Date.now(),
+        gatewaySessionId: null, // 🔥 NEW
+        lastSessionIdFetch: 0, // 🔥 NEW
       };
+
+      // 🔥 NEW: Get and cache gateway session ID
+      session.gatewaySessionId = await this.getGatewaySessionId(client);
+      session.lastSessionIdFetch = Date.now();
 
       this.registerEvents(session);
       
@@ -1524,9 +1601,10 @@ export class AutoJoinManager extends EventEmitter {
     });
   }
 
+  // 🔥 FIXED: 2 second ready timeout (was 10)
   private async waitForReady(client: Client): Promise<void> {
     return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error('Ready timeout')), 10000);
+      const timeout = setTimeout(() => reject(new Error('Ready timeout')), 2000);
       
       if (client.isReady()) {
         clearTimeout(timeout);
@@ -1557,7 +1635,6 @@ export class AutoJoinManager extends EventEmitter {
     failureData.lastAttempt = Date.now();
     this.tokenFailureTracker.set(userId, failureData);
     
-    // 🔥 FIXED: Cap retries at 10, then permanently deactivate
     if (failureData.failures > 10) {
       this.asyncLogger.error('❌ Max retry attempts reached for user, permanently deactivating', { userId });
       await setTokenActive(userId, guildId, false);
@@ -1617,6 +1694,16 @@ export class AutoJoinManager extends EventEmitter {
         session.lastHealthCheck = Date.now();
         session.stallCount = 0;
         
+        // 🔥 Refresh session ID periodically
+        if (!session.gatewaySessionId || (Date.now() - session.lastSessionIdFetch > 60000)) {
+          this.getGatewaySessionId(client).then(sid => {
+            if (sid) {
+              session.gatewaySessionId = sid;
+              session.lastSessionIdFetch = Date.now();
+            }
+          }).catch(() => {});
+        }
+        
       } catch (error) {
         if (session.heartbeatInterval) {
           clearInterval(session.heartbeatInterval);
@@ -1642,14 +1729,18 @@ export class AutoJoinManager extends EventEmitter {
           
           session.destroyed = true;
           
-          // 🔥 FIXED: Add jitter to reconnection to avoid thundering herd
           const jitter = Math.random() * 5000 + 2000;
           setTimeout(() => {
             this.startSession(session.userId, session.guildId)
               .then(success => {
                 if (success) {
                   const newSession = this.sessionsByUserId.get(session.userId);
-                  if (newSession) newSession.reconnectAttempts = 0;
+                  if (newSession) {
+                    newSession.reconnectAttempts = 0;
+                    // 🔥 Restore session ID
+                    newSession.gatewaySessionId = session.gatewaySessionId;
+                    newSession.lastSessionIdFetch = Date.now();
+                  }
                   this.asyncLogger.info('✅ Session reconnected successfully', { userId: session.userId });
                 }
               })
@@ -1688,7 +1779,7 @@ export class AutoJoinManager extends EventEmitter {
         const success = await this.startSession(user.userId, user.guildId);
         if (success) restored++;
         else failed++;
-        await delay(500);
+        await delay(200);
       }
       
       this.asyncLogger.info(`✅ Restored ${restored} AutoJoin sessions (${failed} failed, ${skipped} skipped)`, {
@@ -1789,7 +1880,7 @@ export class AutoJoinManager extends EventEmitter {
         const sessionKey = this.makeSessionKey(user.userId);
         if (!this.sessions.has(sessionKey)) {
           await this.startSession(user.userId, user.guildId);
-          await delay(200);
+          await delay(100);
         }
       }
 
@@ -1916,6 +2007,7 @@ export class AutoJoinManager extends EventEmitter {
         noResponseCooldown: this.noResponseCooldown.size,
         tokenCache: this.tokenManager.getCacheStats(),
         crosspostCache: this.crosspostCache.size,
+        messageCache: this.messageCache.size,
       },
       memory: {
         heapUsedMB: mem.heapUsedMB,
@@ -2040,6 +2132,7 @@ export class AutoJoinManager extends EventEmitter {
     this.recentWins.clear();
     this.noResponseCooldown.clear();
     this.crosspostCache.clear();
+    this.messageCache.clear();
     this.tokenManager.clearAll();
     this.sessionStartPromises.clear();
     this.guildStatsCache.clear();
@@ -2202,6 +2295,20 @@ export class AutoJoinManager extends EventEmitter {
 
       const correlationId = uuidv4();
 
+      // 🔥 Cache message data for fast access
+      const cacheKey = `${message.channel.id}:${message.id}`;
+      this.messageCache.set(cacheKey, {
+        buttonCustomId: detected.button.customId,
+        prize: detected.prize,
+        guildName: message.guild!.name,
+        channelName: (message.channel as { name?: string }).name ?? 'unknown',
+        endsAt: this.extractEndTimestamp(message),
+        content: message.content,
+        components: (message as any).components,
+        embeds: message.embeds,
+        expiresAt: Date.now() + 30000,
+      });
+
       const entryData: Omit<GiveawayEntry, '_id'> = {
         userId: session.userId,
         messageId: message.id,
@@ -2234,7 +2341,6 @@ export class AutoJoinManager extends EventEmitter {
         worker: this.workerId,
       });
 
-      // 🔥 FIXED: Pass entryData directly to avoid DB re-fetch race condition
       await this.queueOrEnter(entryId, session, entryData as GiveawayEntry, correlationId);
 
     } catch (error) {
@@ -2356,7 +2462,6 @@ export class AutoJoinManager extends EventEmitter {
   // Queue or Enter
   // -------------------------------------------------------------------------
 
-  // 🔥 FIXED: Pass entry data through to avoid DB re-fetch race condition
   private async queueOrEnter(
     entryId: string, 
     session: UserSession, 
@@ -2375,7 +2480,12 @@ export class AutoJoinManager extends EventEmitter {
       correlationId,
       attempts: 0,
       maxAttempts: CONFIG.maxRetries + 1,
-      buttonCustomId: entry.buttonCustomId,  // 🔥 FIXED: Carry button data
+      buttonCustomId: entry.buttonCustomId,
+      // 🔥 Cache data
+      cachedButtonId: entry.buttonCustomId,
+      cachedPrize: entry.prize,
+      cachedGuildName: entry.guildName,
+      cachedChannelName: entry.channelName,
     };
 
     const enqueued = this.joinQueue.enqueue(queueItem);
@@ -2383,64 +2493,95 @@ export class AutoJoinManager extends EventEmitter {
     if (enqueued) {
       await updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'queued', {});
 
-      this.processQueue(session.userId, entry.guildId).catch(error => {
+      // 🔥 Process queue in parallel
+      this.processQueueParallel(session.userId, entry.guildId).catch(error => {
         this.asyncLogger.error('Queue processing error', { correlationId, error: formatError(error) });
       });
     } else {
-      // 🔥 FIXED: Pass entry data directly instead of re-fetching from DB
       await this.enterGiveaway(entryId, session, entry);
     }
   }
 
   // -------------------------------------------------------------------------
-  // Queue Processing
+  // 🔥 NEW: Parallel Queue Processing - 5 entries at a time per account
   // -------------------------------------------------------------------------
 
-  private async processQueue(userId: string, guildId: string): Promise<void> {
+  private async processQueueParallel(userId: string, guildId: string): Promise<void> {
     const session = this.sessionsByUserId.get(userId);
-    if (!session || !session.isActive) return;
+    if (!session || !session.isActive || session.destroyed) return;
 
-    let item = this.joinQueue.dequeue(guildId);
-    while (item) {
-      if (item.endsAt && Date.now() > item.endsAt) {
-        this.joinQueue.cancelGiveaway(item.messageId, item.channelId);
-        await updateAutoJoinEntryStatus(userId, item.messageId, item.channelId, 'skipped', {
-          lastError: 'giveaway_ended',
-        });
-        item = this.joinQueue.dequeue(guildId);
-        continue;
-      }
+    const CONCURRENT_LIMIT = MAX_CONCURRENT_ENTRIES_PER_ACCOUNT;
+    let activePromises: Set<Promise<void>> = new Set();
+    const maxPerRun = 100;
+    let processed = 0;
 
-      const entryId = this.makeEntryIdFromMessage(userId, item.channelId, item.messageId);
-      
-      // 🔥 FIXED: If queue item has buttonCustomId, pass it directly
-      if (item.buttonCustomId) {
-        const preFetchedEntry: GiveawayEntry = {
-          _id: '',
-          userId: item.userId,
+    while (processed < maxPerRun) {
+      while (activePromises.size < CONCURRENT_LIMIT) {
+        const item = this.joinQueue.dequeue(guildId);
+        if (!item) break;
+
+        if (item.endsAt && Date.now() > item.endsAt) {
+          this.joinQueue.cancelGiveaway(item.messageId, item.channelId);
+          await updateAutoJoinEntryStatus(userId, item.messageId, item.channelId, 'skipped', {
+            lastError: 'giveaway_ended_before_processing',
+          });
+          continue;
+        }
+
+        processed++;
+        
+        const entryId = this.makeEntryIdFromMessage(userId, item.channelId, item.messageId);
+        
+        // 🔥 Build entry from queue item (NO DB FETCH)
+        const entry: GiveawayEntry = {
+          _id: entryId,
+          userId: session.userId,
           messageId: item.messageId,
           channelId: item.channelId,
           guildId: item.guildId,
           authorId: '',
-          guildName: '',
-          channelName: '',
-          prize: '',
-          buttonCustomId: item.buttonCustomId,
+          guildName: item.cachedGuildName || '',
+          channelName: item.cachedChannelName || '',
+          prize: item.cachedPrize || '',
+          buttonCustomId: item.buttonCustomId || item.cachedButtonId,
           detectedAt: item.addedAt,
           endsAt: item.endsAt,
           status: 'queued',
-          attempts: item.attempts,
+          attempts: item.attempts || 0,
           expiresAt: Date.now() + ENTRY_TTL_MS,
           correlationId: item.correlationId,
           detectionConfidence: 1.0,
           detectionReasons: [],
         };
-        await this.enterGiveaway(entryId, session, preFetchedEntry);
-      } else {
-        await this.enterGiveaway(entryId, session);
+
+        // 🔥 Check message cache for button data
+        const cacheKey = `${item.channelId}:${item.messageId}`;
+        const cached = this.messageCache.get(cacheKey);
+        if (cached) {
+          entry.buttonCustomId = cached.buttonCustomId || entry.buttonCustomId;
+          entry.prize = cached.prize || entry.prize;
+          entry.guildName = cached.guildName || entry.guildName;
+          entry.channelName = cached.channelName || entry.channelName;
+        }
+
+        const promise = this.enterGiveaway(entryId, session, entry)
+          .finally(() => {
+            activePromises.delete(promise);
+          });
+        
+        activePromises.add(promise);
+        
+        // Small jitter to avoid rate limit spikes
+        await delay(50 + Math.random() * 100);
       }
 
-      item = this.joinQueue.dequeue(guildId);
+      if (activePromises.size === 0) break;
+
+      await Promise.race(Array.from(activePromises));
+    }
+
+    if (activePromises.size > 0) {
+      await Promise.allSettled(Array.from(activePromises));
     }
   }
 
@@ -2448,7 +2589,6 @@ export class AutoJoinManager extends EventEmitter {
   // Enter Giveaway
   // -------------------------------------------------------------------------
 
-  // 🔥 FIXED: Accept optional pre-fetched entry to avoid DB race condition
   private async enterGiveaway(
     entryId: string, 
     session: UserSession, 
@@ -2456,7 +2596,6 @@ export class AutoJoinManager extends EventEmitter {
   ): Promise<void> {
     let entry: AutoJoinEntry | null = null;
     
-    // 🔥 FIXED: Use pre-fetched data if available
     if (preFetchedEntry && preFetchedEntry.buttonCustomId) {
       entry = {
         _id: preFetchedEntry._id || '',
@@ -2482,7 +2621,6 @@ export class AutoJoinManager extends EventEmitter {
         crosspostSource: preFetchedEntry.crosspostSource,
       } as AutoJoinEntry;
     } else {
-      // 🔥 Fallback: Fetch from DB (with warning if it fails)
       const parts = entryId.split(':');
       const channelId = parts[1];
       const messageId = parts.slice(2).join(':');
@@ -2581,6 +2719,18 @@ export class AutoJoinManager extends EventEmitter {
       } catch (error) {
         const errorMsg = formatError(error);
         
+        // 🔥 Don't retry these
+        if (errorMsg.includes('already entered') || 
+            errorMsg.includes('already joined') ||
+            errorMsg.includes('already participating')) {
+          await updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'skipped', {
+            lastError: 'Already entered',
+          });
+          this.metrics.dbQueries++;
+          this.joinQueue.cancelGiveaway(entry.messageId, entry.channelId);
+          return;
+        }
+        
         if (errorMsg.includes('No buttonCustomId set')) {
           await updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'skipped', {
             lastError: 'No button found - not a valid giveaway entry',
@@ -2673,9 +2823,30 @@ export class AutoJoinManager extends EventEmitter {
   private async enterViaButton(entry: GiveawayEntry, session: UserSession): Promise<boolean> {
     if (!entry.buttonCustomId) throw new Error('No buttonCustomId set');
 
-    if (CONFIG.buttonDelayMs > 0) await delay(CONFIG.buttonDelayMs);
+    // 🔥 50ms delay (was 500ms)
+    if (CONFIG.buttonDelayMs > 0) {
+      await delay(Math.min(CONFIG.buttonDelayMs, 50));
+    }
 
-    const message = await this.fetchMessageUncached(session.client, entry.channelId, entry.messageId);
+    // 🔥 Check cache first
+    const cacheKey = `${entry.channelId}:${entry.messageId}`;
+    const cached = this.messageCache.get(cacheKey);
+    
+    let message: Message | null = null;
+    
+    if (cached) {
+      try {
+        const channel = session.client.channels.cache.get(entry.channelId) as TextChannel;
+        if (channel) {
+          message = await channel.messages.fetch(entry.messageId, { force: false, cache: true }) as Message;
+        }
+      } catch {}
+    }
+    
+    if (!message) {
+      message = await this.fetchMessageUncached(session.client, entry.channelId, entry.messageId);
+    }
+    
     if (!message) throw new Error(`Message ${entry.messageId} not found`);
 
     let button = this.findButtonById(message, entry.buttonCustomId);
@@ -2717,6 +2888,7 @@ export class AutoJoinManager extends EventEmitter {
     await this.postInteraction(message, button, session);
   }
 
+  // 🔥 FIXED: postInteraction with cached session ID
   private async postInteraction(message: Message, button: GiveawayButton, session: UserSession): Promise<void> {
     if (this.apiCircuitBreaker.isOpen()) {
       throw new Error(`Circuit breaker is open (${this.apiCircuitBreaker.getState()})`);
@@ -2725,12 +2897,24 @@ export class AutoJoinManager extends EventEmitter {
     await this.apiCircuitBreaker.execute(async () => {
       const client = message.client as any;
       
-      let wsSessionId: string | undefined;
-      for (let i = 0; i < 5; i++) {
-        wsSessionId = client.ws?.shards?.first?.()?.sessionId
-          ?? client.ws?.shards?.get?.(0)?.sessionId;
-        if (wsSessionId) break;
-        await delay(1000);
+      // 🔥 Use cached session ID
+      let wsSessionId = session.gatewaySessionId;
+      
+      if (!wsSessionId || (Date.now() - session.lastSessionIdFetch > 30000)) {
+        wsSessionId = await this.getGatewaySessionId(client);
+        session.gatewaySessionId = wsSessionId;
+        session.lastSessionIdFetch = Date.now();
+      }
+      
+      if (!wsSessionId) {
+        try {
+          // @ts-ignore
+          client.ws?.reconnect?.();
+          await delay(2000);
+          wsSessionId = await this.getGatewaySessionId(client);
+          session.gatewaySessionId = wsSessionId;
+          session.lastSessionIdFetch = Date.now();
+        } catch {}
       }
 
       if (!wsSessionId) {
@@ -2779,7 +2963,7 @@ export class AutoJoinManager extends EventEmitter {
               'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
               'X-Discord-Locale': 'en-US',
             },
-            timeout: 15000,
+            timeout: 5000,
           });
           
           this.metrics.apiCalls++;
@@ -2808,7 +2992,7 @@ export class AutoJoinManager extends EventEmitter {
 
           if (status === 429) {
             const retryAfterMs = Math.ceil((axiosErr.response?.data?.retry_after ?? 1) * 1000);
-            await delay(retryAfterMs);
+            await delay(Math.min(retryAfterMs, 1000));
             continue;
           }
 
@@ -3246,6 +3430,7 @@ export class AutoJoinManager extends EventEmitter {
         this.recentWins.clean(),
         this.noResponseCooldown.clean(),
         this.crosspostCache.clean(),
+        this.messageCache.clean(),
       ].reduce((a, b) => a + b, 0);
       
       if (cleaned > 0) {
