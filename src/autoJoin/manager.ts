@@ -1,3 +1,7 @@
+
+AutoJoinManager.ts
+
+
 /**
  * @module autoJoin/manager
  * 
@@ -162,6 +166,11 @@ interface UserSession {
   lastLoginAttempt: number;
   gatewaySessionId: string | null;
   lastSessionIdFetch: number;
+  reconnectAttempts: number;
+  reconnectInProgress: boolean;
+  lastDisconnectAt: number;
+  lastReconnectAt: number;
+  stableSince: number;
 }
 
 interface SessionStats {
@@ -225,9 +234,6 @@ interface CachedMessageData {
   guildName: string;
   channelName: string;
   endsAt?: number;
-  content: string;
-  components: any[];
-  embeds: any[];
   expiresAt: number;
 }
 
@@ -315,46 +321,60 @@ const PATTERNS = {
   TIMESTAMP: /<t:(\d{10,13})(?::[a-zA-Z])?>/,
 } as const;
 
-// SPEED OPTIMIZED: Reduced TTLs
+// ---------------------------------------------------------------------------
+// Stability / memory limits
+// ---------------------------------------------------------------------------
 const ENTRY_TTL_MS = 5 * 60 * 1000;
 const WIN_DEDUP_TTL_MS = 5 * 60 * 1000;
-const COMPONENT_RETRY_DELAY_MS = 50;
+const COMPONENT_RETRY_DELAY_MS = 75;
 const COMPONENT_RETRY_ATTEMPTS = 2;
-const SESSION_REFRESH_INTERVAL_MS = 60000;
-const MAX_SESSIONS_PER_WORKER = 999999;
+const SESSION_REFRESH_INTERVAL_MS = 2 * 60 * 1000;
+const MAX_SESSIONS_PER_WORKER = 999999; // compatibility: no artificial feature cap
+const SESSION_START_CONCURRENCY = 8;
 const PROCESSING_CACHE_TTL_MS = 5000;
 const MAX_RECONNECT_ATTEMPTS = 10;
 const RECONNECT_DELAY_MS = 5000;
+const RECONNECT_GRACE_MS = 15000;
+const RECONNECT_COOLDOWN_MS = 30000;
+const LOGIN_TIMEOUT_MS = 30000;
+const READY_TIMEOUT_MS = 15000;
 const INTERACTION_RETRY_ATTEMPTS = 3;
-const INTERACTION_RETRY_DELAY_MS = 200;
-const NO_RESPONSE_COOLDOWN_MS = 2000;
+const INTERACTION_RETRY_DELAY_MS = 250;
+const NO_RESPONSE_COOLDOWN_MS = 2500;
 const BATCH_DB_WRITE_INTERVAL_MS = 2000;
 const ARCHIVE_AGE_MS = 24 * 60 * 60 * 1000;
 const MAX_QUEUE_SIZE = 5000;
 const MAX_QUEUE_PER_GUILD = 200;
-const DEAD_LETTER_RETENTION_MS = 3600000;
+const MAX_DEAD_LETTER_QUEUE = 1000;
+const MAX_QUEUE_WAIT_SAMPLES = 1000;
 const QUEUE_PERSIST_INTERVAL_MS = 30000;
+const DEAD_LETTER_RETENTION_MS = 3600000;
 const DEAD_LETTER_RESTORE_MAX_AGE_MS = 5 * 60 * 1000;
 const PENDING_RESTORE_MAX_AGE_MS = 30 * 60 * 1000;
 
-// SPEED OPTIMIZED: Larger caches
-const CACHE_PROCESSED_MESSAGES = 20000;
-const CACHE_MAX_PROCESSING = 5000;
+// Bounded application caches. The original values were unnecessarily large,
+// especially because Discord message/embed objects are expensive to retain.
+const CACHE_PROCESSED_MESSAGES = 5000;
+const CACHE_MAX_PROCESSING = 1000;
 const CACHE_MAX_WINS = 500;
 const CACHE_MAX_COOLDOWN = 500;
-const CACHE_MAX_TOKEN = 200;
-const CACHE_CROSSPOST = 5000;
-const CACHE_MESSAGES = 5000;
+const CACHE_MAX_TOKEN = 100;
+const CACHE_CROSSPOST = 2000;
+const CACHE_MESSAGES = 1500;
 
-const MEMORY_WARNING_THRESHOLD_MB = 3000;
-const MEMORY_CRITICAL_THRESHOLD_MB = 4500;
-const MEMORY_MAX_THRESHOLD_MB = 5500;
+const MEMORY_WARNING_THRESHOLD_MB = 2500;
+const MEMORY_CRITICAL_THRESHOLD_MB = 3500;
+const MEMORY_MAX_THRESHOLD_MB = 5000;
+const RSS_WARNING_THRESHOLD_MB = 4500;
+const RSS_CRITICAL_THRESHOLD_MB = 6000;
 
 const MAX_LOG_QUEUE_SIZE = 1000;
-const MAX_SESSION_START_PROMISES = 500;
+const MAX_SESSION_START_PROMISES = 100;
+const MAX_JOIN_OUTCOME_BUFFER = 2000;
+const MAX_TOKEN_FAILURE_TRACKER = 5000;
 
-const HTTP_MAX_SOCKETS = 100;
-const HTTP_MAX_FREE_SOCKETS = 50;
+const HTTP_MAX_SOCKETS = 50;
+const HTTP_MAX_FREE_SOCKETS = 10;
 
 const CIRCUIT_BREAKER_THRESHOLD = 20;
 const CIRCUIT_BREAKER_TIMEOUT_MS = 30000;
@@ -831,7 +851,8 @@ class JoinQueue {
         this.totalProcessed++;
         const startWait = Date.now();
         const item = guildQueue.shift()!;
-        this.totalWaitTimes.push(startWait - item.addedAt);
+        this.recordWaitTime(startWait - item.addedAt);
+        if (guildQueue.length === 0) this.queues.delete(guildId);
         return item;
       }
       return undefined;
@@ -848,10 +869,12 @@ class JoinQueue {
     }
 
     if (highestPriority && highestPriorityGuild) {
-      this.queues.get(highestPriorityGuild)?.shift();
+      const queue = this.queues.get(highestPriorityGuild);
+      queue?.shift();
+      if (queue?.length === 0) this.queues.delete(highestPriorityGuild);
       this.totalProcessed++;
       const startWait = Date.now();
-      this.totalWaitTimes.push(startWait - highestPriority.addedAt);
+      this.recordWaitTime(startWait - highestPriority.addedAt);
     }
 
     return highestPriority;
@@ -882,8 +905,9 @@ class JoinQueue {
     this.totalProcessed += batch.length;
     const now = Date.now();
     for (const item of batch) {
-      this.totalWaitTimes.push(now - item.addedAt);
+      this.recordWaitTime(now - item.addedAt);
     }
+    if (guildQueue.length === 0) this.queues.delete(guildId);
 
     return batch;
   }
@@ -901,6 +925,7 @@ class JoinQueue {
       );
       if (index !== -1) {
         guildQueue.splice(index, 1);
+        if (guildQueue.length === 0) this.queues.delete(guildId);
         return true;
       }
     }
@@ -911,9 +936,12 @@ class JoinQueue {
     item.lastError = error;
     item.addedAt = Date.now();
     this.deadLetterQueue.push(item);
-    
+
     const cutoff = Date.now() - DEAD_LETTER_RETENTION_MS;
     this.deadLetterQueue = this.deadLetterQueue.filter(dl => dl.addedAt > cutoff);
+    if (this.deadLetterQueue.length > MAX_DEAD_LETTER_QUEUE) {
+      this.deadLetterQueue.splice(0, this.deadLetterQueue.length - MAX_DEAD_LETTER_QUEUE);
+    }
   }
 
   retryDeadLetter(correlationId: string): QueueItem | undefined {
@@ -927,10 +955,20 @@ class JoinQueue {
   }
 
   getGuildQueue(guildId: string): QueueItem[] {
-    if (!this.queues.has(guildId)) {
-      this.queues.set(guildId, []);
+    let queue = this.queues.get(guildId);
+    if (!queue) {
+      queue = [];
+      this.queues.set(guildId, queue);
     }
-    return this.queues.get(guildId)!;
+    return queue;
+  }
+
+  private recordWaitTime(ms: number): void {
+    if (!Number.isFinite(ms)) return;
+    this.totalWaitTimes.push(Math.max(0, ms));
+    if (this.totalWaitTimes.length > MAX_QUEUE_WAIT_SAMPLES) {
+      this.totalWaitTimes.splice(0, this.totalWaitTimes.length - MAX_QUEUE_WAIT_SAMPLES);
+    }
   }
 
   getTotalSize(): number {
@@ -1107,14 +1145,14 @@ export class AutoJoinManager extends EventEmitter {
   constructor(workerId: string = 'main') {
     super();
     this.workerId = workerId;
-    this.setMaxListeners(100);
+    this.setMaxListeners(50);
     
     // Initialize caches
-    this.processedMessages = new LRUCache<string, number>(CACHE_PROCESSED_MESSAGES, 300000);
+    this.processedMessages = new LRUCache<string, number>(CACHE_PROCESSED_MESSAGES, 180000);
     this.processingCache = new LRUCache<string, number>(CACHE_MAX_PROCESSING, PROCESSING_CACHE_TTL_MS);
     this.recentWins = new LRUCache<string, number>(CACHE_MAX_WINS, WIN_DEDUP_TTL_MS);
-    this.noResponseCooldown = new LRUCache<string, number>(CACHE_MAX_COOLDOWN);
-    this.crosspostCache = new LRUCache<string, string>(CACHE_CROSSPOST, 3600000);
+    this.noResponseCooldown = new LRUCache<string, number>(CACHE_MAX_COOLDOWN, NO_RESPONSE_COOLDOWN_MS + 10000);
+    this.crosspostCache = new LRUCache<string, string>(CACHE_CROSSPOST, 30 * 60 * 1000);
     this.messageCache = new LRUCache<string, CachedMessageData>(CACHE_MESSAGES, 30000);
     
     // Initialize systems
@@ -1127,8 +1165,8 @@ export class AutoJoinManager extends EventEmitter {
     this.metrics = new MetricsCollector();
 
     // Stats caches
-    this.guildStatsCache = new LRUCache<string, GuildStats>(2000, 24 * 60 * 60 * 1000);
-    this.accountStatsCache = new LRUCache<string, AccountStats>(2000, 24 * 60 * 60 * 1000);
+    this.guildStatsCache = new LRUCache<string, GuildStats>(2000, 6 * 60 * 60 * 1000);
+    this.accountStatsCache = new LRUCache<string, AccountStats>(2000, 6 * 60 * 60 * 1000);
 
     // HTTP agents
     this.httpAgent = new http.Agent({
@@ -1202,67 +1240,89 @@ export class AutoJoinManager extends EventEmitter {
 
   private checkMemory(): boolean {
     const now = Date.now();
-    if (now - this.lastMemoryCheck < 5000) return true;
+    if (now - this.lastMemoryCheck < 5000) return this.healthStatus !== 'critical';
     this.lastMemoryCheck = now;
 
     const mem = this.getMemoryUsage();
-    
-    if (mem.heapUsedMB > MEMORY_WARNING_THRESHOLD_MB) {
+    const heapHigh = mem.heapUsedMB >= MEMORY_WARNING_THRESHOLD_MB;
+    const heapCritical = mem.heapUsedMB >= MEMORY_CRITICAL_THRESHOLD_MB;
+    const heapMax = mem.heapUsedMB >= MEMORY_MAX_THRESHOLD_MB;
+    const rssCritical = mem.rssMB >= RSS_CRITICAL_THRESHOLD_MB;
+
+    if (heapMax || rssCritical) {
+      this.healthStatus = 'critical';
+      if (!this.memoryCriticalLogged) {
+        this.memoryCriticalLogged = true;
+        this.asyncLogger.error('🚨 Critical memory pressure; aggressively trimming application state', {
+          worker: this.workerId,
+          memory: mem,
+          sessions: this.sessions.size,
+        });
+      }
+      this.aggressiveCleanup();
+      if (global.gc) {
+        try { global.gc(); } catch {}
+      }
+      return false;
+    }
+
+    if (heapCritical || mem.rssMB >= RSS_WARNING_THRESHOLD_MB) {
+      this.healthStatus = 'critical';
+      this.aggressiveCleanup();
+      if (global.gc) {
+        try { global.gc(); } catch {}
+      }
+      return false;
+    }
+
+    if (heapHigh) {
+      this.healthStatus = 'warning';
       this.processedMessages.clean();
       this.processingCache.clean();
       this.recentWins.clean();
       this.noResponseCooldown.clean();
       this.crosspostCache.clean();
       this.messageCache.clean();
-      
-      if (mem.heapUsedMB > MEMORY_CRITICAL_THRESHOLD_MB) {
-        this.aggressiveCleanup();
-        if (global.gc) {
-          global.gc();
-        }
-      }
+      this.guildStatsCache.clean();
+      this.accountStatsCache.clean();
+      return true;
     }
-    
-    if (mem.heapUsedMB > MEMORY_CRITICAL_THRESHOLD_MB) {
-      this.asyncLogger.warn('⚠️ High memory usage, cleaning caches aggressively', {
-        heapUsedMB: mem.heapUsedMB,
-        sessions: this.sessions.size,
-        active: Array.from(this.sessions.values()).filter(s => s.isActive && !s.destroyed).length
-      });
-      this.healthStatus = 'warning';
-    } else if (mem.heapUsedMB > MEMORY_MAX_THRESHOLD_MB) {
-      this.healthStatus = 'critical';
-      this.asyncLogger.error('⚠️ CRITICAL: Memory very high but preserving sessions', {
-        heapUsedMB: mem.heapUsedMB,
-        sessions: this.sessions.size
-      });
-      this.aggressiveCleanup();
-      if (global.gc) global.gc();
-    } else {
-      this.healthStatus = 'healthy';
-    }
-    
+
+    this.healthStatus = 'healthy';
+    this.memoryCriticalLogged = false;
     return true;
   }
 
   private aggressiveCleanup(): void {
+    // Keep active session credentials alive. Clearing them under memory pressure
+    // causes avoidable decrypt/login churn and can contribute to reconnect storms.
     this.processedMessages.clear();
     this.processingCache.clear();
     this.recentWins.clear();
     this.noResponseCooldown.clear();
     this.crosspostCache.clear();
     this.messageCache.clear();
-    this.tokenManager.clearAll();
     this.guildStatsCache.clean();
     this.accountStatsCache.clean();
-    
-    if (global.gc) {
-      global.gc();
+
+    const cutoff = Date.now() - 10 * 60 * 1000;
+    for (const [userId, data] of this.tokenFailureTracker) {
+      if (data.lastAttempt < cutoff) this.tokenFailureTracker.delete(userId);
+    }
+    if (this.joinOutcomeBuffer.length > MAX_JOIN_OUTCOME_BUFFER) {
+      this.joinOutcomeBuffer.splice(0, this.joinOutcomeBuffer.length - MAX_JOIN_OUTCOME_BUFFER);
     }
   }
 
   private clearClientCaches(client: Client): void {
     try {
+      const channels = (client as any).channels?.cache;
+      if (channels) {
+        for (const channel of channels.values()) {
+          try { channel?.messages?.cache?.clear?.(); } catch {}
+          try { channel?.members?.cache?.clear?.(); } catch {}
+        }
+      }
       (client as any).guilds?.cache?.clear?.();
       (client as any).users?.cache?.clear?.();
       (client as any).channels?.cache?.clear?.();
@@ -1357,24 +1417,30 @@ export class AutoJoinManager extends EventEmitter {
       const validUsers = allPremiumUsers.filter(u => u.token && u.tokenActive !== false);
       const usersToStart = validUsers.slice(0, MAX_SESSIONS_PER_WORKER);
 
-      this.asyncLogger.info(`🔥 Starting ${usersToStart.length} sessions ALL AT ONCE (no batching)...`);
+      this.asyncLogger.info(`🚀 Starting ${usersToStart.length} sessions with bounded concurrency`, {
+        concurrency: SESSION_START_CONCURRENCY,
+      });
 
-      const startPromises = usersToStart.map(user => 
-        this.startSession(user.userId, user.guildId)
-      );
-
-      const results = await Promise.allSettled(startPromises);
-      
       let started = 0;
       let failed = 0;
-      for (const result of results) {
-        if (result.status === 'fulfilled' && result.value) {
-          started++;
-        } else {
-          failed++;
-          this.asyncLogger.warn(`❌ Failed to start session`, {
-            error: result.status === 'rejected' ? formatError(result.reason) : 'Returned false'
-          });
+      for (let i = 0; i < usersToStart.length; i += SESSION_START_CONCURRENCY) {
+        if (this.isShuttingDown) break;
+        const batch = usersToStart.slice(i, i + SESSION_START_CONCURRENCY);
+        const results = await Promise.allSettled(
+          batch.map(user => this.startSession(user.userId, user.guildId))
+        );
+        for (const result of results) {
+          if (result.status === 'fulfilled' && result.value) {
+            started++;
+          } else {
+            failed++;
+            this.asyncLogger.warn('❌ Failed to start session', {
+              error: result.status === 'rejected' ? formatError(result.reason) : 'Returned false',
+            });
+          }
+        }
+        if (i + SESSION_START_CONCURRENCY < usersToStart.length) {
+          await delay(250);
         }
       }
 
@@ -1423,6 +1489,14 @@ export class AutoJoinManager extends EventEmitter {
       return this.sessionStartPromises.get(sessionKey)!;
     }
 
+    if (this.sessionStartPromises.size >= MAX_SESSION_START_PROMISES) {
+      this.asyncLogger.warn('Session start concurrency limit reached; deferring start', {
+        userId,
+        activeStarts: this.sessionStartPromises.size,
+      });
+      return false;
+    }
+
     const startPromise = this._startSessionInternal(userId, guildId);
     this.sessionStartPromises.set(sessionKey, startPromise);
 
@@ -1456,14 +1530,21 @@ export class AutoJoinManager extends EventEmitter {
       }
 
       const clientOptions: ClientOptions = {
-        messageCacheLifetime: 60,
-        messageSweepInterval: 300,
-        restRequestTimeout: 15000,
+        // We process messages immediately; retaining thousands of message objects
+        // is unnecessary and is one of the biggest sources of heap/RSS growth.
+        messageCacheLifetime: 15,
+        messageSweepInterval: 60,
+        restRequestTimeout: 20000,
         restGlobalRateLimit: 50,
         retryLimit: 3,
         allowedMentions: { parse: [] },
         partials: [],
         makeCache: Options.cacheWithLimits({
+          MessageManager: 100,
+          UserManager: 1000,
+          GuildManager: 100,
+          ChannelManager: 500,
+          GuildMemberManager: 1000,
           PresenceManager: 0,
           ReactionManager: 0,
           ThreadManager: 0,
@@ -1545,6 +1626,11 @@ export class AutoJoinManager extends EventEmitter {
         lastLoginAttempt: Date.now(),
         gatewaySessionId: null,
         lastSessionIdFetch: 0,
+        reconnectAttempts: 0,
+        reconnectInProgress: false,
+        lastDisconnectAt: 0,
+        lastReconnectAt: 0,
+        stableSince: Date.now(),
       };
 
       session.gatewaySessionId = await this.getGatewaySessionId(client);
@@ -1590,7 +1676,7 @@ export class AutoJoinManager extends EventEmitter {
 
   private async loginWithTimeout(client: Client, token: string): Promise<void> {
     return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error('Login timeout')), 15000);
+      const timeout = setTimeout(() => reject(new Error('Login timeout')), LOGIN_TIMEOUT_MS);
       client.login(token)
         .then(() => { clearTimeout(timeout); resolve(); })
         .catch((err) => { clearTimeout(timeout); reject(err); });
@@ -1599,7 +1685,7 @@ export class AutoJoinManager extends EventEmitter {
 
   private async waitForReady(client: Client): Promise<void> {
     return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error('Ready timeout')), 2000);
+      const timeout = setTimeout(() => reject(new Error('Ready timeout')), READY_TIMEOUT_MS);
       
       if (client.isReady()) {
         clearTimeout(timeout);
@@ -1629,6 +1715,12 @@ export class AutoJoinManager extends EventEmitter {
     failureData.failures++;
     failureData.lastAttempt = Date.now();
     this.tokenFailureTracker.set(userId, failureData);
+    if (this.tokenFailureTracker.size > MAX_TOKEN_FAILURE_TRACKER) {
+      const oldest = Array.from(this.tokenFailureTracker.entries())
+        .sort((a, b) => a[1].lastAttempt - b[1].lastAttempt)
+        .slice(0, Math.max(1, this.tokenFailureTracker.size - MAX_TOKEN_FAILURE_TRACKER));
+      for (const [oldUserId] of oldest) this.tokenFailureTracker.delete(oldUserId);
+    }
     
     if (failureData.failures > 10) {
       this.asyncLogger.error('❌ Max retry attempts reached for user, permanently deactivating', { userId });
@@ -1674,18 +1766,10 @@ export class AutoJoinManager extends EventEmitter {
   private registerEvents(session: UserSession): void {
     const { client, userId } = session;
 
-    client.removeAllListeners('messageCreate');
-    client.removeAllListeners('messageUpdate');
-    client.removeAllListeners('error');
-    client.removeAllListeners('disconnect');
-    client.removeAllListeners('ready');
-    client.removeAllListeners('warn');
-    client.removeAllListeners('reconnecting');
-    client.removeAllListeners('resumed');
-    
-    try {
-      (client as any).ws?.removeAllListeners?.();
-    } catch {}
+    // IMPORTANT: never remove the gateway's internal listeners here.
+    // The previous ws.removeAllListeners() could break discord.js-selfbot's
+    // own heartbeat/reconnect machinery and was a major cause of reconnect loops.
+    this.cleanupSessionListeners(session);
 
     const messageCreateHandler = async (message: Message) => {
       if (!message.guild) {
@@ -1755,22 +1839,55 @@ export class AutoJoinManager extends EventEmitter {
 
     const readyHandler = () => {
       session.isActive = true;
+      session.destroyed = false;
       session.gatewaySessionId = null;
+      session.reconnectAttempts = 0;
+      session.reconnectInProgress = false;
+      session.lastReconnectAt = Date.now();
+      session.stableSince = Date.now();
+      this.reconnectCountMap.delete(session.userId);
+      this.tokenFailureTracker.delete(session.userId);
       this.asyncLogger.info('✅ Session ready', { userId: session.userId });
     };
 
     const disconnectHandler = () => {
+      if (this.isShuttingDown || session.destroyed) return;
       session.isActive = false;
-      this.asyncLogger.warn('⚠️ Session disconnected (auto-reconnect in progress)', { userId: session.userId });
+      session.gatewaySessionId = null;
+      session.lastDisconnectAt = Date.now();
+      session.reconnectAttempts = Math.min(MAX_RECONNECT_ATTEMPTS, session.reconnectAttempts + 1);
+      // A disconnect event does not mean our manual recovery is running. Let the
+      // library reconnect/resume first; the health checker intervenes only later.
+      session.reconnectInProgress = false;
+      const count = (this.reconnectCountMap.get(session.userId) || 0) + 1;
+      this.reconnectCountMap.set(session.userId, Math.min(count, 1000));
+      const accountStats = this.accountStatsCache.get(session.userId);
+      if (accountStats) {
+        accountStats.reconnectCount = Math.min(accountStats.reconnectCount + 1, 1000000);
+        this.accountStatsCache.set(session.userId, accountStats);
+      }
+      this.asyncLogger.warn('⚠️ Session disconnected; preserving client for gateway auto-reconnect', {
+        userId: session.userId,
+        attempt: session.reconnectAttempts,
+      });
     };
 
     const reconnectingHandler = () => {
-      this.asyncLogger.info('🔄 Session reconnecting...', { userId: session.userId });
+      if (this.isShuttingDown || session.destroyed) return;
+      session.reconnectInProgress = true;
+      session.lastReconnectAt = Date.now();
+      this.asyncLogger.info('🔄 Session reconnecting...', {
+        userId: session.userId,
+        attempt: session.reconnectAttempts,
+      });
     };
 
     const resumedHandler = () => {
       session.isActive = true;
       session.gatewaySessionId = null;
+      session.reconnectInProgress = false;
+      session.reconnectAttempts = 0;
+      session.stableSince = Date.now();
       this.asyncLogger.info('✅ Session resumed', { userId: session.userId });
     };
 
@@ -1798,20 +1915,25 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   private cleanupSessionListeners(session: UserSession): void {
-    const { client } = session;
-    
-    const events = ['messageCreate', 'messageUpdate', 'error', 'disconnect', 'ready', 'warn', 'debug', 'reconnecting', 'resumed'];
-    
-    for (const event of events) {
-      try {
-        client.removeAllListeners(event);
-      } catch {}
+    const { client, listeners } = session;
+    const handlers: Array<[string, ((...args: any[]) => any) | undefined]> = [
+      ['messageCreate', listeners.messageCreate],
+      ['messageUpdate', listeners.messageUpdate],
+      ['error', listeners.error],
+      ['disconnect', listeners.disconnect],
+      ['ready', listeners.ready],
+      ['reconnecting', listeners.reconnecting],
+      ['resumed', listeners.resumed],
+    ];
+
+    for (const [event, handler] of handlers) {
+      if (!handler) continue;
+      try { client.off(event, handler as any); } catch {
+        try { client.removeListener(event, handler as any); } catch {}
+      }
     }
-    
-    try {
-      (client as any).ws?.removeAllListeners?.();
-    } catch {}
-    
+
+    // Never touch ws.removeAllListeners(): discord.js-selfbot owns those listeners.
     session.listeners = {};
   }
 
@@ -1868,9 +1990,6 @@ export class AutoJoinManager extends EventEmitter {
         guildName: message.guild!.name,
         channelName: (message.channel as { name?: string }).name ?? 'unknown',
         endsAt: this.extractEndTimestamp(message),
-        content: message.content,
-        components: (message as any).components,
-        embeds: message.embeds,
         expiresAt: Date.now() + 30000,
       });
 
@@ -2258,6 +2377,9 @@ export class AutoJoinManager extends EventEmitter {
           correlationId,
           timestamp: Date.now(),
         });
+        if (this.joinOutcomeBuffer.length > MAX_JOIN_OUTCOME_BUFFER) {
+          this.joinOutcomeBuffer.splice(0, this.joinOutcomeBuffer.length - MAX_JOIN_OUTCOME_BUFFER);
+        }
 
         this.updateGuildStats(entry.guildId, entry.guildName, 'entered');
         this.updateAccountStats(session.userId, 'entered');
@@ -2304,8 +2426,7 @@ export class AutoJoinManager extends EventEmitter {
           continue;
         }
         
-        const isNoResponse = errorMsg.includes('No response from Application') || 
-                            errorMsg.includes('No response from Application');
+        const isNoResponse = errorMsg.toLowerCase().includes('no response from application');
 
         if (isNoResponse && attempt < maxAttempts - 1) {
           this.noResponseCooldown.set(session.userId, Date.now() + NO_RESPONSE_COOLDOWN_MS);
@@ -2470,18 +2591,17 @@ export class AutoJoinManager extends EventEmitter {
       }
       
       if (!wsSessionId) {
-        try {
-          // @ts-ignore
-          client.ws?.reconnect?.();
-          await delay(2000);
-          wsSessionId = await this.getGatewaySessionId(client);
-          session.gatewaySessionId = wsSessionId;
-          session.lastSessionIdFetch = Date.now();
-        } catch {}
+        // Do not force a gateway reconnect from an interaction request. That can
+        // interrupt a healthy websocket and create reconnect storms. The gateway
+        // client's own reconnect/resume machinery is authoritative.
+        await delay(250);
+        wsSessionId = await this.getGatewaySessionId(client);
+        session.gatewaySessionId = wsSessionId;
+        session.lastSessionIdFetch = Date.now();
       }
 
       if (!wsSessionId) {
-        throw new Error('No active gateway session ID available');
+        throw new Error('No active gateway session ID available; websocket is reconnecting');
       }
       
       const nonce = `${Date.now()}${Math.random().toString(36).slice(2, 8)}`;
@@ -2776,22 +2896,58 @@ export class AutoJoinManager extends EventEmitter {
   // -------------------------------------------------------------------------
 
   private startHealthChecker(): void {
-    this.healthCheckInterval = setInterval(async () => {
+    this.healthCheckInterval = setInterval(() => {
       if (this.isShuttingDown) return;
+      const now = Date.now();
 
-      for (const [_, session] of this.sessions) {
-        if (!session.isActive || session.destroyed) continue;
+      for (const session of this.sessions.values()) {
+        if (session.destroyed) continue;
 
         try {
           const client = session.client as any;
-          const isConnected = client.isReady() && 
-                             client.ws?.connection?.readyState === 1;
-          
+          const readyState = client.ws?.connection?.readyState;
+          const isReady = client.isReady?.() === true;
+          const isConnected = isReady && readyState === 1;
+
           if (isConnected) {
-            // Session is healthy
+            if (!session.reconnectInProgress) session.stableSince = session.stableSince || now;
+            continue;
           }
-        } catch (error) {
-          // Silent
+
+          if (session.lastDisconnectAt === 0) {
+            session.lastDisconnectAt = now;
+          }
+
+          // Give the library's native reconnect/resume path time to work.
+          if (now - session.lastDisconnectAt < RECONNECT_GRACE_MS) continue;
+          if (session.reconnectInProgress) continue;
+          if (now - session.lastReconnectAt < RECONNECT_COOLDOWN_MS) continue;
+
+          if (session.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+            this.asyncLogger.warn('⚠️ Session exceeded reconnect attempts; scheduling controlled replacement', {
+              userId: session.userId,
+              attempts: session.reconnectAttempts,
+            });
+            this.scheduleRetry(session.userId, session.guildId).catch(() => {});
+            continue;
+          }
+
+          session.reconnectInProgress = true;
+          session.reconnectAttempts++;
+          session.lastReconnectAt = now;
+
+          try {
+            // Only intervene after the native reconnect has had a grace period.
+            client.ws?.reconnect?.();
+          } catch (error) {
+            session.reconnectInProgress = false;
+            this.asyncLogger.warn('Gateway reconnect request failed', {
+              userId: session.userId,
+              error: formatError(error),
+            });
+          }
+        } catch {
+          // Keep the health loop non-fatal.
         }
       }
     }, HEALTH_CHECK_INTERVAL_MS);
@@ -2826,7 +2982,7 @@ export class AutoJoinManager extends EventEmitter {
           totalSessions: this.sessions.size,
         });
       }
-    }, 60000);
+    }, 30000);
     if (this.stallCheckInterval.unref) this.stallCheckInterval.unref();
   }
 
@@ -2953,13 +3109,15 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   private startCleanupInterval(): void {
-    this.cleanupInterval = setInterval(async () => {
+    this.cleanupInterval = setInterval(() => {
       if (this.isShuttingDown) return;
-      try {
-        for (const [_, session] of this.sessions) {
-          await cleanupAutoJoinEntries(session.userId);
-        }
-      } catch {}
+      const users = Array.from(this.sessions.values())
+        .filter(s => s.isActive && !s.destroyed)
+        .map(s => s.userId);
+      for (let i = 0; i < users.length; i += 10) {
+        const batch = users.slice(i, i + 10);
+        Promise.allSettled(batch.map(userId => cleanupAutoJoinEntries(userId))).catch(() => {});
+      }
     }, 5 * 60_000);
     if (this.cleanupInterval.unref) this.cleanupInterval.unref();
   }
@@ -3080,7 +3238,7 @@ export class AutoJoinManager extends EventEmitter {
         heapUsedMB: mem.heapUsedMB,
         heapTotalMB: mem.heapTotalMB,
         rssMB: mem.rssMB,
-        percentageUsed: Math.round((mem.heapUsedMB / 8000) * 100),
+        percentageUsed: Math.round((mem.heapUsedMB / Math.max(mem.heapTotalMB, 1)) * 100),
       },
       metrics: {
         averageDetectionTime: metrics.averageDetectionTime,
@@ -3205,11 +3363,10 @@ export class AutoJoinManager extends EventEmitter {
             lastAttempt: new Date(lastAttempt).toISOString()
           });
           
-          if (isDeadSession) {
-            this.sessions.delete(sessionKey);
-            this.sessionsByUserId.delete(user.userId);
+          if (isDeadSession && session) {
+            await this.stopSession(session.userId, session.guildId);
           }
-          
+
           const success = await this.startSession(user.userId, user.guildId);
           
           if (success) {
@@ -3260,6 +3417,13 @@ export class AutoJoinManager extends EventEmitter {
       this.sessions.delete(sessionKey);
       this.sessionsByUserId.delete(userId);
       this.tokenManager.clearCache(userId, guildId);
+
+      const retryKey = `${userId}:${guildId}`;
+      const retryTimer = this.retryScheduled.get(retryKey);
+      if (retryTimer) {
+        clearTimeout(retryTimer);
+        this.retryScheduled.delete(retryKey);
+      }
       
       this.asyncLogger.info('⏹️ AutoJoin session stopped', { 
         userId, guildId, sessionId: session.sessionId, memory: this.getMemoryUsage(),
@@ -3294,6 +3458,18 @@ export class AutoJoinManager extends EventEmitter {
     intervals.forEach(interval => {
       if (interval) clearInterval(interval);
     });
+    this.refreshInterval = null;
+    this.cleanupInterval = null;
+    this.memoryCheckInterval = null;
+    this.reconnectCheckInterval = null;
+    this.cacheCleanInterval = null;
+    this.metricsInterval = null;
+    this.healthCheckInterval = null;
+    this.queuePersistInterval = null;
+    this.stallCheckInterval = null;
+    this.batchDbInterval = null;
+    this.archiveInterval = null;
+    this.statsCleanInterval = null;
 
     for (const [key, timeout] of this.retryScheduled) {
       clearTimeout(timeout);
