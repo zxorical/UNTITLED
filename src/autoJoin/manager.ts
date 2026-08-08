@@ -11,6 +11,7 @@
  * 5. 🔥 FIXED: Prevent overlapping session starts with promise handling
  * 6. 🔥 FIXED: Memory leaks - proper cleanup on shutdown
  * 7. 🔥 FIXED: All methods restored for index.ts compatibility
+ * 8. 🔥 FIXED: rateLimiter added back to UserSession interface
  * 
  * SPEED OPTIMIZATIONS:
  * 1. Parallel session startup - ALL sessions start at once
@@ -144,6 +145,7 @@ interface UserSession {
   startedAt: number;
   isActive: boolean;
   stats: SessionStats;
+  rateLimiter: TokenBucket; // 🔥 FIXED: Added back
   listeners: {
     messageCreate?: (message: Message) => void;
     messageUpdate?: (oldMessage: Message | PartialMessage, newMessage: Message | PartialMessage) => void;
@@ -364,7 +366,7 @@ const RETRY_CHECK_INTERVAL_MS = 5 * 60 * 1000;
 const INITIAL_RETRY_DELAY_MS = 5000;
 const MAX_RETRY_DELAY_MS = 60000;
 const TOKEN_REACTIVATION_THRESHOLD_MS = 60 * 1000;
-const HEALTH_CHECK_INTERVAL_MS = 60000; // 🔥 FIXED: Added missing constant
+const HEALTH_CHECK_INTERVAL_MS = 60000;
 
 const MAX_CONCURRENT_ENTRIES_PER_ACCOUNT = 5;
 
@@ -1036,7 +1038,8 @@ class JoinQueue {
 }
 
 // ---------------------------------------------------------------------------
-// AutoJoinManager - Main Class// ---------------------------------------------------------------------------
+// AutoJoinManager - Main Class
+// ---------------------------------------------------------------------------
 
 export class AutoJoinManager extends EventEmitter {
   // Sessions
@@ -1301,7 +1304,7 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   // -------------------------------------------------------------------------
-  // 🔥 NEW: Get Gateway Session ID
+  // Get Gateway Session ID
   // -------------------------------------------------------------------------
 
   private async getGatewaySessionId(client: Client): Promise<string | null> {
@@ -1533,6 +1536,7 @@ export class AutoJoinManager extends EventEmitter {
         startedAt: Date.now(),
         isActive: true,
         stats: { detected: 0, entered: 0, failed: 0, wins: 0, falsePositives: 0, queueWaitTimes: [] },
+        rateLimiter: new TokenBucket(10, 5000), // 🔥 FIXED: Added back
         listeners: {},
         sessionId,
         destroyed: false,
@@ -2490,7 +2494,6 @@ export class AutoJoinManager extends EventEmitter {
         throw new Error('Could not determine application ID for interaction');
       }
 
-      // 🔥 FIXED: guild_id is ALWAYS a string (never null)
       const payload = {
         type: 3,
         nonce,
@@ -3033,7 +3036,7 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   // ============================================================
-  // 🔥 FIXED: COMPLETE getStats() - Needed for index.ts
+  // 🔥 COMPLETE getStats() - Needed for index.ts
   // ============================================================
 
   getStats() {
@@ -3102,7 +3105,7 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   // ============================================================
-  // 🔥 FIXED: restoreSessionsFromDatabase() - Needed for index.ts
+  // 🔥 restoreSessionsFromDatabase() - Needed for index.ts
   // ============================================================
 
   async restoreSessionsFromDatabase(): Promise<void> {
@@ -3134,7 +3137,7 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   // ============================================================
-  // 🔥 FIXED: refreshSessions() - Needed for index.ts
+  // 🔥 refreshSessions() - Needed for index.ts
   // ============================================================
 
   async refreshSessions(): Promise<void> {
@@ -3168,7 +3171,7 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   // ============================================================
-  // 🔥 FIXED: retryFailedSessions() - Needed for index.ts
+  // 🔥 retryFailedSessions() - Needed for index.ts
   // ============================================================
 
   async retryFailedSessions(): Promise<void> {
@@ -3235,7 +3238,7 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   // ============================================================
-  // 🔥 FIXED: stopSession() - Proper cleanup
+  // 🔥 stopSession() - Proper cleanup
   // ============================================================
 
   async stopSession(userId: string, guildId: string): Promise<void> {
@@ -3270,7 +3273,7 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   // ============================================================
-  // 🔥 FIXED: shutdown() - Complete cleanup
+  // 🔥 shutdown() - Complete cleanup
   // ============================================================
 
   async shutdown(): Promise<void> {
