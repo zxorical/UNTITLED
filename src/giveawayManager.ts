@@ -13,6 +13,9 @@
  * 26. FIXED: Scrim throttling per channel to prevent detection spam
  * 27. FIXED: Region scoring split into confirmed/weak
  * 28. FIXED: Scrim threshold increased from 6 to 7
+ * 29. FIXED: Invite generation — vanity first, invites.fetch 403 isolated,
+ *            permissionsFor(null) handled, scored channel list, self-member
+ *            double-fetch, reason-aware failed cache TTL
  */
 
 import { Client, Message, TextChannel } from 'discord.js-selfbot-v13';
@@ -137,13 +140,11 @@ const PARSED_CACHE_TTL_MS = 30_000;
 const MAX_PARSED_CACHE_SIZE = 2000;
 
 // Startup grace period constants
-const STARTUP_GRACE_PERIOD_MS = 30_000; // 30 seconds
-const MAX_STARTUP_MESSAGE_AGE_MS = 10_000; // 10 seconds during startup
-const MAX_GATEWAY_LATENCY_MS = 60_000; // Cap gateway latency at 60 seconds
+const STARTUP_GRACE_PERIOD_MS = 30_000;
+const MAX_STARTUP_MESSAGE_AGE_MS = 10_000;
+const MAX_GATEWAY_LATENCY_MS = 60_000;
 
-// ─── Parsed Message Cache with bounded opportunistic cleanup ───────────────
-// Kept global so multiple managers do not duplicate the cache. There is no
-// permanent module-level timer; cleanup happens while the cache is used.
+// ─── Parsed Message Cache ─────────────────────────────────────────────────
 const parsedMessageCache = new Map<string, { data: ParsedGiveawayData; timestamp: number }>();
 
 function cleanupParsedMessageCache(now: number): void {
@@ -169,7 +170,6 @@ function cleanupParsedMessageCache(now: number): void {
 // SCRIM/EVENT DETECTION CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════
 
-// Scrim patterns
 const SCRIM_PATTERNS: RegExp[] = [
   /VREL\s*3v3\s*Scrim/i,
   /scrim|scrims/i,
@@ -188,7 +188,6 @@ const GAGABALL_PATTERNS: RegExp[] = [
   /gaga/i,
 ];
 
-// Team patterns
 const TEAM_PATTERNS: RegExp[] = [
   /3v3/i, /2v2/i, /4v4/i, /5v5/i, /1v1/i,
   /(\d+)\s*TEAMS?/i,
@@ -196,7 +195,6 @@ const TEAM_PATTERNS: RegExp[] = [
   /(\d+)\s*[xX×]\s*(\d+)/i,
 ];
 
-// Host patterns
 const HOST_PATTERNS: RegExp[] = [
   /Host:\s*<@!?(\d+)>/i,
   /Host:\s*<@(\d+)>/i,
@@ -211,7 +209,6 @@ const COHOST_PATTERNS: RegExp[] = [
   /CoHost:\s*<@!?(\d+)>/i,
 ];
 
-// Time patterns
 const TIME_PATTERNS: RegExp[] = [
   /Time:\s*([^\n]+)/i,
   /at\s*([^\n]+?)(?=\s*[A-Z]|$)/i,
@@ -223,7 +220,6 @@ const TIME_PATTERNS: RegExp[] = [
   /(\d{1,2}\s*(?:am|pm))/i,
 ];
 
-// Reward patterns
 const REWARD_PATTERNS: RegExp[] = [
   /Reward:\s*([^\n]+)/i,
   /Rewards:\s*([^\n]+)/i,
@@ -232,7 +228,6 @@ const REWARD_PATTERNS: RegExp[] = [
   /prize\s*([^\n]+)/i,
 ];
 
-// Region patterns - FIXED: No loose \bNA\b, only contextual NA matching
 const REGION_PATTERNS: RegExp[] = [
   /EU\s*[Xx×]\s*NA/i,
   /NA\s*[Xx×]\s*EU/i,
@@ -245,7 +240,6 @@ const REGION_PATTERNS: RegExp[] = [
   /\bNA\s+(?:Region|Server|Host|Team|Scrim)\b/i,
 ];
 
-// Tick patterns
 const TICK_PATTERNS: RegExp[] = [
   /Ticks?:\s*(\d+)\s*\+/i,
   /(\d+)\s*\+\s*Ticks?/i,
@@ -253,7 +247,6 @@ const TICK_PATTERNS: RegExp[] = [
   /Ticks?:\s*(\d+)/i,
 ];
 
-// Scrim score weights - FIXED: Split region into confirmed/weak
 const SCRIM_SCORE = {
   HAS_EVERYONE: 3,
   HAS_HOST: 3,
@@ -269,7 +262,6 @@ const SCRIM_SCORE = {
 const MAX_SCRIM_SCORE = Object.values(SCRIM_SCORE).reduce((a, b) => a + b, 0);
 const MINIMUM_SCRIM_SCORE_THRESHOLD = 5;
 
-// ─── NA False Positive Anti-Patterns ────────────────────────────────────
 const NA_FALSE_POSITIVE_PATTERNS: RegExp[] = [
   /(?:gon|wan|gun|can|don|isn|aren|doesn|didn|haven|hasn|wouldn|couldn|shouldn|mightn|mustn)'?na\b/i,
   /\bna\s+(?:maybe|perhaps|possibly|idk|not\s+sure)\b/i,
@@ -289,7 +281,6 @@ const NA_FALSE_POSITIVE_PATTERNS: RegExp[] = [
   /\bna\s*cl\b/i,
 ];
 
-// ─── Event Context Keywords ─────────────────────────────────────────────
 const EVENT_CONTEXT_WORDS = [
   'host:', 'hosts:', 'reward:', 'prize:', 'time:',
   'teams:', 'team:', 'region:', '3v3', '2v2', '4v4',
@@ -304,7 +295,6 @@ const REGION_CONTEXT_KEYWORDS = [
   'tournament', 'event', 'sign', 'register', 'join',
 ];
 
-// ─── Tracker indicators for blocking other trackers ──────────────────────
 const TRACKER_INDICATORS = [
   'giveaway tracker',
   'worth joining',
@@ -320,7 +310,6 @@ const TRACKER_INDICATORS = [
   'powered by',
 ];
 
-// ─── Timezone Offsets ────────────────────────────────────────────────────
 const TZ_OFFSETS: Record<string, number> = {
   'EST': -5, 'EDT': -4,
   'PST': -8, 'PDT': -7,
@@ -331,9 +320,8 @@ const TZ_OFFSETS: Record<string, number> = {
   'ET': -5, 'PT': -8, 'CT': -6,
 };
 
-// ─── Scrim Throttling ────────────────────────────────────────────────────
 const SCRIM_THROTTLE_MAX = 10;
-const SCRIM_THROTTLE_WINDOW_MS = 3600000; // 1 hour
+const SCRIM_THROTTLE_WINDOW_MS = 3600000;
 
 // ============================================================================
 // SCRIM DETECTION INTERFACE
@@ -354,7 +342,7 @@ interface ScrimDetectionResult {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// AHO-CORASICK (O(queue[head++]) BFS, no shift)
+// AHO-CORASICK
 // ═══════════════════════════════════════════════════════════════════════════
 
 interface AhoNode {
@@ -386,7 +374,7 @@ class AhoCorasick {
   build(): void {
     if (this.built) return;
     const queue: AhoNode[] = [];
-    
+
     for (const child of this.root.children.values()) {
       child.fail = this.root;
       queue.push(child);
@@ -413,7 +401,7 @@ class AhoCorasick {
   findMatches(text: string): Set<string> {
     const results = new Set<string>();
     let node = this.root;
-    
+
     for (const char of text.toLowerCase()) {
       while (node !== this.root && !node.children.has(char)) {
         node = node.fail!;
@@ -458,15 +446,14 @@ class LRUCache<K, V> {
   delete(key: K): void { this.map.delete(key); }
   get size(): number { return this.map.size; }
   clear(): void { this.map.clear(); }
-  
-  // Get all keys for debugging
+
   keys(): IterableIterator<K> {
     return this.map.keys();
   }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// PARSED GIVEAWAY MESSAGE (single parse pass, all lowercase variants)
+// PARSED GIVEAWAY MESSAGE
 // ═══════════════════════════════════════════════════════════════════════════
 
 interface ParsedButtons {
@@ -528,7 +515,7 @@ function parseMessage(message: Message, now: number): ParsedGiveawayData {
 
   const cacheKey = getParsedCacheKey(message);
   const cached = parsedMessageCache.get(cacheKey);
-  
+
   if (cached && now - cached.timestamp < PARSED_CACHE_TTL_MS) {
     return cached.data;
   }
@@ -600,7 +587,6 @@ function parseMessage(message: Message, now: number): ParsedGiveawayData {
     contentHash,
   };
 
-  // Store in cache with timestamp and immediately enforce the hard cap.
   parsedMessageCache.set(cacheKey, { data: parsed, timestamp: now });
   cleanupParsedMessageCache(now);
 
@@ -701,35 +687,28 @@ function extractPrize(
 // TIME PARSER FOR SCRIM/EVENT NOTIFICATIONS
 // ============================================================================
 
-/**
- * Parse a human-written time string into a Unix timestamp
- * Supports: "6 pm EST", "15:00 uk time", "8:45 am est", "Tonight at 8:00 PM EU", "12:30", "8:00 PM EU"
- */
 function parseScrimTime(timeStr: string): number | null {
   if (!timeStr || timeStr.length < 2) return null;
-  
+
   const clean = timeStr.trim().toLowerCase();
-  
+
   let hour: number | null = null;
   let minute: number | null = null;
   let isPM: boolean | null = null;
   let timezone: string | null = null;
-  
-  // Extract timezone
+
   const tzMatch = clean.match(/\b(est|edt|pst|pdt|cst|cdt|gmt|utc|uk|eu|et|pt|ct|mt)\b/i);
   if (tzMatch) {
     timezone = tzMatch[1].toUpperCase();
   }
-  
-  // Try 12-hour format: "6 pm", "8:45 am"
+
   const twelveHourMatch = clean.match(/(\d{1,2})(?::(\d{2}))?\s*(am|pm)/i);
   if (twelveHourMatch) {
     hour = parseInt(twelveHourMatch[1], 10);
     minute = twelveHourMatch[2] ? parseInt(twelveHourMatch[2], 10) : 0;
     isPM = twelveHourMatch[3].toLowerCase() === 'pm';
   }
-  
-  // Try 24-hour format: "15:00", "14:30"
+
   if (hour === null) {
     const twentyFourMatch = clean.match(/(\d{1,2}):(\d{2})/);
     if (twentyFourMatch) {
@@ -738,8 +717,7 @@ function parseScrimTime(timeStr: string): number | null {
       isPM = hour >= 12;
     }
   }
-  
-  // Try single hour with am/pm: "8pm"
+
   if (hour === null) {
     const singleHourMatch = clean.match(/(\d{1,2})\s*(am|pm)/i);
     if (singleHourMatch) {
@@ -748,42 +726,35 @@ function parseScrimTime(timeStr: string): number | null {
       isPM = singleHourMatch[2].toLowerCase() === 'pm';
     }
   }
-  
+
   if (hour === null) {
     return null;
   }
-  
-  // Convert to 24-hour
+
   if (isPM && hour < 12) {
     hour += 12;
   } else if (!isPM && hour === 12) {
     hour = 0;
   }
-  
-  // Determine date
+
   const now = new Date();
   const targetDate = new Date(now);
   targetDate.setHours(hour, minute || 0, 0, 0);
-  
-  // If time is in the past, assume it's tomorrow
+
   if (targetDate.getTime() < now.getTime()) {
     targetDate.setDate(targetDate.getDate() + 1);
   }
-  
-  // Apply timezone offset
+
   if (timezone) {
     const offsetHours = TZ_OFFSETS[timezone];
     if (offsetHours !== undefined) {
       targetDate.setHours(targetDate.getHours() - offsetHours);
     }
   }
-  
+
   return Math.floor(targetDate.getTime() / 1000);
 }
 
-/**
- * Format a time string into a Discord relative timestamp
- */
 function formatScrimTime(timeStr: string | null): string {
   if (!timeStr) return 'Unknown';
   const timestamp = parseScrimTime(timeStr);
@@ -793,9 +764,6 @@ function formatScrimTime(timeStr: string | null): string {
   return `<t:${timestamp}:R>`;
 }
 
-/**
- * Format a time string into a Discord full date timestamp
- */
 function formatScrimTimeFull(timeStr: string | null): string {
   if (!timeStr) return 'Unknown';
   const timestamp = parseScrimTime(timeStr);
@@ -812,17 +780,14 @@ function formatScrimTimeFull(timeStr: string | null): string {
 function detectScrimType(text: string): 'scrim' | 'squid_game' | 'gagaball' | null {
   const lower = text.toLowerCase();
 
-  // Check for Squid Game (highest priority)
   for (const pattern of SQUID_GAME_PATTERNS) {
     if (pattern.test(lower)) return 'squid_game';
   }
 
-  // Check for Gagaball
   for (const pattern of GAGABALL_PATTERNS) {
     if (pattern.test(lower)) return 'gagaball';
   }
 
-  // Check for Scrim
   for (const pattern of SCRIM_PATTERNS) {
     if (pattern.test(lower)) return 'scrim';
   }
@@ -855,7 +820,6 @@ function extractScrimTime(text: string): string | null {
     const match = text.match(pattern);
     if (match && match[1]) {
       const timeStr = match[1].trim();
-      // Validate it actually looks like a time
       if (/\d/.test(timeStr) && (timeStr.includes(':') || timeStr.includes('am') || timeStr.includes('pm') || timeStr.includes('EST') || timeStr.includes('UTC') || timeStr.includes('GMT') || timeStr.includes('UK') || timeStr.includes('EU'))) {
         return timeStr;
       }
@@ -869,7 +833,6 @@ function extractScrimReward(text: string): string | null {
     const match = text.match(pattern);
     if (match && match[1]) {
       const rewardStr = match[1].trim();
-      // Validate it's not a single character or generic
       if (rewardStr.length > 2 && rewardStr !== 'W' && rewardStr !== 'N/A' && rewardStr !== 'TBD') {
         return rewardStr;
       }
@@ -891,8 +854,6 @@ function extractScrimTeams(text: string): string | null {
   return null;
 }
 
-// ─── FIXED: Region extraction with NA validation ─────────────────────────
-
 function isNAFalsePositive(text: string): boolean {
   for (const pattern of NA_FALSE_POSITIVE_PATTERNS) {
     if (pattern.test(text)) return true;
@@ -903,21 +864,20 @@ function isNAFalsePositive(text: string): boolean {
 function isValidRegionContext(text: string, regionMatch: string): boolean {
   const lowerText = text.toLowerCase();
   const regionPos = lowerText.indexOf(regionMatch.toLowerCase());
-  
+
   if (regionPos === -1) return false;
-  
-  // Check for scrim-related keywords within 80 characters of the region match
+
   const contextWindow = lowerText.substring(
     Math.max(0, regionPos - 80),
     Math.min(lowerText.length, regionPos + 80)
   );
-  
+
   let keywordCount = 0;
   for (const keyword of REGION_CONTEXT_KEYWORDS) {
     if (contextWindow.includes(keyword)) keywordCount++;
     if (keywordCount >= 2) return true;
   }
-  
+
   return false;
 }
 
@@ -926,17 +886,15 @@ function extractScrimRegion(text: string): string | null {
     const match = text.match(pattern);
     if (match) {
       const regionText = match[0];
-      
-      // Skip if the match is from an NA false positive pattern
+
       if (isNAFalsePositive(text)) {
         continue;
       }
-      
-      // Validate region appears in proper scrim context
+
       if (!isValidRegionContext(text, regionText)) {
         continue;
       }
-      
+
       return regionText;
     }
   }
@@ -953,8 +911,6 @@ function extractScrimTicks(text: string): number | null {
   return null;
 }
 
-// ─── FIXED: Event context and structure validation ──────────────────────
-
 function hasEventContext(text: string): boolean {
   const lowerText = text.toLowerCase();
   let matchCount = 0;
@@ -967,79 +923,68 @@ function hasEventContext(text: string): boolean {
 
 function hasScrimStructure(text: string, type: 'scrim' | 'squid_game' | 'gagaball'): boolean {
   const lines = text.split('\n').filter(line => line.trim().length > 0);
-  
-  // Scrim announcements usually have multiple lines of structured info
+
   if (lines.length < 3) return false;
-  
-  // Check for common structural patterns (colon-separated fields)
+
   const colonLines = lines.filter(line => /[A-Z][a-z]+:\s*.+/i.test(line));
-  
+
   if (type === 'scrim') {
     return colonLines.length >= 2;
   }
-  // squid_game and gagaball
   return colonLines.length >= 1;
 }
 
 function isOwnNotification(message: Message): boolean {
   const content = message.content || '';
-  
-  // Check for our notification titles
-  if (content.includes('Scrim Detected') || 
-      content.includes('Event Detected') || 
+
+  if (content.includes('Scrim Detected') ||
+      content.includes('Event Detected') ||
       content.includes('Squid Game Detected') ||
       content.includes('Gagaball Detected') ||
       content.includes('New Giveaway')) {
     return true;
   }
-  
+
   const embed = message.embeds?.[0];
   if (embed) {
-    // Our notification colors
     const botColors = [0x5865F2, 0xFF6B6B, 0x4ECDC4, 0x00AAFF, 0xFFD700];
-    
-    // Check color
+
     if (embed.color !== null && botColors.includes(embed.color)) {
-      // Check footer - our notifications have "Detected in Xms"
-      if (embed.footer?.text && 
-          embed.footer.text.includes('Detected in') && 
+      if (embed.footer?.text &&
+          embed.footer.text.includes('Detected in') &&
           embed.footer.text.includes('ms')) {
         return true;
       }
-      
-      // Check author - our notifications have "Scrim Detected" etc.
-      if (embed.author?.name && 
-          (embed.author.name.includes('Detected') || 
+
+      if (embed.author?.name &&
+          (embed.author.name.includes('Detected') ||
            embed.author.name.includes('Giveaway'))) {
         return true;
       }
     }
-    
-    // Check description for our patterns
+
     if (embed.description) {
       const desc = embed.description.toLowerCase();
-      if (desc.includes('server:') && 
+      if (desc.includes('server:') &&
           (desc.includes('view message') || desc.includes('join server'))) {
         return true;
       }
     }
   }
-  
+
   return false;
 }
 
 function isTrackerMessage(message: Message): boolean {
   const content = (message.content || '').toLowerCase();
   const embed = message.embeds?.[0];
-  
-  // Check content
+
   for (const indicator of TRACKER_INDICATORS) {
     if (content.includes(indicator)) {
       return true;
     }
   }
-  
-  // Check embed
+
   if (embed) {
     const embedText = [
       embed.title || '',
@@ -1047,43 +992,34 @@ function isTrackerMessage(message: Message): boolean {
       embed.footer?.text || '',
       ...(embed.fields?.map(f => f.name + ' ' + f.value) || [])
     ].join(' ').toLowerCase();
-    
+
     for (const indicator of TRACKER_INDICATORS) {
       if (embedText.includes(indicator)) {
         return true;
       }
     }
   }
-  
+
   return false;
 }
 
-// ─── FIXED: Complete scrim detection with all validations ────────────────
-
 function detectScrim(parsed: ParsedGiveawayData): ScrimDetectionResult | null {
   const { lowerText, fullText } = parsed;
-  
-  // Skip if it's obviously a bot notification
+
   if (lowerText.includes('scrim detected') || lowerText.includes('event detected')) return null;
   if (lowerText.includes('view message') && lowerText.includes('join server')) return null;
   if (lowerText.includes('detected in') && lowerText.includes('ms')) return null;
-  
-  // Skip if it's obviously a giveaway
+
   if (lowerText.includes('giveaway') && (lowerText.includes('winner') || lowerText.includes('entered'))) {
     return null;
   }
 
-  // First check if it's a scrim/event type
   const type = detectScrimType(fullText);
   if (!type) return null;
 
-  // NEW: Check for event context - must have at least 2 event-related words
   if (!hasEventContext(fullText)) return null;
-
-  // NEW: Check for scrim announcement structure
   if (!hasScrimStructure(fullText, type)) return null;
 
-  // Extract data
   const host = extractScrimHost(fullText);
   const coHost = extractScrimCoHost(fullText);
   const time = extractScrimTime(fullText);
@@ -1093,9 +1029,6 @@ function detectScrim(parsed: ParsedGiveawayData): ScrimDetectionResult | null {
   const ticks = extractScrimTicks(fullText);
   const hasEveryone = lowerText.includes('@everyone') || lowerText.includes('@here');
 
-  // ─── TYPE-SPECIFIC VALIDATION ───
-  
-  // SCRIM: Require 2+ of: Host, Time, Teams, @everyone
   if (type === 'scrim') {
     let fields = 0;
     if (host) fields++;
@@ -1103,32 +1036,26 @@ function detectScrim(parsed: ParsedGiveawayData): ScrimDetectionResult | null {
     if (teams) fields++;
     if (hasEveryone) fields++;
     if (region) fields++;
-    
-    // Must have at least 2 fields
+
     if (fields < 2) return null;
   }
 
-  // SQUID GAME: Require (Host OR Time) AND Reward
   if (type === 'squid_game') {
     if (!host && !time) return null;
     if (!reward) return null;
   }
 
-  // GAGABALL: Require Time AND Reward
   if (type === 'gagaball') {
     if (!time) return null;
     if (!reward) return null;
-    
-    // NEW: Verify the time actually parses to a valid future timestamp
+
     const parsedTimestamp = parseScrimTime(time);
     if (parsedTimestamp === null) return null;
-    
-    // NEW: Time must be within reasonable range (not years in future)
-    const maxFutureMs = 7 * 24 * 60 * 60 * 1000; // 7 days max
+
+    const maxFutureMs = 7 * 24 * 60 * 60 * 1000;
     if (parsedTimestamp * 1000 - Date.now() > maxFutureMs) return null;
   }
 
-  // ─── CALCULATE SCORE ───
   let score = 0;
   const signals: string[] = [];
 
@@ -1157,10 +1084,9 @@ function detectScrim(parsed: ParsedGiveawayData): ScrimDetectionResult | null {
     signals.push('reward');
   }
 
-  // FIXED: Split region scoring into confirmed vs weak
   if (region) {
     const isConfirmedRegion = /(?:EU|NA)\s*[Xx×]\s*(?:NA|EU)|(?:EU|NA)\s+ONLY|Region:\s*(?:EU|NA)|Server(?:s)?:\s*(?:EU|NA)/i.test(fullText);
-    
+
     if (isConfirmedRegion) {
       score += SCRIM_SCORE.HAS_REGION_CONFIRMED;
       signals.push('region_confirmed');
@@ -1175,21 +1101,17 @@ function detectScrim(parsed: ParsedGiveawayData): ScrimDetectionResult | null {
     signals.push('ticks');
   }
 
-  // Keyword bonus
   if (/scrim|squid|gaga|giveaway|event/i.test(lowerText)) {
     score += SCRIM_SCORE.TITLE_KEYWORD;
     signals.push('keyword');
   }
 
-  // ─── FINAL THRESHOLD CHECK ───
-  // FIXED: Increased scrim threshold from 6 to 7
   const requiredScore = type === 'scrim' ? 7 : 5;
-  
+
   if (score < requiredScore) {
     return null;
   }
 
-  // Skip if it's just a single word mention
   const words = fullText.split(/\s+/).filter(w => w.length > 2 && !/^<@!?\d+>$/.test(w));
   if (words.length < 4 && score < 7) {
     return null;
@@ -1213,37 +1135,28 @@ function detectScrim(parsed: ParsedGiveawayData): ScrimDetectionResult | null {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// QUICK REJECT (Stage 1) - FIXED: Smart bot filter + webhook detection
+// QUICK REJECT (Stage 1)
 // ═══════════════════════════════════════════════════════════════════════════
 
 function quickReject(message: Message, selfUserId: string, now: number): string | null {
   if (!message.guild) return 'no_guild';
-  
-  // Skip self messages (the bot's own messages)
+
   if (message.author?.id === selfUserId) return 'self';
-  
-  // Skip if it's the bot's own notification
+
   if (isOwnNotification(message)) return 'self_notification';
 
-  // ─── BLOCK ALL WEBHOOK MESSAGES ───
-  // Webhooks are almost always automated messages from other bots/trackers
-  // We want to block ALL webhooks to prevent detecting other trackers
   if (message.webhookId) {
     return 'webhook_blocked';
   }
 
-  // ─── SMART BOT FILTER ───
   if (message.author?.bot) {
-    // ALLOW: The official giveaway bot (530082442967646230)
     if (ALLOWED_GIVEAWAY_BOT_IDS.has(message.author.id)) {
-      // Allow this bot - it's the real giveaway bot
+      // Allow
     } else {
-      // BLOCK: All other bots
       return 'not_allowed_bot';
     }
   }
 
-  // ─── AGE CHECK ───
   const messageAge = now - message.createdTimestamp;
   if (messageAge > MAX_MESSAGE_AGE_MS) {
     return 'too_old';
@@ -1303,7 +1216,7 @@ function detectCreation(parsed: ParsedGiveawayData): { isCreation: boolean; scor
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// SCORE CALCULATOR WITH DETECTION REASONS
+// SCORE CALCULATOR
 // ═══════════════════════════════════════════════════════════════════════════
 
 function calculateGiveawayScore(parsed: ParsedGiveawayData): DetectionReason {
@@ -1378,7 +1291,7 @@ function shouldRefreshMessage(parsed: ParsedGiveawayData): boolean {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// GIVEAWAY MANAGER - FIXED: Two-tier detection, accurate timing, throttling
+// GIVEAWAY MANAGER
 // ═══════════════════════════════════════════════════════════════════════════
 
 interface ScrimHistoryEntry {
@@ -1387,6 +1300,9 @@ interface ScrimHistoryEntry {
   cooldownUntil: number;
   lastActivity: number;
 }
+
+// ─── Invite failure reason type ──────────────────────────────────────────
+type InviteFailReason = 'no_guild' | 'no_text_channels' | 'all_failed' | 'fatal';
 
 export class GiveawayManager extends EventEmitter {
   private readonly client: Client;
@@ -1402,7 +1318,6 @@ export class GiveawayManager extends EventEmitter {
   private failedInviteCache = new LRUCache<string, number>(MAX_FAILED_INVITE_CACHE);
   private duplicateCache = new LRUCache<string, number>(MAX_DUPLICATE_CACHE);
 
-  // ─── FIXED: Scrim throttling history ────────────────────────────────
   private scrimHistory = new Map<string, ScrimHistoryEntry>();
   private scrimCleanupInterval: NodeJS.Timeout | null = null;
 
@@ -1413,7 +1328,6 @@ export class GiveawayManager extends EventEmitter {
 
   private pendingInvites = new Map<string, Promise<string>>();
 
-  // ─── NEW: Startup grace period properties ──────────────────────────
   private readyEventReceived = false;
   private readonly startupTime: number;
   private pendingStartupMessages = new Set<string>();
@@ -1436,7 +1350,6 @@ export class GiveawayManager extends EventEmitter {
     lastSeen: number;
   }>();
 
-  // Log sampling to reduce spam
   private logSampleCounter = 0;
   private readonly LOG_SAMPLE_RATE = 10;
 
@@ -1457,7 +1370,7 @@ export class GiveawayManager extends EventEmitter {
   }
 
   // ═══════════════════════════════════════════════════════════════════════
-  // NEW: Startup Ready Handler
+  // STARTUP READY HANDLER
   // ═══════════════════════════════════════════════════════════════════════
 
   private setupReadyHandler(): void {
@@ -1465,7 +1378,7 @@ export class GiveawayManager extends EventEmitter {
       setTimeout(() => {
         if (this.destroyed) return;
         this.readyEventReceived = true;
-        
+
         const startupDuration = Date.now() - this.startupTime;
         this.log.info(
           `Startup complete - ${this.pendingStartupMessages.size} messages skipped during startup (${startupDuration}ms)`,
@@ -1475,11 +1388,11 @@ export class GiveawayManager extends EventEmitter {
             pendingMessages: this.pendingStartupMessages.size
           }
         );
-        
+
         this.stats.startupMessagesSkipped = this.pendingStartupMessages.size;
         this.pendingStartupMessages.clear();
       }, 2000);
-      
+
       this.startupGraceTimer = setTimeout(() => {
         if (this.destroyed) return;
         if (!this.readyEventReceived) {
@@ -1496,7 +1409,7 @@ export class GiveawayManager extends EventEmitter {
   }
 
   // ═══════════════════════════════════════════════════════════════════════
-  // SCRIM THROTTLING - FIXED: Dynamic cooldown per channel
+  // SCRIM THROTTLING
   // ═══════════════════════════════════════════════════════════════════════
 
   private shouldThrottleScrim(guildId: string, channelId: string): boolean {
@@ -1585,7 +1498,7 @@ export class GiveawayManager extends EventEmitter {
   }
 
   // ═══════════════════════════════════════════════════════════════════════
-  // SCRIM NOTIFICATION - FIXED: Accurate processing time, removed rawContent
+  // SCRIM NOTIFICATION
   // ═══════════════════════════════════════════════════════════════════════
 
   private async sendScrimNotification(
@@ -1630,7 +1543,6 @@ export class GiveawayManager extends EventEmitter {
     const inviteUrl = await this.fetchInviteForGuild(guild.id);
 
     try {
-      // FIXED: Use processingTime for accurate detection time, removed rawContent
       const sent = await this.botManager.sendScrimNotification({
         messageId: message.id,
         channelId: message.channel.id,
@@ -1683,7 +1595,7 @@ export class GiveawayManager extends EventEmitter {
   }
 
   // ═══════════════════════════════════════════════════════════════════════
-  // PUBLIC API - FIXED: Two-tier detection, accurate timing
+  // PUBLIC API
   // ═══════════════════════════════════════════════════════════════════════
 
   public async handleMessage(message: Message): Promise<void> {
@@ -1722,7 +1634,7 @@ export class GiveawayManager extends EventEmitter {
 
       // ─── TIER 1: GIVEAWAY DETECTION (giveaway bot only) ──────────
       const isGiveawayBot = ALLOWED_GIVEAWAY_BOT_IDS.has(message.author?.id || '');
-      
+
       if (isGiveawayBot && message.author?.bot) {
         if (isBlockedContent(parsed)) { this.stats.falsePositivesBlocked++; return; }
 
@@ -1768,7 +1680,6 @@ export class GiveawayManager extends EventEmitter {
           this.stats.detected++;
           this.recordGuildStat(message.guild!.id, 'detected');
 
-          // FIXED: Use actual processing time
           const processingTime = Math.round(performance.now() - processingStart);
           const guild = message.guild!;
           const guildIcon = guild.iconURL({ size: 512 }) || null;
@@ -1822,15 +1733,13 @@ export class GiveawayManager extends EventEmitter {
           await watchlistPromise;
           return;
         }
-        
-        // Giveaway bot message but didn't meet threshold
+
         this.stats.falsePositivesBlocked++;
         return;
       }
 
       // ─── TIER 2: SCRIM/EVENT DETECTION (non-bot messages) ─────────
       if (!parsed.isFromBot) {
-        // Fast pre-check: skip if no scrim-related keywords at all
         if (!/scrim|squid|gaga|event|host|reward|prize|team|region/i.test(parsed.lowerText)) {
           this.stats.falsePositivesBlocked++;
           return;
@@ -1840,13 +1749,12 @@ export class GiveawayManager extends EventEmitter {
         if (scrimResult && scrimResult.score >= MINIMUM_SCRIM_SCORE_THRESHOLD) {
           const scrimDupKey = `scrim:${message.id}:${message.channel.id}`;
           if (this.duplicateCache.get(scrimDupKey)) return;
-          
-          // FIXED: Check for scrim throttling
+
           if (this.shouldThrottleScrim(message.guild!.id, message.channel.id)) {
             this.stats.falsePositivesBlocked++;
             return;
           }
-          
+
           this.duplicateCache.set(scrimDupKey, now);
 
           this.stats.detected++;
@@ -1907,7 +1815,7 @@ export class GiveawayManager extends EventEmitter {
   }
 
   // ═══════════════════════════════════════════════════════════════════════
-  // WATCHLIST MATCHING (reverse index + Aho-Corasick)
+  // WATCHLIST MATCHING
   // ═══════════════════════════════════════════════════════════════════════
 
   private async checkWatchlistMatches(
@@ -1954,7 +1862,6 @@ export class GiveawayManager extends EventEmitter {
       const messageUrl = `https://discord.com/channels/${message.guild!.id}/${message.channel.id}/${message.id}`;
       const inviteUrl = await invitePromise;
 
-      // FIXED: Pass processingTime instead of Date.now()
       await this.sendWatchlistDMs(uniqueUsers, parsed.prize, message, parsed.timestamps.end, messageUrl, inviteUrl, processingTime);
 
     } catch (err) {
@@ -2067,7 +1974,7 @@ export class GiveawayManager extends EventEmitter {
       for (const r of results) { r.status === 'fulfilled' ? sent++ : failed++; }
       if (i + batchSize < users.length) await delay(delayMs + Math.random() * 200);
     }
-    
+
     if (sent > 0) {
       this.log.debug(`Sent ${sent} watchlist DMs (${failed} failed)`, {
         component: 'GiveawayManager',
@@ -2077,30 +1984,35 @@ export class GiveawayManager extends EventEmitter {
   }
 
   // ═══════════════════════════════════════════════════════════════════════
-  // BACKGROUND REFRESHERS
-  // ═══════════════════════════════════════════════════════════════════════
-
-  // ═══════════════════════════════════════════════════════════════════════
-  // INVITE GENERATION WITH FAILED CACHE
+  // INVITE GENERATION — FIXED (v29)
+  //
+  // Root causes addressed:
+  //   1. permissionsFor() returns null on partial guild cache → null-safe
+  //   2. guild.invites.fetch() 403 was bubbling and aborting function → isolated
+  //   3. Vanity URL moved before invites.fetch() (free, no perms needed)
+  //   4. Channel iteration now uses a scored list best-first, single loop
+  //   5. self-member fetch now retries with force:true on first failure
+  //   6. cacheFailedInvite accepts reason → structural failures get 4× TTL
   // ═══════════════════════════════════════════════════════════════════════
 
   private async fetchInviteForGuild(guildId: string): Promise<string> {
     const now = Date.now();
+    const fallback = `https://discord.com/channels/${guildId}`;
 
+    // Hard-failed recently — don't hammer API
     const failedUntil = this.failedInviteCache.get(guildId);
-    if (failedUntil && failedUntil > now) {
-      return `https://discord.com/channels/${guildId}`;
-    }
+    if (failedUntil && failedUntil > now) return fallback;
 
+    // Valid cached invite
     const cached = this.inviteCache.get(guildId);
     if (cached && cached.expiresAt > now) return cached.url;
 
+    // Deduplicate concurrent calls for same guild
     const pending = this.pendingInvites.get(guildId);
     if (pending) return pending;
 
     const promise = this.doFetchInvite(guildId, now);
     this.pendingInvites.set(guildId, promise);
-
     try {
       return await promise;
     } finally {
@@ -2109,73 +2021,146 @@ export class GiveawayManager extends EventEmitter {
   }
 
   private async doFetchInvite(guildId: string, now: number): Promise<string> {
+    const fallback = `https://discord.com/channels/${guildId}`;
+
     try {
       const guild = this.client.guilds.cache.get(guildId);
-      if (!guild) { this.cacheFailedInvite(guildId, now); return `https://discord.com/channels/${guildId}`; }
+      if (!guild) {
+        this.cacheFailedInvite(guildId, now, 'no_guild');
+        return fallback;
+      }
 
+      // ── 1. Vanity URL (free, no MANAGE_GUILD needed) ─────────────
+      try {
+        const vanity = (guild as any).vanityURLCode as string | null | undefined;
+        if (vanity) {
+          const url = `https://discord.gg/${vanity}`;
+          this.cacheInvite(guildId, url, now);
+          return url;
+        }
+      } catch {
+        // vanityURLCode access can throw on partial guilds — ignore
+      }
+
+      // ── 2. Fetch existing invites (requires MANAGE_GUILD) ─────────
+      // Isolated so a 403 doesn't abort the rest of the function.
       try {
         const invites = await guild.invites.fetch();
         if (invites?.size) {
-          const permanent = invites.find(inv => inv.maxAge === 0 && inv.maxUses === 0);
-          const url = permanent?.url || invites.first()?.url;
-          if (url) { this.cacheInvite(guildId, url, now); return url; }
+          const best =
+            invites.find(inv => inv.maxAge === 0 && inv.maxUses === 0) ??
+            invites.find(inv => inv.maxAge === 0) ??
+            invites.first();
+          if (best?.url) {
+            this.cacheInvite(guildId, best.url, now);
+            return best.url;
+          }
         }
-      } catch {
-        // Ignore fetch errors
+      } catch (err: any) {
+        // 403 / 50013 = no MANAGE_GUILD — expected, skip silently
+        const code = err?.code ?? err?.httpStatus;
+        if (code !== 403 && code !== 50013) {
+          this.log.debug(`invites.fetch non-perm error guild ${guildId}: ${formatError(err)}`);
+        }
+        // Fall through to createInvite path
       }
 
-      try {
-        const vanity = (guild as any).vanityURLCode;
-        if (vanity) { const url = `https://discord.gg/${vanity}`; this.cacheInvite(guildId, url, now); return url; }
-      } catch {
-        // Ignore
-      }
-
-      const textChannels = guild.channels.cache.filter(
-        (ch): ch is TextChannel => ch.type === 'GUILD_TEXT'
-      );
-      if (!textChannels.size) { this.cacheFailedInvite(guildId, now); return `https://discord.com/channels/${guildId}`; }
-
+      // ── 3. Resolve self member for permission checks ──────────────
       let botMember = guild.members.cache.get(this.selfUserId);
       if (!botMember) {
         try {
-          botMember = await guild.members.fetch(this.selfUserId);
-        } catch (fetchErr) {
-          this.log.debug(`Could not fetch self member for invite in ${guildId}: ${formatError(fetchErr)}`);
-          this.cacheFailedInvite(guildId, now);
-          return `https://discord.com/channels/${guildId}`;
-        }
-      }
-      if (!botMember) { this.cacheFailedInvite(guildId, now); return `https://discord.com/channels/${guildId}`; }
-
-      for (const [, channel] of textChannels) {
-        try {
-          if (!channel.permissionsFor(botMember)?.has('CREATE_INSTANT_INVITE')) continue;
-          const invite = await channel.createInvite({ maxAge: 0, maxUses: 0, reason: 'Giveaway tracker', temporary: false });
-          this.cacheInvite(guildId, invite.url, now);
-          return invite.url;
+          botMember = await guild.members.fetch({ user: this.selfUserId, force: false });
         } catch {
-          // Ignore
+          // Retry with force:true
+          try {
+            botMember = await guild.members.fetch({ user: this.selfUserId, force: true });
+          } catch (fetchErr) {
+            this.log.debug(`Cannot fetch self member in ${guildId}: ${formatError(fetchErr)}`);
+            // botMember stays undefined — we'll try channels without perm filtering
+          }
         }
       }
 
-      for (const [, channel] of textChannels) {
+      // ── 4. Score text channels by invite-ability ──────────────────
+      // Score 2: explicit overwrite grant
+      // Score 1: permissionsFor() passes
+      // Score 0: permissionsFor() returned null (partial guild data)
+      // Excluded: permissionsFor() explicitly denies
+      const textChannels = guild.channels.cache.filter(
+        (ch): ch is TextChannel => ch.type === 'GUILD_TEXT'
+      );
+
+      if (!textChannels.size) {
+        this.cacheFailedInvite(guildId, now, 'no_text_channels');
+        return fallback;
+      }
+
+      interface ScoredChannel { channel: TextChannel; score: number }
+      const scored: ScoredChannel[] = [];
+
+      for (const [, ch] of textChannels) {
+        let score = 0;
+
+        if (botMember) {
+          try {
+            const perms = ch.permissionsFor(botMember);
+
+            if (perms === null) {
+              // null means partial guild cache; unknown — include at score 0
+              score = 0;
+            } else if (perms.has('CREATE_INSTANT_INVITE')) {
+              // Check if explicitly granted via overwrite (score 2) or inherited (score 1)
+              const overwrite = ch.permissionOverwrites?.cache.get(this.selfUserId);
+              score = overwrite?.allow?.has('CREATE_INSTANT_INVITE') ? 2 : 1;
+            } else {
+              // Explicitly denied — skip channel entirely
+              continue;
+            }
+          } catch {
+            // permissionsFor threw (evicted partial data) — include at score 0
+            score = 0;
+          }
+        }
+        // If botMember is null we have no info — include everything at score 0
+
+        scored.push({ channel: ch, score });
+      }
+
+      // Sort best candidates first
+      scored.sort((a, b) => b.score - a.score);
+
+      // ── 5. Try createInvite on scored channels ────────────────────
+      const INVITE_OPTIONS = {
+        maxAge: 0,
+        maxUses: 0,
+        reason: 'Giveaway tracker',
+        temporary: false,
+      };
+
+      for (const { channel } of scored) {
         try {
-          const invite = await channel.createInvite({ maxAge: 0, maxUses: 0, reason: 'Giveaway tracker (fallback)', temporary: false });
-          this.cacheInvite(guildId, invite.url, now);
-          return invite.url;
-        } catch {
-          // Ignore
+          const invite = await channel.createInvite(INVITE_OPTIONS);
+          if (invite?.url) {
+            this.cacheInvite(guildId, invite.url, now);
+            return invite.url;
+          }
+        } catch (err: any) {
+          const code = err?.code ?? err?.httpStatus;
+          // Perm denied on this specific channel — try next
+          if (code === 50013 || code === 403) continue;
+          // Transient (rate limit, network) — log and try next
+          this.log.debug(`createInvite failed ch ${channel.id}: ${formatError(err)}`);
         }
       }
 
-      this.cacheFailedInvite(guildId, now);
-      return `https://discord.com/channels/${guildId}`;
+      // ── 6. All attempts exhausted ─────────────────────────────────
+      this.cacheFailedInvite(guildId, now, 'all_failed');
+      return fallback;
 
     } catch (error) {
-      this.log.error(`Invite error ${guildId}: ${formatError(error)}`);
-      this.cacheFailedInvite(guildId, now);
-      return `https://discord.com/channels/${guildId}`;
+      this.log.error(`Invite fatal error ${guildId}: ${formatError(error)}`);
+      this.cacheFailedInvite(guildId, now, 'fatal');
+      return fallback;
     }
   }
 
@@ -2183,8 +2168,20 @@ export class GiveawayManager extends EventEmitter {
     this.inviteCache.set(guildId, { url, expiresAt: now + INVITE_CACHE_TTL });
   }
 
-  private cacheFailedInvite(guildId: string, now: number): void {
-    this.failedInviteCache.set(guildId, now + FAILED_INVITE_RETRY_MS);
+  // Reason-aware TTL: structural failures are retried much less often
+  private cacheFailedInvite(
+    guildId: string,
+    now: number,
+    reason: InviteFailReason = 'all_failed',
+  ): void {
+    const retryMs = (reason === 'no_guild' || reason === 'no_text_channels')
+      ? FAILED_INVITE_RETRY_MS * 4   // 60 min — structural, won't change soon
+      : FAILED_INVITE_RETRY_MS;      // 15 min — might be transient
+
+    this.failedInviteCache.set(guildId, now + retryMs);
+    this.log.debug(
+      `Invite cached as failed (${reason}) for guild ${guildId}, retry in ${retryMs / 60000}m`
+    );
   }
 
   public clearInviteCache(guildId: string): void {
@@ -2237,9 +2234,9 @@ export class GiveawayManager extends EventEmitter {
   }
 
   public getStats() {
-    return { 
-      ...this.stats, 
-      uptime: Date.now() - this.stats.startedAt, 
+    return {
+      ...this.stats,
+      uptime: Date.now() - this.stats.startedAt,
       guildStats: this.guildStats.size,
       readyEventReceived: this.readyEventReceived,
     };
@@ -2309,7 +2306,7 @@ export class GiveawayManager extends EventEmitter {
   }
 
   // ═══════════════════════════════════════════════════════════════════════
-  // SHUTDOWN - FIXED: Clean up startup timer + scrim cleanup
+  // SHUTDOWN
   // ═══════════════════════════════════════════════════════════════════════
 
   public async shutdown(): Promise<void> {
