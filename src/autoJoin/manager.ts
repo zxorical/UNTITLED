@@ -146,6 +146,7 @@ interface UserSession {
   isActive: boolean;
   stats: SessionStats;
   rateLimiter: TokenBucket; // 🔥 FIXED: Added back
+  interactionCircuitBreaker: CircuitBreaker;
   listeners: {
     messageCreate?: (message: Message) => void;
     messageUpdate?: (oldMessage: Message | PartialMessage, newMessage: Message | PartialMessage) => void;
@@ -167,6 +168,7 @@ interface UserSession {
   lastDisconnectAt: number;
   lastReconnectAt: number;
   stableSince: number;
+  lastPipelineActivityAt: number;
 }
 
 interface SessionStats {
@@ -393,6 +395,9 @@ const HEALTH_CHECK_INTERVAL_MS = 60000;
 const MAX_CONCURRENT_ENTRIES_PER_ACCOUNT = 5;
 const DETECTION_CONCURRENCY_PER_SESSION = 4;
 const MAX_INGEST_QUEUE_SIZE = 20000;
+const INGEST_OPERATION_TIMEOUT_MS = 30000;
+const ENTRY_OPERATION_TIMEOUT_MS = 30000;
+const SESSION_PIPELINE_STALL_MS = 90000;
 
 // ---------------------------------------------------------------------------
 // LRU Cache Implementation
@@ -1667,6 +1672,7 @@ export class AutoJoinManager extends EventEmitter {
         isActive: true,
         stats: { detected: 0, entered: 0, failed: 0, wins: 0, falsePositives: 0, queueWaitTimes: [] },
         rateLimiter: new TokenBucket(10, 5000), // 🔥 FIXED: Added back
+        interactionCircuitBreaker: new CircuitBreaker(8, 10000, 2),
         listeners: {},
         sessionId,
         destroyed: false,
@@ -1680,6 +1686,7 @@ export class AutoJoinManager extends EventEmitter {
         lastDisconnectAt: 0,
         lastReconnectAt: 0,
         stableSince: Date.now(),
+        lastPipelineActivityAt: Date.now(),
       };
 
       session.gatewaySessionId = await this.getGatewaySessionId(client);
@@ -1883,8 +1890,10 @@ export class AutoJoinManager extends EventEmitter {
       session.reconnectInProgress = false;
       session.lastReconnectAt = Date.now();
       session.stableSince = Date.now();
+      session.lastPipelineActivityAt = Date.now();
       this.reconnectCountMap.delete(session.userId);
       this.tokenFailureTracker.delete(session.userId);
+      this.restartSessionWorkers(session);
       this.asyncLogger.info('✅ Session ready', { userId: session.userId });
     };
 
@@ -1894,6 +1903,7 @@ export class AutoJoinManager extends EventEmitter {
       session.gatewaySessionId = null;
       session.lastDisconnectAt = Date.now();
       session.reconnectAttempts = Math.min(MAX_RECONNECT_ATTEMPTS, session.reconnectAttempts + 1);
+      session.lastPipelineActivityAt = Date.now();
       // A disconnect event does not mean our manual recovery is running. Let the
       // library reconnect/resume first; the health checker intervenes only later.
       session.reconnectInProgress = false;
@@ -1926,6 +1936,8 @@ export class AutoJoinManager extends EventEmitter {
       session.reconnectInProgress = false;
       session.reconnectAttempts = 0;
       session.stableSince = Date.now();
+      session.lastPipelineActivityAt = Date.now();
+      this.restartSessionWorkers(session);
       this.asyncLogger.info('✅ Session resumed', { userId: session.userId });
     };
 
@@ -1984,6 +1996,7 @@ export class AutoJoinManager extends EventEmitter {
     // Do not impose a tiny burst limit. The queue is intentionally large so a
     // giveaway spike is absorbed instead of silently dropping messages.
     queue.push({ message, kind, queuedAt: Date.now() });
+    session.lastPipelineActivityAt = Date.now();
 
     if (queue.length > MAX_INGEST_QUEUE_SIZE) {
       this.asyncLogger.warn('⚠️ Large incoming giveaway burst queued', {
@@ -2051,7 +2064,13 @@ export class AutoJoinManager extends EventEmitter {
                 error: formatError(error),
               });
             });
-            await this.handleMessage(item.message, session);
+            session.lastPipelineActivityAt = Date.now();
+            await this.withTimeout(
+              this.handleMessage(item.message, session),
+              INGEST_OPERATION_TIMEOUT_MS,
+              `message processing ${item.message.id}`,
+            );
+            session.lastPipelineActivityAt = Date.now();
           } catch (error) {
             this.asyncLogger.error('Incoming giveaway processing error', {
               userId: session.userId,
@@ -2183,7 +2202,11 @@ export class AutoJoinManager extends EventEmitter {
         detectionReasons: ['binary_detection_with_button'],
       };
 
-      await saveAutoJoinEntry(entryData as Omit<AutoJoinEntry, '_id'>);
+      await this.withTimeout(
+        saveAutoJoinEntry(entryData as Omit<AutoJoinEntry, '_id'>),
+        15000,
+        `save entry ${entryId}`,
+      );
       this.metrics.dbQueries++;
 
       this.asyncLogger.info('🎯 AutoJoin: Giveaway detected', {
@@ -2205,7 +2228,18 @@ export class AutoJoinManager extends EventEmitter {
       });
     } finally {
       this.processingCache.delete(entryId);
-      await cleanupAutoJoinEntries(session.userId);
+      try {
+        await this.withTimeout(
+          cleanupAutoJoinEntries(session.userId),
+          10000,
+          `cleanup ${session.userId}`,
+        );
+      } catch (cleanupError) {
+        this.asyncLogger.warn('AutoJoin cleanup timed out', {
+          userId: session.userId,
+          error: formatError(cleanupError),
+        });
+      }
     }
   }
 
@@ -2430,8 +2464,20 @@ export class AutoJoinManager extends EventEmitter {
         }
 
         let promise!: Promise<void>;
-        promise = this.enterGiveaway(entryId, session, entry).finally(() => {
+        session.lastPipelineActivityAt = Date.now();
+        promise = this.withTimeout(
+          this.enterGiveaway(entryId, session, entry),
+          ENTRY_OPERATION_TIMEOUT_MS,
+          `giveaway entry ${entry.messageId}`,
+        ).catch(error => {
+          this.asyncLogger.error('Giveaway entry worker timed out or failed', {
+            userId,
+            messageId: entry.messageId,
+            error: formatError(error),
+          });
+        }).finally(() => {
           activePromises.delete(promise);
+          session.lastPipelineActivityAt = Date.now();
         });
         activePromises.add(promise);
 
@@ -2567,7 +2613,7 @@ export class AutoJoinManager extends EventEmitter {
         this.updateGuildStats(entry.guildId, entry.guildName, 'entered');
         this.updateAccountStats(session.userId, 'entered');
 
-        this.apiCircuitBreaker.reset();
+        session.interactionCircuitBreaker.reset();
 
         this.asyncLogger.info('✅ AutoJoin: Entered giveaway', {
           correlationId,
@@ -2758,11 +2804,11 @@ export class AutoJoinManager extends EventEmitter {
       throw new Error('Cannot click buttons in DMs - guild context required');
     }
 
-    if (this.apiCircuitBreaker.isOpen()) {
-      throw new Error(`Circuit breaker is open (${this.apiCircuitBreaker.getState()})`);
+    if (session.interactionCircuitBreaker.isOpen()) {
+      throw new Error(`Circuit breaker is open (${session.interactionCircuitBreaker.getState()})`);
     }
 
-    await this.apiCircuitBreaker.execute(async () => {
+    await session.interactionCircuitBreaker.execute(async () => {
       const client = message.client as any;
       
       let wsSessionId = session.gatewaySessionId;
@@ -3074,6 +3120,51 @@ export class AutoJoinManager extends EventEmitter {
     this.accountStatsCache.set(userId, stats);
   }
 
+  private async withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+    let timeout: NodeJS.Timeout | undefined;
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timeout = setTimeout(() => reject(new Error(`Operation timeout: ${label} after ${timeoutMs}ms`)), timeoutMs);
+      if (timeout.unref) timeout.unref();
+    });
+    try {
+      return await Promise.race([promise, timeoutPromise]);
+    } finally {
+      if (timeout) clearTimeout(timeout);
+    }
+  }
+
+  private restartSessionWorkers(session: UserSession): void {
+    if (this.isShuttingDown || session.destroyed || !session.isActive) return;
+
+    const ingestQueue = this.ingestQueues.get(session.userId);
+    if (ingestQueue && ingestQueue.length > 0 && !this.ingestWorkers.has(session.userId)) {
+      const worker = this.processIncomingMessageQueue(session)
+        .catch(error => {
+          this.asyncLogger.error('Resumed ingest worker failed', {
+            userId: session.userId,
+            error: formatError(error),
+          });
+        })
+        .finally(() => {
+          this.ingestWorkers.delete(session.userId);
+          if (
+            !this.isShuttingDown &&
+            session.isActive &&
+            !session.destroyed &&
+            (this.ingestQueues.get(session.userId)?.length || 0) > 0 &&
+            !this.ingestWorkers.has(session.userId)
+          ) {
+            this.restartSessionWorkers(session);
+          }
+        });
+      this.ingestWorkers.set(session.userId, worker);
+    }
+
+    if (this.joinQueue.hasEntriesForUser(session.userId) && !this.queueProcessorPromises.has(session.userId)) {
+      this.startQueueProcessor(session.userId);
+    }
+  }
+
   // -------------------------------------------------------------------------
   // Health Check System
   // -------------------------------------------------------------------------
@@ -3094,6 +3185,23 @@ export class AutoJoinManager extends EventEmitter {
 
           if (isConnected) {
             if (!session.reconnectInProgress) session.stableSince = session.stableSince || now;
+            this.restartSessionWorkers(session);
+
+            const pipelineAge = now - session.lastPipelineActivityAt;
+            const hasPendingWork =
+              (this.ingestQueues.get(session.userId)?.length || 0) > 0 ||
+              this.joinQueue.hasEntriesForUser(session.userId);
+
+            if (hasPendingWork && pipelineAge > SESSION_PIPELINE_STALL_MS) {
+              this.asyncLogger.warn('⚠️ Session pipeline appears stalled; restarting workers', {
+                userId: session.userId,
+                pipelineAgeMs: pipelineAge,
+                ingestQueueSize: this.ingestQueues.get(session.userId)?.length || 0,
+                hasJoinQueue: this.joinQueue.hasEntriesForUser(session.userId),
+              });
+              session.lastPipelineActivityAt = now;
+              this.restartSessionWorkers(session);
+            }
             continue;
           }
 
@@ -3164,6 +3272,12 @@ export class AutoJoinManager extends EventEmitter {
           worker: this.workerId,
           totalSessions: this.sessions.size,
         });
+      }
+
+      for (const session of this.sessions.values()) {
+        if (session.isActive && !session.destroyed) {
+          this.restartSessionWorkers(session);
+        }
       }
     }, 30000);
     if (this.stallCheckInterval.unref) this.stallCheckInterval.unref();
@@ -3407,7 +3521,9 @@ export class AutoJoinManager extends EventEmitter {
       sessionStats,
       worker: this.workerId,
       healthStatus: this.healthStatus,
-      circuitBreakerState: this.apiCircuitBreaker.getState(),
+      circuitBreakerState: Array.from(this.sessions.values()).some(
+        session => session.interactionCircuitBreaker.isOpen()
+      ) ? 'open' : 'closed',
       caches: {
         processedMessages: this.processedMessages.size,
         processing: this.processingCache.size,
