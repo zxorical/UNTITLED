@@ -325,7 +325,7 @@ const INITIAL_RETRY_DELAY_MS = 5000;
 const MAX_RETRY_DELAY_MS = 60000;
 const TOKEN_REACTIVATION_THRESHOLD_MS = 60 * 1000;
 const HEALTH_CHECK_INTERVAL_MS = 60000;
-const MAX_CONCURRENT_ENTRIES_PER_ACCOUNT = 16;
+const MAX_CONCURRENT_ENTRIES_PER_ACCOUNT = 5;
 const DETECTION_CONCURRENCY_PER_SESSION = 4;
 const MAX_INGEST_QUEUE_SIZE = 20000;
 const MAX_DETECTION_MESSAGE_AGE_MS = 30 * 60 * 1000;
@@ -1365,7 +1365,7 @@ export class AutoJoinManager extends EventEmitter {
         startedAt: Date.now(),
         isActive: true,
         stats: { detected: 0, entered: 0, failed: 0, wins: 0, falsePositives: 0, queueWaitTimes: [] },
-        rateLimiter: new TokenBucket(20, 1000),
+        rateLimiter: new TokenBucket(10, 5000),
         listeners: {},
         sessionId,
         destroyed: false,
@@ -1970,6 +1970,7 @@ export class AutoJoinManager extends EventEmitter {
           activePromises.delete(promise);
         });
         activePromises.add(promise);
+        await delay(25);
       }
       if (activePromises.size === 0) break;
       await Promise.race(Array.from(activePromises));
