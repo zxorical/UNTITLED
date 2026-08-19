@@ -149,6 +149,7 @@ interface DetectionTask {
   message: Message;
   kind: 'create' | 'update';
   queuedAt: number;
+  retryCount: number;
 }
 interface QueueItem {
   entryId: string;
@@ -1612,7 +1613,7 @@ export class AutoJoinManager extends EventEmitter {
     }
     session.listeners = {};
   }
-  private enqueueDetection(session: UserSession, message: Message, kind: 'create' | 'update', delayMs = 0): void {
+  private enqueueDetection(session: UserSession, message: Message, kind: 'create' | 'update', delayMs = 0, retryCount = 0): void {
     const key = this.makeEntryId(session, message);
     const enqueue = () => {
       if (this.isShuttingDown || session.destroyed) return;
@@ -1630,6 +1631,7 @@ export class AutoJoinManager extends EventEmitter {
       if (existing) {
         existing.message = message;
         existing.kind = kind;
+        existing.retryCount = Math.max(existing.retryCount, retryCount);
         return;
       }
       if (queue.length >= MAX_INGEST_QUEUE_SIZE && !this.detectionInFlight.get(session.userId)?.has(key)) {
@@ -1637,7 +1639,7 @@ export class AutoJoinManager extends EventEmitter {
         if (timer.unref) timer.unref();
         return;
       }
-      const task: DetectionTask = { key, message, kind, queuedAt: Date.now() };
+      const task: DetectionTask = { key, message, kind, queuedAt: Date.now(), retryCount };
       queue.push(task);
       pending.set(key, task);
       this.startDetectionProcessor(session.userId);
@@ -1667,7 +1669,7 @@ export class AutoJoinManager extends EventEmitter {
     this.detectionInFlight.set(userId, inFlight);
     while (!this.isShuttingDown) {
       const current = this.sessionsByUserId.get(userId);
-      if (!current || current.destroyed) break;
+      if (!current || current.destroyed || !current.isActive) break;
       const queue = this.detectionQueues.get(userId);
       const pending = this.detectionPending.get(userId);
       if (!queue || !pending) break;
@@ -1677,7 +1679,7 @@ export class AutoJoinManager extends EventEmitter {
         pending.delete(task.key);
         if (inFlight.has(task.key)) continue;
         inFlight.add(task.key);
-        const promise = this.handleMessage(task.message, current, task.kind, task.queuedAt).catch(error => {
+        const promise = this.handleMessage(task.message, current, task.kind, task.queuedAt, task.retryCount).catch(error => {
           this.asyncLogger.error('AutoJoin: detection task failed', {
             userId,
             kind: task.kind,
@@ -1697,7 +1699,7 @@ export class AutoJoinManager extends EventEmitter {
     }
     if (active.size > 0) await Promise.allSettled(active);
   }
-  private async handleMessage(message: Message, session: UserSession, kind: 'create' | 'update' = 'create', queuedAt = Date.now()): Promise<void> {
+  private async handleMessage(message: Message, session: UserSession, kind: 'create' | 'update' = 'create', queuedAt = Date.now(), retryCount = 0): Promise<void> {
     if (!message.guild) return;
     const messageAge = Date.now() - message.createdTimestamp;
     if (messageAge > MAX_DETECTION_MESSAGE_AGE_MS) return;
@@ -1710,13 +1712,14 @@ export class AutoJoinManager extends EventEmitter {
     if (this.processingCache.get(entryId) !== undefined) return;
     this.metrics.cacheMisses++;
     if (!this.checkMemory()) {
-      this.enqueueDetection(session, message, kind, 1000);
+      if (retryCount < 6) this.enqueueDetection(session, message, kind, Math.min(5000, 250 * Math.pow(2, retryCount)), retryCount + 1);
       return;
     }
     this.processingCache.set(entryId, Date.now());
     try {
       const detected = await this.detectGiveawaySimple(message);
       if (!detected?.button) {
+        if (retryCount < 3) this.enqueueDetection(session, message, kind, 150 * (retryCount + 1), retryCount + 1);
         return;
       }
       session.lastGiveawayDetectionAt = Date.now();
@@ -1910,10 +1913,6 @@ export class AutoJoinManager extends EventEmitter {
       })
       .finally(() => {
         this.queueProcessorPromises.delete(userId);
-    this.detectionProcessorPromises.delete(userId);
-    this.detectionQueues.delete(userId);
-    this.detectionPending.delete(userId);
-    this.detectionInFlight.delete(userId);
         if (!this.isShuttingDown && this.joinQueue.hasEntriesForUser(userId)) {
           this.startQueueProcessor(userId);
         }
@@ -2644,10 +2643,12 @@ export class AutoJoinManager extends EventEmitter {
       const users = Array.from(this.sessions.values())
         .filter(s => s.isActive && !s.destroyed)
         .map(s => s.userId);
-      for (let i = 0; i < users.length; i += 10) {
-        const batch = users.slice(i, i + 10);
-        Promise.allSettled(batch.map(userId => cleanupAutoJoinEntries(userId))).catch(() => {});
-      }
+      void (async () => {
+        for (let i = 0; i < users.length && !this.isShuttingDown; i += 20) {
+          const batch = users.slice(i, i + 20);
+          await Promise.allSettled(batch.map(userId => cleanupAutoJoinEntries(userId)));
+        }
+      })().catch(() => {});
     }, 5 * 60_000);
     if (this.cleanupInterval.unref) this.cleanupInterval.unref();
   }
@@ -2890,6 +2891,10 @@ export class AutoJoinManager extends EventEmitter {
     session.destroyed = true;
     session.isActive = false;
     this.queueProcessorPromises.delete(userId);
+    this.detectionProcessorPromises.delete(userId);
+    this.detectionQueues.delete(userId);
+    this.detectionPending.delete(userId);
+    this.detectionInFlight.delete(userId);
     try {
       this.cleanupSessionListeners(session);
       this.clearClientCaches(session.client);
