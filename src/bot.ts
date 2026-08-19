@@ -563,7 +563,7 @@ function createItemEmbed(item: VRFSItem): EmbedBuilder {
   return embed;
 }
 function createMarketplaceEmbed(item: VRFSMarketplaceItem): EmbedBuilder {
-  const name = String(item.title ?? item.name ?? getSku(item) || "Marketplace Item");
+  const name = String((item.title ?? item.name ?? getSku(item)) || "Marketplace Item");
   const embed = createEmbed(name, getMarketplaceActive(item) ? 0x2ecc71 : 0xe74c3c);
   embed.setDescription(
     `ID \`#${item.id}\`\n${getSku(item) ? `\`${getSku(item)}\`` : "No SKU available"}`
