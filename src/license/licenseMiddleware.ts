@@ -1,4 +1,4 @@
-import { Client, Guild, GuildMember, Role } from 'discord.js';
+import { Client, Guild, GuildMember, PartialGuildMember, Role } from 'discord.js';
 import { logger } from '../logger.js';
 import {
   setPremiumUser,
@@ -186,6 +186,7 @@ export function clearPremiumCache(
   }
 
   const prefix = `${userId}:`;
+
   for (const key of premiumCache.keys()) {
     if (key.startsWith(prefix)) {
       premiumCache.delete(key);
@@ -208,18 +209,28 @@ export async function checkPremium(
   guildId?: string,
 ): Promise<PremiumCheckResult> {
   if (!guildId) {
-    return { isPremium: false, error: 'Guild ID required.' };
+    return {
+      isPremium: false,
+      error: 'Guild ID required.',
+    };
   }
 
   if (!clientRef) {
-    return { isPremium: false, error: 'Bot client not initialized.' };
+    return {
+      isPremium: false,
+      error: 'Bot client not initialized.',
+    };
   }
 
   if (!roleId) {
-    return { isPremium: false, error: 'Premium role not configured.' };
+    return {
+      isPremium: false,
+      error: 'Premium role not configured.',
+    };
   }
 
   const cached = getCachedResult(userId, guildId);
+
   if (cached) {
     return {
       isPremium: cached.isPremium,
@@ -236,7 +247,11 @@ export async function checkPremium(
       cacheResult(
         userId,
         guildId,
-        { isPremium: false, guildId, roleId },
+        {
+          isPremium: false,
+          guildId,
+          roleId,
+        },
         NEGATIVE_CACHE_TTL_MS,
       );
 
@@ -257,11 +272,19 @@ export async function checkPremium(
       cacheResult(
         userId,
         guildId,
-        { isPremium: false, guildId, roleId },
+        {
+          isPremium: false,
+          guildId,
+          roleId,
+        },
         NEGATIVE_CACHE_TTL_MS,
       );
 
-      return { isPremium: false, guildId, roleId };
+      return {
+        isPremium: false,
+        guildId,
+        roleId,
+      };
     }
 
     const member = await fetchMember(guild, userId);
@@ -403,7 +426,10 @@ export async function isPremiumFresh(
 export async function requirePremium(
   userId: string,
   guildId?: string,
-): Promise<{ allowed: boolean; message?: string }> {
+): Promise<{
+  allowed: boolean;
+  message?: string;
+}> {
   if (!(await isPremium(userId, guildId))) {
     return {
       allowed: false,
@@ -412,7 +438,9 @@ export async function requirePremium(
     };
   }
 
-  return { allowed: true };
+  return {
+    allowed: true,
+  };
 }
 
 /**
@@ -426,22 +454,36 @@ export async function addPremiumUser(
   guildId: string,
   source: PremiumSource,
   licenseKey?: string,
-): Promise<{ success: boolean; error?: string }> {
+): Promise<{
+  success: boolean;
+  error?: string;
+}> {
   if (!clientRef) {
-    return { success: false, error: 'Bot client not initialized.' };
+    return {
+      success: false,
+      error: 'Bot client not initialized.',
+    };
   }
 
   if (!roleId) {
-    return { success: false, error: 'PREMIUM_ROLE_ID not configured.' };
+    return {
+      success: false,
+      error: 'PREMIUM_ROLE_ID not configured.',
+    };
   }
 
   try {
     const guild = getGuild(guildId);
+
     if (!guild) {
-      return { success: false, error: 'Guild not found.' };
+      return {
+        success: false,
+        error: 'Guild not found.',
+      };
     }
 
     const member = await fetchMember(guild, userId);
+
     if (!member) {
       return {
         success: false,
@@ -450,6 +492,7 @@ export async function addPremiumUser(
     }
 
     const role = getPremiumRole(guild);
+
     if (!role) {
       return {
         success: false,
@@ -499,7 +542,9 @@ export async function addPremiumUser(
       source,
     });
 
-    return { success: true };
+    return {
+      success: true,
+    };
   } catch (error) {
     logger.error('Failed to add premium user', {
       component: 'LicenseMiddleware',
@@ -519,9 +564,15 @@ export async function addPremiumUser(
 export async function removePremiumUser(
   userId: string,
   guildId: string,
-): Promise<{ success: boolean; error?: string }> {
+): Promise<{
+  success: boolean;
+  error?: string;
+}> {
   if (!clientRef) {
-    return { success: false, error: 'Bot client not initialized.' };
+    return {
+      success: false,
+      error: 'Bot client not initialized.',
+    };
   }
 
   if (!roleId) {
@@ -538,13 +589,23 @@ export async function removePremiumUser(
       const role = getPremiumRole(guild);
       const member = await fetchMember(guild, userId);
 
-      if (role && member?.roles.cache.has(role.id)) {
+      if (
+        role &&
+        member?.roles.cache.has(role.id)
+      ) {
         await member.roles.remove(role);
       }
     }
 
-    await removePremiumUserDb(userId, guildId);
-    clearPremiumCache(userId, guildId);
+    await removePremiumUserDb(
+      userId,
+      guildId,
+    );
+
+    clearPremiumCache(
+      userId,
+      guildId,
+    );
 
     logger.info('Premium user removed', {
       component: 'LicenseMiddleware',
@@ -552,7 +613,9 @@ export async function removePremiumUser(
       guildId,
     });
 
-    return { success: true };
+    return {
+      success: true,
+    };
   } catch (error) {
     logger.error('Failed to remove premium user', {
       component: 'LicenseMiddleware',
@@ -573,9 +636,12 @@ export async function removePremiumUser(
  *
  * This intentionally ignores premium source. If a user leaves the guild,
  * key/booster/manual premium for that guild is revoked.
+ *
+ * discord.js can emit GuildMember | PartialGuildMember here, so we only
+ * use properties guaranteed to exist on both types.
  */
 async function handlePremiumMemberRemove(
-  member: GuildMember,
+  member: GuildMember | PartialGuildMember,
 ): Promise<void> {
   try {
     await revokePremiumEntitlement(
@@ -591,12 +657,15 @@ async function handlePremiumMemberRemove(
       guildId: member.guild.id,
     });
   } catch (error) {
-    logger.error('Unhandled premium revoke error on member removal', {
-      component: 'LicenseMiddleware',
-      userId: member.id,
-      guildId: member.guild.id,
-      error: String(error),
-    });
+    logger.error(
+      'Unhandled premium revoke error on member removal',
+      {
+        component: 'LicenseMiddleware',
+        userId: member.id,
+        guildId: member.guild.id,
+        error: String(error),
+      },
+    );
   }
 }
 
@@ -611,45 +680,72 @@ async function handlePremiumMemberAdd(
   member: GuildMember,
 ): Promise<void> {
   try {
-    clearPremiumCache(member.id, member.guild.id);
+    clearPremiumCache(
+      member.id,
+      member.guild.id,
+    );
 
-    logger.debug('Premium cache cleared after guild rejoin', {
-      component: 'LicenseMiddleware',
-      userId: member.id,
-      guildId: member.guild.id,
-    });
+    logger.debug(
+      'Premium cache cleared after guild rejoin',
+      {
+        component: 'LicenseMiddleware',
+        userId: member.id,
+        guildId: member.guild.id,
+      },
+    );
   } catch (error) {
-    logger.warn('Failed clearing premium cache after guild rejoin', {
-      component: 'LicenseMiddleware',
-      userId: member.id,
-      guildId: member.guild.id,
-      error: String(error),
-    });
+    logger.warn(
+      'Failed clearing premium cache after guild rejoin',
+      {
+        component: 'LicenseMiddleware',
+        userId: member.id,
+        guildId: member.guild.id,
+        error: String(error),
+      },
+    );
   }
 }
 
-export function registerPremiumEvents(client: Client): void {
+export function registerPremiumEvents(
+  client: Client,
+): void {
   if (eventsRegistered) return;
+
   eventsRegistered = true;
 
-  client.on('guildMemberRemove', member => {
-    void handlePremiumMemberRemove(member);
-  });
+  client.on(
+    'guildMemberRemove',
+    member => {
+      void handlePremiumMemberRemove(member);
+    },
+  );
 
-  client.on('guildMemberAdd', member => {
-    void handlePremiumMemberAdd(member);
-  });
+  client.on(
+    'guildMemberAdd',
+    member => {
+      void handlePremiumMemberAdd(member);
+    },
+  );
 
-  client.on('error', error => {
-    logger.error('Discord client error in premium middleware', {
+  client.on(
+    'error',
+    error => {
+      logger.error(
+        'Discord client error in premium middleware',
+        {
+          component: 'LicenseMiddleware',
+          error: String(error),
+        },
+      );
+    },
+  );
+
+  logger.info(
+    'Premium membership enforcement enabled',
+    {
       component: 'LicenseMiddleware',
-      error: String(error),
-    });
-  });
-
-  logger.info('Premium membership enforcement enabled', {
-    component: 'LicenseMiddleware',
-  });
+    },
+  );
 }
 
 export async function getPremiumUsers(
@@ -673,6 +769,13 @@ export async function getPremiumStats(
 export async function assignPremiumRole(
   userId: string,
   guildId: string,
-): Promise<{ success: boolean; error?: string }> {
-  return addPremiumUser(userId, guildId, 'key');
+): Promise<{
+  success: boolean;
+  error?: string;
+}> {
+  return addPremiumUser(
+    userId,
+    guildId,
+    'key',
+  );
 }
