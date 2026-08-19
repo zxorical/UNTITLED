@@ -1,20 +1,124 @@
 import https from "node:https";
 import http from "node:http";
 import {URL} from "node:url";
-import {HttpResponse,RequestOptions,VRFSApiError} from "./types";
-const DEFAULT_TIMEOUT=15000;
-const DEFAULT_RETRIES=2;
-const DEFAULT_RETRY_DELAY=500;
-const USER_AGENT="UNTITLED-VRFS-Middleware/1.0";
-function sleep(ms:number,signal?:AbortSignal):Promise<void>{return new Promise((resolve,reject)=>{if(signal?.aborted){reject(new Error("Request aborted"));return;}const timer=setTimeout(resolve,ms);const onAbort=()=>{clearTimeout(timer);reject(new Error("Request aborted"));};signal?.addEventListener("abort",onAbort,{once:true});});}
-function shouldRetry(status:number):boolean{return status===408||status===425||status===429||status>=500;}
-function retryAfter(headers:Record<string,string|string[]|undefined>):number|null{const value=headers["retry-after"];if(!value)return null;const raw=Array.isArray(value)?value[0]:value;const seconds=Number(raw);if(Number.isFinite(seconds)&&seconds>=0)return seconds*1000;const date=Date.parse(raw);if(Number.isFinite(date))return Math.max(0,date-Date.now());return null;}
-function normalizeHeaders(headers:Record<string,string|string[]|undefined>):Record<string,string|string[]|undefined>{const result:Record<string,string|string[]|undefined>={};for(const[key,value]of Object.entries(headers))result[key.toLowerCase()]=value;return result;}
-function requestOnce<T>(url:string,options:RequestOptions):Promise<HttpResponse<T>>{return new Promise((resolve,reject)=>{let parsed:URL;try{parsed=new URL(url);}catch(error){reject(error);return;}const transport=parsed.protocol==="https:"?https:http;const method=options.method??"GET";const timeoutMs=options.timeoutMs??DEFAULT_TIMEOUT;const body=options.body===undefined||options.body===null?null:typeof options.body==="string"?options.body:JSON.stringify(options.body);const headers:Record<string,string>={"Accept":"application/json","User-Agent":USER_AGENT,...(options.headers??{})};if(body!==null&&!headers["Content-Length"]&&!headers["content-length"])headers["Content-Length"]=String(Buffer.byteLength(body));if(body!==null&&!headers["Content-Type"]&&!headers["content-type"])headers["Content-Type"]="application/json";const req=transport.request(parsed,{method,headers,timeout:timeoutMs},res=>{const chunks:Buffer[]=[];res.on("data",(chunk:Buffer|string)=>chunks.push(Buffer.isBuffer(chunk)?chunk:Buffer.from(chunk)));res.on("end",()=>{const buffer=Buffer.concat(chunks);const text=buffer.toString("utf8");const normalized=normalizeHeaders(res.headers as Record<string,string|string[]|undefined>);let data:T|null=null;if(text.trim()){try{data=JSON.parse(text) as T;}catch{data=null;}}resolve({status:Number(res.statusCode??0),headers:normalized,data,text,url});});res.on("error",reject);});req.on("timeout",()=>req.destroy(new Error(`Request timed out after ${timeoutMs}ms`)));req.on("error",reject);const abort=()=>req.destroy(new Error("Request aborted"));if(options.signal){if(options.signal.aborted){abort();return;}options.signal.addEventListener("abort",abort,{once:true});}if(body!==null)req.write(body);req.end();});}
-export async function request<T=unknown>(url:string,options:RequestOptions={}):Promise<HttpResponse<T>>{const retries=Math.max(0,options.retries??DEFAULT_RETRIES);const retryDelayMs=Math.max(0,options.retryDelayMs??DEFAULT_RETRY_DELAY);let lastError:unknown=null;for(let attempt=0;attempt<=retries;attempt++){try{const response=await requestOnce<T>(url,options);if(response.status>=200&&response.status<300)return response;if(!shouldRetry(response.status)||attempt>=retries)return response;const retryWait=retryAfter(response.headers)??retryDelayMs*Math.pow(2,attempt);await sleep(retryWait,options.signal);}catch(error){lastError=error;if(attempt>=retries)throw error;await sleep(retryDelayMs*Math.pow(2,attempt),options.signal);}}throw lastError instanceof Error?lastError:new Error("HTTP request failed");}
-export async function requestJson<T=unknown>(url:string,options:RequestOptions={}):Promise<T>{const response=await request<T>(url,options);if(response.status<200||response.status>=300){const retryable=shouldRetry(response.status);throw new VRFSApiError(`HTTP ${response.status} from ${url}`,response.status,url,response.data??response.text.slice(0,1000),retryable);}if(response.data===null){if(!response.text.trim())throw new VRFSApiError("Empty response body",response.status,url,null,false);throw new VRFSApiError("Invalid JSON response",response.status,url,response.text.slice(0,1000),false);}return response.data;}
-export async function getJson<T=unknown>(url:string,options:Omit<RequestOptions,"method"|"body">={}):Promise<T>{return requestJson<T>(url,{...options,method:"GET"});}
-export async function postJson<T=unknown>(url:string,body:unknown,options:Omit<RequestOptions,"method"|"body">={}):Promise<T>{return requestJson<T>(url,{...options,method:"POST",body});}
-export async function putJson<T=unknown>(url:string,body:unknown,options:Omit<RequestOptions,"method"|"body">={}):Promise<T>{return requestJson<T>(url,{...options,method:"PUT",body});}
-export async function deleteJson<T=unknown>(url:string,options:Omit<RequestOptions,"method"|"body">={}):Promise<T>{return requestJson<T>(url,{...options,method:"DELETE"});}
-export function isRetryableError(error:unknown):boolean{if(error instanceof VRFSApiError)return error.retryable;if(error instanceof Error)return /timeout|network|socket|econn|reset|aborted/i.test(error.message);return false;}
+import type {HttpMethod,RequestOptions,HttpResponse} from "./types.js";
+export class MiddlewareHttpError extends Error{
+public readonly status:number;
+public readonly url:string;
+public readonly body:string;
+public readonly retryable:boolean;
+public constructor(message:string,status:number,url:string,body="",retryable=false){
+super(message);
+this.name="MiddlewareHttpError";
+this.status=status;
+this.url=url;
+this.body=body;
+this.retryable=retryable;
+Object.setPrototypeOf(this,new.target.prototype);
+}
+}
+export interface HttpClientOptions{
+timeoutMs?:number;
+maxResponseBytes?:number;
+userAgent?:string;
+maxRedirects?:number;
+}
+const DEFAULT_TIMEOUT=15_000;
+const DEFAULT_MAX_RESPONSE=16*1024*1024;
+const DEFAULT_USER_AGENT="UNTITLED-Middleware/1.0";
+const sleep=(ms:number):Promise<void>=>new Promise(resolve=>setTimeout(resolve,ms));
+const isRetryableStatus=(status:number):boolean=>[408,425,429,500,502,503,504,520,521,522,523,524].includes(status);
+export class HttpClient{
+private readonly timeoutMs:number;
+private readonly maxResponseBytes:number;
+private readonly userAgent:string;
+private readonly maxRedirects:number;
+public constructor(options:HttpClientOptions={}){
+this.timeoutMs=Math.max(100,options.timeoutMs??DEFAULT_TIMEOUT);
+this.maxResponseBytes=Math.max(1024,options.maxResponseBytes??DEFAULT_MAX_RESPONSE);
+this.userAgent=options.userAgent??DEFAULT_USER_AGENT;
+this.maxRedirects=Math.max(0,Math.floor(options.maxRedirects??5));
+}
+public async request<T=unknown>(url:string,options:RequestOptions={}):Promise<HttpResponse<T>>{
+const retries=Math.max(0,Math.min(10,Math.floor(options.retries??3)));
+const baseDelay=Math.max(50,Math.floor(options.retryDelayMs??500));
+let lastError:unknown;
+for(let attempt=0;attempt<=retries;attempt++){
+try{
+return await this.perform<T>(url,options);
+}catch(error){
+lastError=error;
+const retryable=error instanceof MiddlewareHttpError?error.retryable:true;
+if(!retryable||attempt>=retries)throw error;
+await sleep(Math.min(baseDelay*Math.pow(2,attempt),8_000));
+}
+}
+throw lastError instanceof Error?lastError:new Error("HTTP request failed.");
+}
+private async perform<T>(url:string,options:RequestOptions,redirectDepth=0):Promise<HttpResponse<T>>{
+const parsed=new URL(url);
+if(redirectDepth>this.maxRedirects)throw new MiddlewareHttpError("Too many redirects.",0,url,"",false);
+const method:HttpMethod=options.method??"GET";
+const headers:Record<string,string>={"User-Agent":this.userAgent,"Accept":"application/json, text/plain, */*",...options.headers};
+let body:string|undefined;
+if(options.body!==undefined){
+body=typeof options.body==="string"?options.body:JSON.stringify(options.body);
+headers["Content-Type"]??="application/json";
+headers["Content-Length"]=String(Buffer.byteLength(body));
+}
+const transport=parsed.protocol==="https:"?https:http;
+return new Promise<HttpResponse<T>>((resolve,reject)=>{
+let settled=false;
+let bytes=0;
+const chunks:Buffer[]=[];
+let timer:NodeJS.Timeout|undefined;
+const cleanup=()=>{if(timer)clearTimeout(timer);if(options.signal)options.signal.removeEventListener("abort",abort);};
+const fail=(error:Error)=>{if(settled)return;settled=true;cleanup();reject(error);};
+const succeed=(response:HttpResponse<T>)=>{if(settled)return;settled=true;cleanup();resolve(response);};
+const request=transport.request(parsed,{method,headers,timeout:this.timeoutMs},response=>{
+const status=Number(response.statusCode??0);
+const location=response.headers.location;
+if([301,302,303,307,308].includes(status)&&location){
+response.resume();
+const next=Array.isArray(location)?location[0]:location;
+if(!next){fail(new MiddlewareHttpError("Invalid redirect.",status,url,"",false));return;}
+const redirectUrl=new URL(next,url).toString();
+this.perform<T>(redirectUrl,options,redirectDepth+1).then(succeed).catch(fail);
+return;
+}
+response.on("data",(chunk:Buffer|string)=>{
+const buffer=Buffer.isBuffer(chunk)?chunk:Buffer.from(chunk);
+bytes+=buffer.length;
+if(bytes>this.maxResponseBytes){response.destroy();fail(new MiddlewareHttpError("Response exceeded size limit.",status,url,"",false));return;}
+chunks.push(buffer);
+});
+response.once("end",()=>{
+const text=Buffer.concat(chunks).toString("utf8");
+let data:T|null=null;
+if(text.trim()){
+try{data=JSON.parse(text) as T;}catch{data=null;}
+}
+if(status<200||status>=300){
+fail(new MiddlewareHttpError(`HTTP ${status}`,status,url,text.slice(0,2_000),isRetryableStatus(status)));
+return;
+}
+if(text.trim()&&data===null){
+succeed({status,headers:response.headers as Record<string,string|string[]|undefined>,data:null,text,url});
+return;
+}
+succeed({status,headers:response.headers as Record<string,string|string[]|undefined>,data,text,url});
+});
+response.once("error",error=>fail(error));
+});
+timer=setTimeout(()=>{request.destroy();fail(new MiddlewareHttpError("Request timed out.",0,url,"",true));},this.timeoutMs+250);
+request.once("error",error=>fail(error));
+const abort=()=>{request.destroy();fail(new MiddlewareHttpError("Request aborted.",0,url,"",false));};
+if(options.signal?.aborted){abort();return;}
+options.signal?.addEventListener("abort",abort,{once:true});
+if(body!==undefined)request.write(body);
+request.end();
+});
+}
+}
+export const httpClient=new HttpClient();
+export default httpClient;
