@@ -77,11 +77,11 @@ const DEFAULTS=Object.freeze({
 vrfsBaseUrl:"https://api.vrfs.gg",
 sebyBaseUrl:"https://vrfs.sebyplay.xyz/lockerchecker",
 requestTimeoutMs:15_000,
-maxResponseBytes:16*1024*1024,
+maxResponseBytes:8*1024*1024,
 maxRedirects:5,
-retries:3,
-retryBaseDelayMs:500,
-retryMaxDelayMs:8_000,
+retries:1,
+retryBaseDelayMs:750,
+retryMaxDelayMs:5_000,
 userAgent:"UNTITLED-VRFS-Middleware/1.0",
 catalogTtlMs:30*60*1000,
 marketplaceTtlMs:5*60*1000,
@@ -92,7 +92,10 @@ ownershipMinBatchSize:5,
 ownershipMaxBatchSize:500,
 ownershipRetryCount:2,
 ownershipDelayMs:150,
-maxSkuLength:255
+maxSkuLength:255,
+maxOwnershipSkus:5_000,
+vrfsMaxConcurrentRequests:6,
+sebyMaxConcurrentRequests:4
 });
 const VRFS_ENDPOINTS=Object.freeze({
 username:"/webhooks/v1/get_username.php",
@@ -336,6 +339,41 @@ return promise;
 public clear():void{this.inflight.clear();}
 public get size():number{return this.inflight.size;}
 }
+class RequestSemaphore{
+private readonly max:number;
+private active=0;
+private readonly queue:Array<{resolve:()=>void;reject:(error:Error)=>void;signal?:AbortSignal}>=[];
+public constructor(max:number){this.max=Math.max(1,Math.floor(max));}
+public async acquire(signal?:AbortSignal):Promise<()=>void>{
+if(signal?.aborted)throw new VRFSApiError("Request aborted.",{code:"ABORTED"});
+if(this.active<this.max){this.active++;return()=>this.release();}
+await new Promise<void>((resolve,reject)=>{
+const entry={resolve,reject,signal};
+const onAbort=()=>{
+const index=this.queue.indexOf(entry);
+if(index!==-1)this.queue.splice(index,1);
+reject(new VRFSApiError("Request aborted.",{code:"ABORTED"}));
+};
+if(signal){signal.addEventListener("abort",onAbort,{once:true});}
+this.queue.push({resolve:()=>{if(signal)signal.removeEventListener("abort",onAbort);resolve();},reject:error=>{if(signal)signal.removeEventListener("abort",onAbort);reject(error);},signal});
+});
+this.active++;
+return()=>this.release();
+}
+private release():void{
+this.active=Math.max(0,this.active-1);
+while(this.queue.length){
+const next=this.queue.shift();
+if(!next)break;
+if(next.signal?.aborted){next.reject(new VRFSApiError("Request aborted.",{code:"ABORTED"}));continue;}
+next.resolve();
+break;
+}
+}
+public get activeCount():number{return this.active;}
+public get queuedCount():number{return this.queue.length;}
+}
+
 export class VRFSClient{
 private readonly baseUrl:string;
 private readonly apiKey?:string;
@@ -353,6 +391,7 @@ private readonly playerCache:TTLCache<VRFSUser>;
 private readonly profileCache:TTLCache<VRFSProfile>;
 private readonly outfitsCache:TTLCache<VRFSOutfit[]>;
 private readonly requestFlights=new SingleFlight();
+private readonly requestSemaphore:RequestSemaphore;
 private localRateLimitedUntil=0;
 public constructor(options:VRFSClientOptions={}){
 this.baseUrl=normalizeBaseUrl(options.baseUrl??DEFAULTS.vrfsBaseUrl);
@@ -365,14 +404,15 @@ this.retryBaseDelayMs=Math.max(50,options.retryBaseDelayMs??DEFAULTS.retryBaseDe
 this.retryMaxDelayMs=Math.max(this.retryBaseDelayMs,options.retryMaxDelayMs??DEFAULTS.retryMaxDelayMs);
 this.userAgent=options.userAgent??DEFAULTS.userAgent;
 this.logger=options.logger??console;
-this.catalogCache=new TTLCache(options.catalogTtlMs??DEFAULTS.catalogTtlMs,10);
-this.marketplaceCache=new TTLCache(options.marketplaceTtlMs??DEFAULTS.marketplaceTtlMs,10);
-this.playerCache=new TTLCache(options.playerTtlMs??DEFAULTS.playerTtlMs,5_000);
-this.profileCache=new TTLCache(options.playerTtlMs??DEFAULTS.playerTtlMs,5_000);
-this.outfitsCache=new TTLCache(options.playerTtlMs??DEFAULTS.playerTtlMs,5_000);
+this.catalogCache=new TTLCache(options.catalogTtlMs??DEFAULTS.catalogTtlMs,2);
+this.marketplaceCache=new TTLCache(options.marketplaceTtlMs??DEFAULTS.marketplaceTtlMs,2);
+this.playerCache=new TTLCache(options.playerTtlMs??DEFAULTS.playerTtlMs,500);
+this.profileCache=new TTLCache(options.playerTtlMs??DEFAULTS.playerTtlMs,250);
+this.outfitsCache=new TTLCache(options.playerTtlMs??DEFAULTS.playerTtlMs,1);
+this.requestSemaphore=new RequestSemaphore(DEFAULTS.vrfsMaxConcurrentRequests);
 }
 public get configuration():Readonly<Record<string,unknown>>{
-return{baseUrl:this.baseUrl,hasApiKey:Boolean(this.apiKey),requestTimeoutMs:this.requestTimeoutMs,maxResponseBytes:this.maxResponseBytes,maxRedirects:this.maxRedirects,retries:this.retries,userAgent:this.userAgent};
+return{baseUrl:this.baseUrl,hasApiKey:Boolean(this.apiKey),requestTimeoutMs:this.requestTimeoutMs,maxResponseBytes:this.maxResponseBytes,maxRedirects:this.maxRedirects,retries:this.retries,userAgent:this.userAgent,maxConcurrentRequests:DEFAULTS.vrfsMaxConcurrentRequests};
 }
 private buildUrl(pathname:string,params:Record<string,unknown>={}):string{
 const url=new URL(pathname,`${this.baseUrl}/`);
@@ -407,7 +447,11 @@ throw new VRFSApiError("Failed to serialize request body.",{code:"REQUEST_SERIAL
 headers["Content-Type"]??="application/json";
 headers["Content-Length"]=String(Buffer.byteLength(body));
 }
+let release:()=>void=()=>{};
+let released=false;
 try{
+const semaphoreRelease=await this.requestSemaphore.acquire(options.signal);
+release=()=>{if(released)return;released=true;semaphoreRelease();};
 const response=await httpRequest(url,{method,headers,body,timeoutMs,maxResponseBytes,maxRedirects,signal:options.signal});
 const retryAfterMs=parseRetryAfter(response.headers);
 const parsed=parseJson<T>(response.text);
@@ -415,9 +459,11 @@ if(response.status===429){
 this.localRateLimitedUntil=Math.max(this.localRateLimitedUntil,Date.now()+(retryAfterMs??1_000));
 lastError=new VRFSRateLimitError("Rate limit received from upstream.",retryAfterMs??1_000,sanitizeEndpoint(url),attempt);
 if(attempt<=retries){
+release();
 await sleep(retryDelay(attempt,retryAfterMs,base,maxDelay),options.signal);
 continue;
 }
+release();
 return{status:"rate_limited",httpStatus:429,data:parsed,rawText:response.text,headers:redactHeaders(response.headers),attempts:attempt,durationMs:Date.now()-started,retryAfterMs,url:sanitizeEndpoint(url)};
 }
 if(response.status<200||response.status>=300){
@@ -432,16 +478,21 @@ details:parsed??response.text.slice(0,2_000),
 attempts:attempt
 });
 if(retryable&&attempt<=retries){
+release();
 await sleep(retryDelay(attempt,retryAfterMs,base,maxDelay),options.signal);
 continue;
 }
+release();
 return{status:"http_error",httpStatus:response.status,data:parsed,rawText:response.text,headers:redactHeaders(response.headers),attempts:attempt,durationMs:Date.now()-started,retryAfterMs,url:sanitizeEndpoint(url)};
 }
 if(response.text.trim()&&parsed===null){
+release();
 return{status:"success",httpStatus:response.status,data:response.text as T,rawText:response.text,headers:redactHeaders(response.headers),attempts:attempt,durationMs:Date.now()-started,url:sanitizeEndpoint(url)};
 }
+release();
 return{status:"success",httpStatus:response.status,data:parsed,rawText:response.text,headers:redactHeaders(response.headers),attempts:attempt,durationMs:Date.now()-started,url:sanitizeEndpoint(url)};
 }catch(error){
+release();
 if(error instanceof VRFSApiError)lastError=error;
 else lastError=new VRFSApiError(error instanceof Error?error.message:"Unknown network error.",{code:"NETWORK_ERROR",retryable:true,endpoint:sanitizeEndpoint(url),attempts:attempt,details:error});
 if(!lastError.retryable||attempt>retries)break;
@@ -488,7 +539,7 @@ const cached=this.playerCache.get(key);
 if(cached)return cached;
 }
 return this.requestFlights.run(`username:${validUid}`,async()=>{
-const data=await this.request<unknown>(VRFS_ENDPOINTS.username,{uid:validUid},{signal});
+const data=await this.request<unknown>(VRFS_ENDPOINTS.username,{uid:validUid});
 const user=normalizeUser(data,validUid);
 this.playerCache.set(key,user);
 return user;
@@ -503,7 +554,7 @@ if(cached)return cached;
 }
 const apiKey=this.requireApiKey();
 return this.requestFlights.run(`profile:${validUid}`,async()=>{
-const data=await this.request<unknown>(VRFS_ENDPOINTS.profile,{uid:validUid,key:apiKey},{signal});
+const data=await this.request<unknown>(VRFS_ENDPOINTS.profile,{uid:validUid,key:apiKey});
 const profile=normalizeProfile(data,validUid);
 this.profileCache.set(key,profile);
 return profile;
@@ -518,9 +569,8 @@ if(cached)return cached;
 }
 const apiKey=this.requireApiKey();
 return this.requestFlights.run(`outfits:${validUid}`,async()=>{
-const data=await this.request<unknown>(VRFS_ENDPOINTS.outfits,{uid:validUid,key:apiKey},{signal});
+const data=await this.request<unknown>(VRFS_ENDPOINTS.outfits,{uid:validUid,key:apiKey});
 const outfits=normalizeOutfits(data);
-this.outfitsCache.set(key,outfits);
 return outfits;
 });
 }
@@ -545,7 +595,7 @@ if(cached)return cached;
 }
 const apiKey=this.requireApiKey();
 return this.requestFlights.run("marketplace:all",async()=>{
-const data=await this.request<unknown>(VRFS_ENDPOINTS.marketplace,{key:apiKey},{signal});
+const data=await this.request<unknown>(VRFS_ENDPOINTS.marketplace,{key:apiKey});
 const items=normalizeMarketplace(data);
 if(!items.length&&!looksLikeEmptyMarketplaceResponse(data))throw new VRFSInvalidResponseError("Marketplace response contained no valid items.",this.buildUrl(VRFS_ENDPOINTS.marketplace),data);
 this.marketplaceCache.set("all",items);
@@ -677,6 +727,7 @@ private readonly retryMaxDelayMs:number;
 private readonly userAgent:string;
 private readonly logger:VRFSLogger;
 private readonly requestFlights=new SingleFlight();
+private readonly requestSemaphore:RequestSemaphore;
 private localRateLimitedUntil=0;
 private readonly defaultBatchSize:number;
 private readonly defaultMinBatchSize:number;
@@ -693,6 +744,7 @@ this.retryBaseDelayMs=Math.max(50,options.retryBaseDelayMs??DEFAULTS.retryBaseDe
 this.retryMaxDelayMs=Math.max(this.retryBaseDelayMs,options.retryMaxDelayMs??DEFAULTS.retryMaxDelayMs);
 this.userAgent=options.userAgent??DEFAULTS.userAgent;
 this.logger=options.logger??console;
+this.requestSemaphore=new RequestSemaphore(DEFAULTS.sebyMaxConcurrentRequests);
 this.defaultBatchSize=clamp(Math.floor(options.ownershipBatchSize??DEFAULTS.ownershipBatchSize),1,500);
 this.defaultMinBatchSize=clamp(Math.floor(options.ownershipMinBatchSize??DEFAULTS.ownershipMinBatchSize),1,this.defaultBatchSize);
 this.defaultMaxBatchSize=clamp(Math.floor(options.ownershipMaxBatchSize??DEFAULTS.ownershipMaxBatchSize),this.defaultMinBatchSize,500);
@@ -730,7 +782,11 @@ throw new VRFSApiError("Failed to serialize request body.",{code:"REQUEST_SERIAL
 headers["Content-Type"]??="application/json";
 headers["Content-Length"]=String(Buffer.byteLength(body));
 }
+let release:()=>void=()=>{};
+let released=false;
 try{
+const semaphoreRelease=await this.requestSemaphore.acquire(options.signal);
+release=()=>{if(released)return;released=true;semaphoreRelease();};
 const response=await httpRequest(url,{method,headers,body,timeoutMs,maxResponseBytes,maxRedirects,signal:options.signal});
 const retryAfterMs=parseRetryAfter(response.headers);
 const parsed=parseJson<T>(response.text);
@@ -738,9 +794,11 @@ if(response.status===429){
 this.localRateLimitedUntil=Math.max(this.localRateLimitedUntil,Date.now()+(retryAfterMs??1_000));
 lastError=new VRFSRateLimitError("Rate limit received from upstream.",retryAfterMs??1_000,sanitizeEndpoint(url),attempt);
 if(attempt<=retries){
+release();
 await sleep(retryDelay(attempt,retryAfterMs,base,maxDelay),options.signal);
 continue;
 }
+release();
 return{status:"rate_limited",httpStatus:429,data:parsed,rawText:response.text,headers:redactHeaders(response.headers),attempts:attempt,durationMs:Date.now()-started,retryAfterMs,url:sanitizeEndpoint(url)};
 }
 if(response.status<200||response.status>=300){
@@ -755,16 +813,21 @@ details:parsed??response.text.slice(0,2_000),
 attempts:attempt
 });
 if(retryable&&attempt<=retries){
+release();
 await sleep(retryDelay(attempt,retryAfterMs,base,maxDelay),options.signal);
 continue;
 }
+release();
 return{status:"http_error",httpStatus:response.status,data:parsed,rawText:response.text,headers:redactHeaders(response.headers),attempts:attempt,durationMs:Date.now()-started,retryAfterMs,url:sanitizeEndpoint(url)};
 }
 if(response.text.trim()&&parsed===null){
+release();
 return{status:"success",httpStatus:response.status,data:response.text as T,rawText:response.text,headers:redactHeaders(response.headers),attempts:attempt,durationMs:Date.now()-started,url:sanitizeEndpoint(url)};
 }
+release();
 return{status:"success",httpStatus:response.status,data:parsed,rawText:response.text,headers:redactHeaders(response.headers),attempts:attempt,durationMs:Date.now()-started,url:sanitizeEndpoint(url)};
 }catch(error){
+release();
 if(error instanceof VRFSApiError)lastError=error;
 else lastError=new VRFSApiError(error instanceof Error?error.message:"Unknown network error.",{code:"NETWORK_ERROR",retryable:true,endpoint:sanitizeEndpoint(url),attempts:attempt,details:error});
 if(!lastError.retryable||attempt>retries)break;
@@ -826,6 +889,7 @@ return normalizeSebyResponse(response);
 public async checkOwnership(uid:number,skus:string[],options:OwnershipCheckOptions={}):Promise<OwnershipCheckResult>{
 const validUid=requireUid(uid);
 const normalized=uniqueStrings(skus);
+if(normalized.length>DEFAULTS.maxOwnershipSkus)throw new VRFSApiError(`Too many SKUs requested. Maximum is ${DEFAULTS.maxOwnershipSkus}.`,{code:"TOO_MANY_SKUS"});
 const started=Date.now();
 const results:Record<string,OwnershipValue>={};
 if(!normalized.length)return{uid:validUid,results,unknown:[],owned:[],notOwned:[],requested:0,confirmed:0,cached:0,apiRequests:0,retries:0,batches:0,durationMs:0,health:"ok",partial:false};
@@ -994,8 +1058,10 @@ name:typeof root.name==="string"?root.name:undefined
 function normalizeProfile(input:unknown,fallbackUid:number):VRFSProfile{
 const root=unwrapData(input);
 if(!isRecord(root))throw new VRFSInvalidResponseError("Profile response was not valid.",undefined,root);
-const profile:VRFSProfile={...root};
-profile.uid=asPositiveInt(root.uid??root.userId??root.id)??fallbackUid;
+const profile:VRFSProfile={
+uid:asPositiveInt(root.uid??root.userId??root.id)??fallbackUid,
+username:typeof root.username==="string"?root.username:undefined
+};
 if(typeof root.requestResult==="string")profile.requestResult=root.requestResult;
 if(root.followersCount!==undefined){
 const followers=Number(root.followersCount);
@@ -1017,9 +1083,10 @@ const array=Array.isArray(root)?root:isRecord(root)&&Array.isArray(root.outfits)
 return array.filter(isRecord).map(item=>{
 const slots=isRecord(item.slots)?Object.fromEntries(Object.entries(item.slots).map(([key,value])=>[key,value===null?null:String(value)])):undefined;
 return{
-...item,
 id:typeof item.id==="number"||typeof item.id==="string"?item.id:undefined,
 name:typeof item.name==="string"?item.name:undefined,
+createdAt:typeof item.createdAt==="string"?item.createdAt:undefined,
+updatedAt:typeof item.updatedAt==="string"?item.updatedAt:undefined,
 slots
 };
 });
@@ -1035,7 +1102,6 @@ array=root.items;
 throw new VRFSInvalidResponseError("Catalog response did not contain an item array.",undefined,input);
 }
 return array.filter(isRecord).map(item=>({
-...item,
 id:item.id as string|number|undefined,
 item_id:item.item_id as string|number|undefined,
 itemId:item.itemId as string|number|undefined,
@@ -1072,7 +1138,6 @@ throw new VRFSInvalidResponseError("Marketplace response did not contain an item
 }
 return array.filter(isRecord).filter(item=>item.id!==undefined&&item.id!==null).map(item=>{
 const author=isRecord(item.author)?{
-...item.author,
 uid:item.author.uid as string|number|undefined,
 username:typeof item.author.username==="string"?item.author.username:undefined,
 nickname:typeof item.author.nickname==="string"?item.author.nickname:undefined,
@@ -1082,7 +1147,6 @@ badge_id:item.author.badge_id as number|string|undefined,
 highlight_color:typeof item.author.highlight_color==="string"?item.author.highlight_color:undefined
 }:undefined;
 return{
-...item,
 id:item.id as string|number,
 title:typeof item.title==="string"?item.title:undefined,
 name:typeof item.name==="string"?item.name:undefined,
@@ -1107,7 +1171,7 @@ created_at:typeof item.created_at==="string"?item.created_at:undefined,
 updated_at:typeof item.updated_at==="string"?item.updated_at:undefined,
 activated_at:typeof item.activated_at==="string"?item.activated_at:undefined,
 available_for_send:item.available_for_send as number|string|boolean|undefined,
-badges:Array.isArray(item.badges)?item.badges:undefined,
+badges:Array.isArray(item.badges)?item.badges.slice(0,20):undefined,
 author
 };
 });
