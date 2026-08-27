@@ -274,8 +274,8 @@ const PATTERNS = {
 } as const;
 const ENTRY_TTL_MS = 5 * 60 * 1000;
 const WIN_DEDUP_TTL_MS = 5 * 60 * 1000;
-const COMPONENT_RETRY_DELAY_MS = 75;
-const COMPONENT_RETRY_ATTEMPTS = 2;
+const COMPONENT_RETRY_DELAY_MS = 60;
+const COMPONENT_RETRY_ATTEMPTS = 1;
 const SESSION_REFRESH_INTERVAL_MS = 2 * 60 * 1000;
 const MAX_SESSIONS_PER_WORKER = 999999;
 const SESSION_START_CONCURRENCY = 8;
@@ -327,7 +327,7 @@ const MAX_RETRY_DELAY_MS = 60000;
 const TOKEN_REACTIVATION_THRESHOLD_MS = 60 * 1000;
 const HEALTH_CHECK_INTERVAL_MS = 60000;
 const MAX_CONCURRENT_ENTRIES_PER_ACCOUNT = 16;
-const DETECTION_CONCURRENCY_PER_SESSION = 4;
+const DETECTION_CONCURRENCY_PER_SESSION = 12;
 const MAX_INGEST_QUEUE_SIZE = 20000;
 const MAX_DETECTION_MESSAGE_AGE_MS = 30 * 60 * 1000;
 class LRUCache<K, V> {
@@ -547,6 +547,7 @@ class TokenBucket {
   private lastRefill: number;
   private totalConsumed = 0;
   private totalWaits = 0;
+
   constructor(
     private readonly maxTokens: number,
     private readonly refillIntervalMs: number,
@@ -554,26 +555,34 @@ class TokenBucket {
     this.tokens = maxTokens;
     this.lastRefill = Date.now();
   }
+
   async consume(): Promise<void> {
-    this.refill();
-    if (this.tokens <= 0) {
-      this.totalWaits++;
-      const waitMs = this.refillIntervalMs - (Date.now() - this.lastRefill);
-      await delay(Math.max(waitMs, 50));
+    while (true) {
       this.refill();
+
+      if (this.tokens > 0) {
+        this.tokens--;
+        this.totalConsumed++;
+        return;
+      }
+
+      this.totalWaits++;
+      const elapsed = Date.now() - this.lastRefill;
+      const waitMs = Math.max(10, this.refillIntervalMs - elapsed);
+      await delay(waitMs);
     }
-    this.tokens = Math.max(0, this.tokens - 1);
-    this.totalConsumed++;
   }
+
   private refill(): void {
     const now = Date.now();
     const elapsed = now - this.lastRefill;
     const batches = Math.floor(elapsed / this.refillIntervalMs);
-    if (batches > 0) {
-      this.tokens = Math.min(this.maxTokens, this.tokens + batches * this.maxTokens);
-      this.lastRefill = now;
-    }
+    if (batches <= 0) return;
+
+    this.tokens = Math.min(this.maxTokens, this.tokens + batches * this.maxTokens);
+    this.lastRefill += batches * this.refillIntervalMs;
   }
+
   getStats(): { tokens: number; maxTokens: number; totalConsumed: number; totalWaits: number } {
     return {
       tokens: this.tokens,
@@ -944,6 +953,7 @@ export class AutoJoinManager extends EventEmitter {
   private noResponseCooldown: LRUCache<string, number>;
   private crosspostCache: LRUCache<string, string>;
   private messageCache: LRUCache<string, CachedMessageData>;
+  private liveMessageCache: LRUCache<string, Message>;
   private joinQueue: JoinQueue;
   private tokenManager: TokenManager;
   private asyncLogger: AsyncLogger;
@@ -966,6 +976,7 @@ export class AutoJoinManager extends EventEmitter {
   private detectionQueues: Map<string, DetectionTask[]> = new Map();
   private detectionPending: Map<string, Map<string, DetectionTask>> = new Map();
   private detectionInFlight: Map<string, Set<string>> = new Map();
+  private detectionLatest: Map<string, DetectionTask> = new Map();
   private detectionProcessorPromises: Map<string, Promise<void>> = new Map();
   private workerId: string;
   private memoryWarningLogged = false;
@@ -992,6 +1003,7 @@ export class AutoJoinManager extends EventEmitter {
     this.noResponseCooldown = new LRUCache<string, number>(CACHE_MAX_COOLDOWN, NO_RESPONSE_COOLDOWN_MS + 10000);
     this.crosspostCache = new LRUCache<string, string>(CACHE_CROSSPOST, 30 * 60 * 1000);
     this.messageCache = new LRUCache<string, CachedMessageData>(CACHE_MESSAGES, 30000);
+    this.liveMessageCache = new LRUCache<string, Message>(3000, 60000);
     this.joinQueue = new JoinQueue();
     this.tokenManager = new TokenManager();
     this.asyncLogger = new AsyncLogger();
@@ -1108,6 +1120,7 @@ export class AutoJoinManager extends EventEmitter {
     this.noResponseCooldown.clear();
     this.crosspostCache.clear();
     this.messageCache.clear();
+    this.liveMessageCache.clear();
     this.guildStatsCache.clean();
     this.accountStatsCache.clean();
     const cutoff = Date.now() - 10 * 60 * 1000;
@@ -1505,6 +1518,7 @@ export class AutoJoinManager extends EventEmitter {
       const age = now - message.createdTimestamp;
       session.lastMessageEventAt = now;
       this.metrics.totalMessagesProcessed++;
+      this.liveMessageCache.set(`${message.channel.id}:${message.id}`, message);
       if (age > MAX_DETECTION_MESSAGE_AGE_MS) {
         this.purgeMessageFromCache(message);
         return;
@@ -1615,40 +1629,55 @@ export class AutoJoinManager extends EventEmitter {
   }
   private enqueueDetection(session: UserSession, message: Message, kind: 'create' | 'update', delayMs = 0, retryCount = 0): void {
     const key = this.makeEntryId(session, message);
+
     const enqueue = () => {
-      if (this.isShuttingDown || session.destroyed) return;
-      let queue = this.detectionQueues.get(session.userId);
-      if (!queue) {
-        queue = [];
-        this.detectionQueues.set(session.userId, queue);
-      }
-      let pending = this.detectionPending.get(session.userId);
-      if (!pending) {
-        pending = new Map();
-        this.detectionPending.set(session.userId, pending);
-      }
+      if (this.isShuttingDown || session.destroyed || !session.isActive) return;
+
+      const now = Date.now();
+      if (now - message.createdTimestamp > MAX_DETECTION_MESSAGE_AGE_MS) return;
+
+      const queue = this.detectionQueues.get(session.userId) ?? [];
+      this.detectionQueues.set(session.userId, queue);
+
+      const pending = this.detectionPending.get(session.userId) ?? new Map<string, DetectionTask>();
+      this.detectionPending.set(session.userId, pending);
+
+      const latest: DetectionTask = { key, message, kind, queuedAt: now, retryCount };
+      this.detectionLatest.set(`${session.userId}:${key}`, latest);
+
       const existing = pending.get(key);
       if (existing) {
         existing.message = message;
         existing.kind = kind;
+        existing.queuedAt = Math.min(existing.queuedAt, now);
         existing.retryCount = Math.max(existing.retryCount, retryCount);
         return;
       }
-      if (queue.length >= MAX_INGEST_QUEUE_SIZE && !this.detectionInFlight.get(session.userId)?.has(key)) {
-        const timer = setTimeout(enqueue, 50);
+
+      // If this message is already being processed, do not enqueue a second
+      // worker. detectionLatest will make the worker process the newest event
+      // immediately after the current attempt finishes.
+      if (this.detectionInFlight.get(session.userId)?.has(key)) return;
+
+      if (queue.length >= MAX_INGEST_QUEUE_SIZE) {
+        // Never create an unbounded timer storm. The latest event is retained
+        // and a single retry is enough to drain the backlog.
+        const timer = setTimeout(() => this.enqueueDetection(session, message, kind, 0, retryCount), 100);
         if (timer.unref) timer.unref();
         return;
       }
-      const task: DetectionTask = { key, message, kind, queuedAt: Date.now(), retryCount };
-      queue.push(task);
-      pending.set(key, task);
+
+      queue.push(latest);
+      pending.set(key, latest);
       this.startDetectionProcessor(session.userId);
     };
+
     if (delayMs > 0) {
       const timer = setTimeout(enqueue, delayMs);
       if (timer.unref) timer.unref();
       return;
     }
+
     enqueue();
   }
   private startDetectionProcessor(userId: string): void {
@@ -1664,79 +1693,130 @@ export class AutoJoinManager extends EventEmitter {
   private async processDetectionQueue(userId: string): Promise<void> {
     const session = this.sessionsByUserId.get(userId);
     if (!session || session.destroyed) return;
-    const active: Set<Promise<void>> = new Set();
-    const inFlight = this.detectionInFlight.get(userId) || new Set<string>();
+
+    const active = new Set<Promise<void>>();
+    const inFlight = this.detectionInFlight.get(userId) ?? new Set<string>();
     this.detectionInFlight.set(userId, inFlight);
+
     while (!this.isShuttingDown) {
       const current = this.sessionsByUserId.get(userId);
       if (!current || current.destroyed || !current.isActive) break;
+
       const queue = this.detectionQueues.get(userId);
       const pending = this.detectionPending.get(userId);
-      if (!queue || !pending) break;
+      if (!queue || !pending || queue.length === 0) break;
+
       while (active.size < DETECTION_CONCURRENCY_PER_SESSION && queue.length > 0) {
         const task = queue.shift();
         if (!task) break;
         pending.delete(task.key);
+
         if (inFlight.has(task.key)) continue;
         inFlight.add(task.key);
-        const promise = this.handleMessage(task.message, current, task.kind, task.queuedAt, task.retryCount).catch(error => {
-          this.asyncLogger.error('AutoJoin: detection task failed', {
-            userId,
-            kind: task.kind,
-            messageId: task.message.id,
-            guild: task.message.guild?.name,
-            channelId: task.message.channel?.id,
-            error: formatError(error),
+
+        let promise!: Promise<void>;
+        promise = this.handleMessage(task.message, current, task.kind, task.queuedAt, task.retryCount)
+          .catch(error => {
+            this.asyncLogger.error('AutoJoin: detection task failed', {
+              userId,
+              kind: task.kind,
+              messageId: task.message.id,
+              guild: task.message.guild?.name,
+              channelId: task.message.channel?.id,
+              error: formatError(error),
+            });
+          })
+          .finally(() => {
+            inFlight.delete(task.key);
+            active.delete(promise);
+
+            // A messageUpdate may have arrived while this task was running.
+            // Process the newest message instead of dropping the update.
+            const latestKey = `${userId}:${task.key}`;
+            const latest = this.detectionLatest.get(latestKey);
+            if (latest && latest.message !== task.message && !this.isShuttingDown && current.isActive && !current.destroyed) {
+              this.detectionLatest.delete(latestKey);
+              const latestQueue = this.detectionQueues.get(userId) ?? [];
+              const latestPending = this.detectionPending.get(userId) ?? new Map<string, DetectionTask>();
+              this.detectionQueues.set(userId, latestQueue);
+              this.detectionPending.set(userId, latestPending);
+              if (!latestPending.has(latest.key)) {
+                latestQueue.unshift(latest);
+                latestPending.set(latest.key, latest);
+              }
+              this.startDetectionProcessor(userId);
+            } else {
+              this.detectionLatest.delete(latestKey);
+            }
           });
-        }).finally(() => {
-          inFlight.delete(task.key);
-          active.delete(promise);
-        });
+
         active.add(promise);
       }
+
       if (active.size === 0) break;
       await Promise.race(active);
     }
+
     if (active.size > 0) await Promise.allSettled(active);
   }
   private async handleMessage(message: Message, session: UserSession, kind: 'create' | 'update' = 'create', queuedAt = Date.now(), retryCount = 0): Promise<void> {
     if (!message.guild) return;
-    const messageAge = Date.now() - message.createdTimestamp;
-    if (messageAge > MAX_DETECTION_MESSAGE_AGE_MS) return;
+    if (Date.now() - message.createdTimestamp > MAX_DETECTION_MESSAGE_AGE_MS) return;
     if (CONFIG.monitoredChannels.length > 0 && !CONFIG.monitoredChannels.includes(message.channel.id)) return;
+
     const entryId = this.makeEntryId(session, message);
+    const cacheKey = `${message.channel.id}:${message.id}`;
+    this.liveMessageCache.set(cacheKey, message);
+
     if (this.processedMessages.has(entryId)) {
-      this.metrics.cacheHits++;
-      return;
+      const known = this.messageCache.get(cacheKey);
+      const currentButton = this.extractEntryButton(message)?.customId;
+      // A normal duplicate event is ignored, but an edited giveaway with a
+      // different button must be allowed through. This is important because
+      // GiveawayBoat can update the component after the initial message.
+      if (!currentButton || !known || currentButton === known.buttonCustomId) {
+        this.metrics.cacheHits++;
+        return;
+      }
+      this.metrics.cacheMisses++;
     }
+
     if (this.processingCache.get(entryId) !== undefined) return;
     this.metrics.cacheMisses++;
+
     if (!this.checkMemory()) {
-      if (retryCount < 6) this.enqueueDetection(session, message, kind, Math.min(5000, 250 * Math.pow(2, retryCount)), retryCount + 1);
+      if (retryCount < 4) {
+        this.enqueueDetection(session, message, kind, 250 * Math.pow(2, retryCount), retryCount + 1);
+      }
       return;
     }
+
     this.processingCache.set(entryId, Date.now());
+    const detectionStarted = Date.now();
+
     try {
       const detected = await this.detectGiveawaySimple(message);
       if (!detected?.button) {
-        if (retryCount < 3) this.enqueueDetection(session, message, kind, 150 * (retryCount + 1), retryCount + 1);
+        // GiveawayBoat can publish the message before its components are
+        // visible to the client. Prefer messageUpdate; only do one short retry.
+        if (retryCount < 2) {
+          this.enqueueDetection(session, message, kind, retryCount === 0 ? 100 : 250, retryCount + 1);
+        }
         return;
       }
-      session.lastGiveawayDetectionAt = Date.now();
-      this.metrics.totalGiveawaysDetected++;
-      this.processedMessages.set(entryId, Date.now());
-      session.stats.detected++;
+
+      const detectedAt = Date.now();
+      const endsAt = this.extractEndTimestamp(message);
       const correlationId = uuidv4();
-      const cacheKey = `${message.channel.id}:${message.id}`;
-      this.messageCache.set(cacheKey, {
-        buttonCustomId: detected.button.customId,
-        prize: detected.prize,
-        guildName: message.guild.name,
-        channelName: (message.channel as { name?: string }).name ?? 'unknown',
-        endsAt: this.extractEndTimestamp(message),
-        expiresAt: Date.now() + 30000,
-      });
-      const entryData: Omit<GiveawayEntry, '_id'> = {
+
+      session.lastGiveawayDetectionAt = detectedAt;
+      session.stats.detected++;
+      this.metrics.totalGiveawaysDetected++;
+      this.metrics.recordDetectionTime(detectedAt - detectionStarted);
+      this.processedMessages.set(entryId, detectedAt);
+
+      const entryData: GiveawayEntry = {
+        _id: entryId,
         userId: session.userId,
         messageId: message.id,
         channelId: message.channel.id,
@@ -1746,17 +1826,25 @@ export class AutoJoinManager extends EventEmitter {
         channelName: (message.channel as { name?: string }).name ?? 'unknown',
         prize: detected.prize,
         buttonCustomId: detected.button.customId,
-        detectedAt: Date.now(),
-        endsAt: this.extractEndTimestamp(message),
+        detectedAt,
+        endsAt,
         status: 'pending',
         attempts: 0,
-        expiresAt: Date.now() + ENTRY_TTL_MS,
+        expiresAt: detectedAt + ENTRY_TTL_MS,
         correlationId,
-        detectionConfidence: 1.0,
-        detectionReasons: ['binary_detection_with_button', kind, `queue_wait_${Math.max(0, Date.now() - queuedAt)}ms`],
+        detectionConfidence: 1,
+        detectionReasons: ['gateway_components', kind, `queue_wait_${Math.max(0, detectionStarted - queuedAt)}ms`],
       };
-      await saveAutoJoinEntry(entryData as Omit<AutoJoinEntry, '_id'>);
-      this.metrics.dbQueries++;
+
+      this.messageCache.set(cacheKey, {
+        buttonCustomId: detected.button.customId,
+        prize: detected.prize,
+        guildName: entryData.guildName,
+        channelName: entryData.channelName,
+        endsAt,
+        expiresAt: detectedAt + ENTRY_TTL_MS,
+      });
+
       this.asyncLogger.info('🎯 AutoJoin: Giveaway detected', {
         correlationId,
         userId: session.userId,
@@ -1765,69 +1853,65 @@ export class AutoJoinManager extends EventEmitter {
         guild: entryData.guildName,
         worker: this.workerId,
         kind,
+        detectionMs: detectedAt - detectionStarted,
+        queueWaitMs: Math.max(0, detectionStarted - queuedAt),
       });
-      await this.queueOrEnter(entryId, session, entryData as GiveawayEntry, correlationId);
+
+      // Do not make MongoDB part of the critical join path. The in-memory entry
+      // already contains everything needed to enter the giveaway.
+      void saveAutoJoinEntry(entryData as Omit<AutoJoinEntry, '_id'>)
+        .then(() => { this.metrics.dbQueries++; })
+        .catch(error => {
+          this.asyncLogger.warn('AutoJoin: background entry save failed', {
+            userId: session.userId,
+            messageId: message.id,
+            error: formatError(error),
+          });
+        });
+
+      await this.queueOrEnter(entryId, session, entryData, correlationId);
     } finally {
       this.processingCache.delete(entryId);
     }
   }
-  private async detectGiveawaySimple(message: Message): Promise<{
-    button?: GiveawayButton;
-    prize: string;
-  } | null> {
-    const now = Date.now();
-    if (now - message.createdTimestamp > MAX_DETECTION_MESSAGE_AGE_MS) {
-      return null;
-    }
+  private async detectGiveawaySimple(message: Message): Promise<{ button?: GiveawayButton; prize: string } | null> {
+    if (!message.guild) return null;
+    if (Date.now() - message.createdTimestamp > MAX_DETECTION_MESSAGE_AGE_MS) return null;
+
     const rawContent = message.content ?? '';
-    if (BLOCKED_MESSAGE_PATTERNS.some(re => re.test(rawContent))) {
-      return null;
+    if (BLOCKED_MESSAGE_PATTERNS.some(re => re.test(rawContent))) return null;
+    if (message.author?.id !== GIVEAWAY_BOT_ID || !message.author.bot) return null;
+
+    // Fast path: GiveawayBoat's gateway event already contains the components.
+    const directButton = this.extractEntryButton(message);
+    if (directButton) {
+      return { button: directButton, prize: this.extractPrize(message) };
     }
-    if (message.author?.id !== GIVEAWAY_BOT_ID || !message.author.bot) {
-      return null;
+
+    // The first gateway event can occasionally arrive before components are
+    // populated locally. Give the update event a chance before one REST fallback.
+    await delay(COMPONENT_RETRY_DELAY_MS);
+
+    const live = this.liveMessageCache.get(`${message.channel.id}:${message.id}`);
+    const latestButton = live ? this.extractEntryButton(live) : null;
+    if (latestButton) {
+      return { button: latestButton, prize: this.extractPrize(live!) };
     }
-    let button = this.extractEntryButton(message);
-    if (button) {
-      return { button, prize: this.extractPrize(message) };
+
+    try {
+      const refreshed = await this.fetchMessageUncached(
+        message.client as Client,
+        message.channel.id,
+        message.id,
+      );
+      if (!refreshed) return null;
+      this.liveMessageCache.set(`${message.channel.id}:${message.id}`, refreshed);
+      const button = this.extractEntryButton(refreshed);
+      if (button) return { button, prize: this.extractPrize(refreshed) };
+    } catch {
+      // The next messageUpdate is the preferred recovery path.
     }
-    const embed = message.embeds?.[0];
-    const text = [
-      message.content ?? '',
-      ...message.embeds.flatMap(e => [
-        e.title ?? '',
-        e.description ?? '',
-        e.footer?.text ?? '',
-        ...(e.fields ?? []).flatMap(f => [f.name, f.value]),
-      ]),
-    ].join(' ').trim();
-    const shouldRefresh = !embed ||
-      !((message as any).components?.length) ||
-      text.length < 50 ||
-      /giveaway/i.test(text);
-    if (!shouldRefresh) return null;
-    for (let attempt = 0; attempt < COMPONENT_RETRY_ATTEMPTS + 1; attempt++) {
-      if (attempt > 0) await delay(COMPONENT_RETRY_DELAY_MS);
-      try {
-        const refreshed = await this.fetchMessageUncached(
-          message.client as Client,
-          message.channel.id,
-          message.id,
-        );
-        if (!refreshed) break;
-        button = this.extractEntryButton(refreshed);
-        if (button) {
-          return { button, prize: this.extractPrize(refreshed) };
-        }
-      } catch (error) {
-        if (attempt === 0) {
-          this.asyncLogger.debug('Giveaway refresh fetch failed', {
-            userId: message.client.user?.id,
-            messageId: message.id,
-            error: formatError(error),
-          });
-        }
-      }
-    }
+
     return null;
   }
   private messageHasKeyword(message: Message): boolean {
@@ -1895,10 +1979,19 @@ export class AutoJoinManager extends EventEmitter {
     };
     const enqueued = this.joinQueue.enqueue(queueItem);
     if (enqueued) {
-      await updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'queued', {});
+      // Queue state is in memory and the join worker can start immediately.
+      // Do not put a MongoDB write between detection and the click.
       this.startQueueProcessor(session.userId);
     } else {
-      await this.enterGiveaway(entryId, session, entry);
+      // The queue is saturated; try the entry directly rather than silently
+      // dropping a live giveaway.
+      void this.enterGiveaway(entryId, session, entry).catch(error => {
+        this.asyncLogger.error('Direct giveaway entry failed after queue saturation', {
+          userId: session.userId,
+          messageId: entry.messageId,
+          error: formatError(error),
+        });
+      });
     }
   }
   private startQueueProcessor(userId: string): void {
@@ -2020,11 +2113,10 @@ export class AutoJoinManager extends EventEmitter {
         return;
       }
     }
-    this.metrics.dbQueries++;
     if (!entry) return;
     const correlationId = entry.correlationId || uuidv4();
-    await updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'attempting', {});
-    this.metrics.dbQueries++;
+    // The prefetched entry is authoritative for a live queue item. Avoid a DB
+    // round-trip before the interaction; persist status after the attempt.
     const maxAttempts = CONFIG.maxRetries + 1;
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       const attemptNum = attempt + 1;
@@ -2032,18 +2124,6 @@ export class AutoJoinManager extends EventEmitter {
       if (attempt > 0) {
         const backoffMs = exponentialBackoff(attempt - 1, CONFIG.retryDelayMs, 30000);
         await delay(backoffMs);
-      }
-      if (attempt === 2) {
-        try {
-          const refreshedEntry = await this.refreshButtonData(entry as GiveawayEntry, session);
-          if (refreshedEntry && refreshedEntry.buttonCustomId !== entry.buttonCustomId) {
-            entry.buttonCustomId = refreshedEntry.buttonCustomId;
-          }
-        } catch {}
-      }
-      const cooldownEnd = this.noResponseCooldown.get(session.userId) || 0;
-      if (Date.now() < cooldownEnd) {
-        await delay(Math.min(cooldownEnd - Date.now(), 5000));
       }
       try {
         const skipped = await this.enterViaButton(entry as GiveawayEntry, session);
@@ -2105,15 +2185,9 @@ export class AutoJoinManager extends EventEmitter {
           this.metrics.dbQueries++;
           return;
         }
-        if (errorMsg.includes('Circuit breaker is open')) {
-          await delay(30000);
-          session.apiCircuitBreaker.reset();
-          continue;
-        }
         const isNoResponse = errorMsg.toLowerCase().includes('no response from application');
         if (isNoResponse && attempt < maxAttempts - 1) {
-          this.noResponseCooldown.set(session.userId, Date.now() + NO_RESPONSE_COOLDOWN_MS);
-          await delay(2000);
+          await delay(100);
           try { await this.refreshButtonData(entry as GiveawayEntry, session); } catch {}
           continue;
         }
@@ -2171,37 +2245,41 @@ export class AutoJoinManager extends EventEmitter {
   }
   private async enterViaButton(entry: GiveawayEntry, session: UserSession): Promise<boolean> {
     if (!entry.buttonCustomId) throw new Error('No buttonCustomId set');
+
     if (CONFIG.buttonDelayMs > 0) {
       await delay(Math.min(CONFIG.buttonDelayMs, 50));
     }
+
     const cacheKey = `${entry.channelId}:${entry.messageId}`;
-    const cached = this.messageCache.get(cacheKey);
-    let message: Message | null = null;
-    if (cached) {
+    let message = this.liveMessageCache.get(cacheKey) ?? null;
+
+    // Use the normal discord.js cache as a second fast path. Neither path
+    // requires a network request when the gateway already delivered the message.
+    if (!message) {
       try {
-        const channel = session.client.channels.cache.get(entry.channelId) as TextChannel;
+        const channel = session.client.channels.cache.get(entry.channelId) as TextChannel | undefined;
         if (channel) {
-          message = await channel.messages.fetch(entry.messageId, { force: false, cache: true }) as Message;
+          message = channel.messages.cache.get(entry.messageId) as Message | undefined ?? null;
         }
       } catch {}
     }
+
     if (!message) {
       message = await this.fetchMessageUncached(session.client, entry.channelId, entry.messageId);
     }
     if (!message) throw new Error(`Message ${entry.messageId} not found`);
-    if (!message.guild) {
-      throw new Error('Cannot enter giveaway in DM - buttons require guild context');
-    }
+    if (!message.guild) throw new Error('Cannot enter giveaway in DM - buttons require guild context');
+
+    this.liveMessageCache.set(cacheKey, message);
+
     let button = this.findButtonById(message, entry.buttonCustomId);
     if (!button) {
       button = this.extractEntryButton(message);
-      if (button) {
-        entry.buttonCustomId = button.customId;
-      }
+      if (button) entry.buttonCustomId = button.customId;
     }
-    if (!button || button.disabled) {
-      return true;
-    }
+
+    if (!button || button.disabled) return true;
+
     await session.rateLimiter.consume();
     await this.clickButton(message, button, session);
     return false;
@@ -2228,10 +2306,7 @@ export class AutoJoinManager extends EventEmitter {
     if (!message.guild) {
       throw new Error('Cannot click buttons in DMs - guild context required');
     }
-    if (session.apiCircuitBreaker.isOpen()) {
-      throw new Error(`Circuit breaker is open (${session.apiCircuitBreaker.getState()})`);
-    }
-    await session.apiCircuitBreaker.execute(async () => {
+    await (async () => {
       const client = message.client as any;
       let wsSessionId = session.gatewaySessionId;
       if (!wsSessionId || (Date.now() - session.lastSessionIdFetch > 30000)) {
@@ -2679,6 +2754,7 @@ export class AutoJoinManager extends EventEmitter {
         this.noResponseCooldown.clean(),
         this.crosspostCache.clean(),
         this.messageCache.clean(),
+        this.liveMessageCache.clean(),
       ].reduce((a, b) => a + b, 0);
       if (cleaned > 0) {
         this.asyncLogger.debug(`🧹 Cache cleaner: removed ${cleaned} expired entries`, {
@@ -2753,6 +2829,7 @@ export class AutoJoinManager extends EventEmitter {
         tokenCache: this.tokenManager.getCacheStats(),
         crosspostCache: this.crosspostCache.size,
         messageCache: this.messageCache.size,
+        liveMessages: this.liveMessageCache.size,
       },
       memory: {
         heapUsedMB: mem.heapUsedMB,
@@ -2971,6 +3048,7 @@ export class AutoJoinManager extends EventEmitter {
     this.detectionQueues.clear();
     this.detectionPending.clear();
     this.detectionInFlight.clear();
+    this.detectionLatest.clear();
     await this.joinQueue.persist();
     if (this.joinOutcomeBuffer.length > 0) {
       try { await batchSaveJoinOutcomes(this.joinOutcomeBuffer); } catch {}
@@ -3007,6 +3085,7 @@ export class AutoJoinManager extends EventEmitter {
     this.noResponseCooldown.clear();
     this.crosspostCache.clear();
     this.messageCache.clear();
+    this.liveMessageCache.clear();
     this.tokenManager.clearAll();
     this.sessionStartPromises.clear();
     this.queueProcessorPromises.clear();
