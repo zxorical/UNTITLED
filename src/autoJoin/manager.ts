@@ -316,13 +316,6 @@ const MAX_JOIN_OUTCOME_BUFFER = 2000;
 const MAX_TOKEN_FAILURE_TRACKER = 5000;
 const HTTP_MAX_SOCKETS = 50;
 const HTTP_MAX_FREE_SOCKETS = 10;
-const RATE_LIMIT_JITTER_MS = 50;
-const RATE_LIMIT_MIN_DELAY_MS = 100;
-const RATE_LIMIT_MAX_DELAY_MS = 120_000;
-const NETWORK_RETRY_BASE_MS = 400;
-const NETWORK_RETRY_MAX_MS = 15_000;
-const QUEUE_BACKPRESSURE_RETRIES = 6;
-const QUEUE_BACKPRESSURE_BASE_MS = 100;
 const CIRCUIT_BREAKER_THRESHOLD = 20;
 const CIRCUIT_BREAKER_TIMEOUT_MS = 30000;
 const CIRCUIT_BREAKER_HALF_OPEN_ATTEMPTS = 3;
@@ -332,8 +325,8 @@ const INITIAL_RETRY_DELAY_MS = 5000;
 const MAX_RETRY_DELAY_MS = 60000;
 const TOKEN_REACTIVATION_THRESHOLD_MS = 60 * 1000;
 const HEALTH_CHECK_INTERVAL_MS = 60000;
-const MAX_CONCURRENT_ENTRIES_PER_ACCOUNT = 4;
-const DETECTION_CONCURRENCY_PER_SESSION = 6;
+const MAX_CONCURRENT_ENTRIES_PER_ACCOUNT = 16;
+const DETECTION_CONCURRENCY_PER_SESSION = 12;
 const MAX_INGEST_QUEUE_SIZE = 20000;
 const MAX_DETECTION_MESSAGE_AGE_MS = 30 * 60 * 1000;
 class LRUCache<K, V> {
@@ -548,30 +541,9 @@ class TokenManager {
     return { size: this.decryptedCache.size, maxSize: CACHE_MAX_TOKEN };
   }
 }
-class DiscordRateLimitError extends Error {
-  readonly retryAfterMs: number;
-  readonly global: boolean;
-
-  constructor(retryAfterMs: number, global = false) {
-    super(`Discord rate limited request; retry after ${retryAfterMs}ms`);
-    this.name = 'DiscordRateLimitError';
-    this.retryAfterMs = retryAfterMs;
-    this.global = global;
-  }
-}
-
-class RetryableNetworkError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'RetryableNetworkError';
-  }
-}
-
 class TokenBucket {
   private tokens: number;
   private lastRefill: number;
-  private cooldownUntil = 0;
-  private waiters = 0;
   private totalConsumed = 0;
   private totalWaits = 0;
 
@@ -579,73 +551,43 @@ class TokenBucket {
     private readonly maxTokens: number,
     private readonly refillIntervalMs: number,
   ) {
-    this.tokens = Math.max(1, maxTokens);
+    this.tokens = maxTokens;
     this.lastRefill = Date.now();
   }
 
   async consume(): Promise<void> {
-    this.waiters++;
-    try {
-      while (true) {
-        const now = Date.now();
-        this.refill(now);
+    while (true) {
+      this.refill();
 
-        const cooldownWait = Math.max(0, this.cooldownUntil - now);
-        if (cooldownWait > 0) {
-          this.totalWaits++;
-          await delay(cooldownWait);
-          continue;
-        }
-
-        if (this.tokens > 0) {
-          this.tokens--;
-          this.totalConsumed++;
-          return;
-        }
-
-        this.totalWaits++;
-        const elapsed = Math.max(0, now - this.lastRefill);
-        const waitMs = Math.max(10, this.refillIntervalMs - elapsed);
-        await delay(waitMs);
+      if (this.tokens > 0) {
+        this.tokens--;
+        this.totalConsumed++;
+        return;
       }
-    } finally {
-      this.waiters = Math.max(0, this.waiters - 1);
+
+      this.totalWaits++;
+      const elapsed = Date.now() - this.lastRefill;
+      const waitMs = Math.max(10, this.refillIntervalMs - elapsed);
+      await delay(waitMs);
     }
   }
 
-  applyCooldown(delayMs: number): void {
-    const bounded = Math.max(0, Math.min(RATE_LIMIT_MAX_DELAY_MS, Math.ceil(delayMs)));
-    this.cooldownUntil = Math.max(this.cooldownUntil, Date.now() + bounded);
-  }
-
-  getCooldownRemaining(): number {
-    return Math.max(0, this.cooldownUntil - Date.now());
-  }
-
-  private refill(now = Date.now()): void {
+  private refill(): void {
+    const now = Date.now();
     const elapsed = now - this.lastRefill;
     const batches = Math.floor(elapsed / this.refillIntervalMs);
     if (batches <= 0) return;
+
     this.tokens = Math.min(this.maxTokens, this.tokens + batches * this.maxTokens);
     this.lastRefill += batches * this.refillIntervalMs;
   }
 
-  getStats(): {
-    tokens: number;
-    maxTokens: number;
-    totalConsumed: number;
-    totalWaits: number;
-    waiters: number;
-    cooldownMs: number;
-  } {
-    this.refill();
+  getStats(): { tokens: number; maxTokens: number; totalConsumed: number; totalWaits: number } {
     return {
       tokens: this.tokens,
       maxTokens: this.maxTokens,
       totalConsumed: this.totalConsumed,
       totalWaits: this.totalWaits,
-      waiters: this.waiters,
-      cooldownMs: this.getCooldownRemaining(),
     };
   }
 }
@@ -1050,7 +992,6 @@ export class AutoJoinManager extends EventEmitter {
   private httpAgent: http.Agent;
   private httpsAgent: https.Agent;
   private readonly http: AxiosInstance;
-  private discordGlobalCooldownUntil = 0;
   constructor(workerId: string = 'main') {
     super();
     this.workerId = workerId;
@@ -1211,41 +1152,21 @@ export class AutoJoinManager extends EventEmitter {
     } catch {
     }
   }
-  private async fetchMessageUncached(
-    client: Client,
-    channelId: string,
-    messageId: string,
-    session?: UserSession,
-  ): Promise<Message | null> {
+  private async fetchMessageUncached(client: Client, channelId: string, messageId: string): Promise<Message | null> {
     try {
-      if (session) {
-        await this.waitForGlobalDiscordCooldown();
-        await session.rateLimiter.consume();
-      }
-
       const channel = await client.channels.fetch(channelId, { force: true, cache: false });
       if (!channel || !('messages' in channel)) return null;
-
       const message = await (channel as TextChannel).messages.fetch(messageId, {
         force: true,
         cache: false,
       }) as Message;
-
       try {
         (channel as TextChannel).messages.cache.delete(messageId);
         (client as any).channels?.cache?.delete(channelId);
       } catch {
       }
       return message;
-    } catch (error) {
-      const rateLimit = this.readRateLimit(error);
-      if (rateLimit && session) {
-        this.applyDiscordRateLimit(session, rateLimit.retryAfterMs, rateLimit.global);
-        throw new DiscordRateLimitError(rateLimit.retryAfterMs, rateLimit.global);
-      }
-      if (session && this.isRetryableEntryError(error)) {
-        throw new RetryableNetworkError(formatError(error));
-      }
+    } catch {
       return null;
     }
   }
@@ -1457,7 +1378,7 @@ export class AutoJoinManager extends EventEmitter {
         startedAt: Date.now(),
         isActive: true,
         stats: { detected: 0, entered: 0, failed: 0, wins: 0, falsePositives: 0, queueWaitTimes: [] },
-        rateLimiter: new TokenBucket(5, 1000),
+        rateLimiter: new TokenBucket(20, 1000),
         listeners: {},
         sessionId,
         destroyed: false,
@@ -2061,25 +1982,10 @@ export class AutoJoinManager extends EventEmitter {
       // Do not put a MongoDB write between detection and the click.
       this.startQueueProcessor(session.userId);
     } else {
-      // Never bypass the per-account worker pool when the queue is full. Doing
-      // so creates an unbounded side-channel of entry promises and defeats the
-      // rate limiter. Apply bounded backpressure instead.
-      const retry = async (): Promise<void> => {
-        for (let attempt = 0; attempt < QUEUE_BACKPRESSURE_RETRIES; attempt++) {
-          if (this.isShuttingDown || session.destroyed || !session.isActive) return;
-          await delay(QUEUE_BACKPRESSURE_BASE_MS * Math.pow(2, attempt));
-          if (this.joinQueue.enqueue(queueItem)) {
-            this.startQueueProcessor(session.userId);
-            return;
-          }
-        }
-        this.joinQueue.moveToDeadLetter(queueItem, 'Queue remained saturated after bounded backpressure retries');
-        void updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'dead_letter', {
-          lastError: 'Queue saturated',
-        }).catch(() => {});
-      };
-      void retry().catch(error => {
-        this.asyncLogger.error('Queue backpressure handler failed', {
+      // The queue is saturated; try the entry directly rather than silently
+      // dropping a live giveaway.
+      void this.enterGiveaway(entryId, session, entry).catch(error => {
+        this.asyncLogger.error('Direct giveaway entry failed after queue saturation', {
           userId: session.userId,
           messageId: entry.messageId,
           error: formatError(error),
@@ -2158,9 +2064,6 @@ export class AutoJoinManager extends EventEmitter {
       }
       if (activePromises.size === 0) break;
       await Promise.race(Array.from(activePromises));
-      // Yield once after a completion so promise.finally handlers can remove
-      // the completed worker before we refill the pool.
-      await Promise.resolve();
     }
     if (activePromises.size > 0) {
       await Promise.allSettled(Array.from(activePromises));
@@ -2213,43 +2116,30 @@ export class AutoJoinManager extends EventEmitter {
     const correlationId = entry.correlationId || uuidv4();
     // The prefetched entry is authoritative for a live queue item. Avoid a DB
     // round-trip before the interaction; persist status after the attempt.
-    const maxAttempts = Math.max(1, CONFIG.maxRetries + 1);
-    let lastError: unknown = null;
-
+    const maxAttempts = CONFIG.maxRetries + 1;
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       const attemptNum = attempt + 1;
       this.metrics.totalEntriesAttempted++;
-
-      if (lastError && attempt > 0) {
-        const retryDelay = this.getRetryDelayForEntry(lastError, attempt);
-        await delay(retryDelay);
+      if (attempt > 0) {
+        const backoffMs = exponentialBackoff(attempt - 1, CONFIG.retryDelayMs, 30000);
+        await delay(backoffMs);
       }
-
       try {
         const skipped = await this.enterViaButton(entry as GiveawayEntry, session);
         if (skipped) {
-          void updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'skipped', {})
-            .catch(() => {});
+          await updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'skipped', {});
+          this.metrics.dbQueries++;
           return;
         }
-
         session.stats.entered++;
         session.stats.lastEntryAt = Date.now();
         this.metrics.totalEntriesSucceeded++;
-
-        void updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'success', {
+        await updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'success', {
           attempts: attemptNum,
-        }).catch(error => {
-          this.asyncLogger.warn('Failed to persist successful entry status', {
-            userId: session.userId,
-            messageId: entry.messageId,
-            error: formatError(error),
-          });
         });
-
-        void incrementTokenEntries(session.userId, session.guildId).catch(() => {});
-        void updateTokenLastUsed(session.userId, session.guildId).catch(() => {});
-
+        this.metrics.dbQueries++;
+        await incrementTokenEntries(session.userId, session.guildId);
+        await updateTokenLastUsed(session.userId, session.guildId);
         this.joinOutcomeBuffer.push({
           userId: session.userId,
           messageId: entry.messageId,
@@ -2263,10 +2153,9 @@ export class AutoJoinManager extends EventEmitter {
         if (this.joinOutcomeBuffer.length > MAX_JOIN_OUTCOME_BUFFER) {
           this.joinOutcomeBuffer.splice(0, this.joinOutcomeBuffer.length - MAX_JOIN_OUTCOME_BUFFER);
         }
-
         this.updateGuildStats(entry.guildId, entry.guildName, 'entered');
         this.updateAccountStats(session.userId, 'entered');
-        this.asyncLogger.info('✅ AutoJoin: Entered giveaway', {
+            this.asyncLogger.info('✅ AutoJoin: Entered giveaway', {
           correlationId,
           userId: session.userId,
           prize: truncate(entry.prize, 60),
@@ -2277,66 +2166,40 @@ export class AutoJoinManager extends EventEmitter {
         this.emit('giveawayEntered', { entry, userId: session.userId, correlationId });
         return;
       } catch (error) {
-        lastError = error;
         const errorMsg = formatError(error);
-        const lower = errorMsg.toLowerCase();
-
-        if (lower.includes('already entered') ||
-            lower.includes('already joined') ||
-            lower.includes('already participating')) {
-          void updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'skipped', {
+        if (errorMsg.includes('already entered') ||
+            errorMsg.includes('already joined') ||
+            errorMsg.includes('already participating')) {
+          await updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'skipped', {
             lastError: 'Already entered',
-          }).catch(() => {});
+          });
+          this.metrics.dbQueries++;
           this.joinQueue.cancelGiveaway(entry.messageId, entry.channelId);
           return;
         }
-
-        if (lower.includes('no buttoncustomid set') || lower.includes('button no longer exists')) {
-          void updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'skipped', {
-            lastError: 'No valid entry button found',
-          }).catch(() => {});
+        if (errorMsg.includes('No buttonCustomId set')) {
+          await updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'skipped', {
+            lastError: 'No button found - not a valid giveaway entry',
+          });
+          this.metrics.dbQueries++;
           return;
         }
-
-        const retryable = this.isRetryableEntryError(error);
-        if (!retryable || attempt >= maxAttempts - 1) {
-          void updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'attempting', {
-            attempts: attemptNum,
-            lastError: errorMsg,
-          }).catch(() => {});
-
-          this.asyncLogger.warn(`AutoJoin: Attempt ${attemptNum}/${maxAttempts} failed`, {
-            correlationId,
-            userId: session.userId,
-            entryId,
-            retryable,
-            error: errorMsg,
-            worker: this.workerId,
-          });
-          break;
-        }
-
-        if (lower.includes('no response from application')) {
+        const isNoResponse = errorMsg.toLowerCase().includes('no response from application');
+        if (isNoResponse && attempt < maxAttempts - 1) {
           await delay(100);
           try { await this.refreshButtonData(entry as GiveawayEntry, session); } catch {}
+          continue;
         }
-
-        void updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'attempting', {
+        await updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'attempting', {
           attempts: attemptNum,
-          lastError: errorMsg,
-        }).catch(() => {});
-
-        this.asyncLogger.warn(`AutoJoin: Retryable attempt ${attemptNum}/${maxAttempts} failed`, {
-          correlationId,
-          userId: session.userId,
-          entryId,
-          retryInMs: this.getRetryDelayForEntry(error, attemptNum + 1),
-          error: errorMsg,
-          worker: this.workerId,
+          lastError: errorMsg
+        });
+        this.metrics.dbQueries++;
+        this.asyncLogger.warn(`AutoJoin: Attempt ${attemptNum}/${maxAttempts} failed`, {
+          correlationId, userId: session.userId, entryId, error: errorMsg, worker: this.workerId,
         });
       }
     }
-
     const queueItem: QueueItem = {
       entryId,
       userId: session.userId,
@@ -2361,13 +2224,13 @@ export class AutoJoinManager extends EventEmitter {
     this.metrics.totalEntriesFailed++;
     this.asyncLogger.error('❌ AutoJoin: All retries exhausted - moved to dead letter', {
       correlationId, userId: session.userId, prize: truncate(entry.prize, 60),
-      attempts: maxAttempts, worker: this.workerId,
+      attempts: entry.attempts, worker: this.workerId,
     });
     this.emit('giveawayFailed', { entry, userId: session.userId, correlationId });
   }
   private async refreshButtonData(entry: GiveawayEntry, session: UserSession): Promise<GiveawayEntry | null> {
     try {
-      const message = await this.fetchMessageUncached(session.client, entry.channelId, entry.messageId, session);
+      const message = await this.fetchMessageUncached(session.client, entry.channelId, entry.messageId);
       if (!message) return null;
       const button = this.extractEntryButton(message);
       if (button && button.customId !== entry.buttonCustomId) {
@@ -2401,7 +2264,7 @@ export class AutoJoinManager extends EventEmitter {
     }
 
     if (!message) {
-      message = await this.fetchMessageUncached(session.client, entry.channelId, entry.messageId, session);
+      message = await this.fetchMessageUncached(session.client, entry.channelId, entry.messageId);
     }
     if (!message) throw new Error(`Message ${entry.messageId} not found`);
     if (!message.guild) throw new Error('Cannot enter giveaway in DM - buttons require guild context');
@@ -2416,7 +2279,6 @@ export class AutoJoinManager extends EventEmitter {
 
     if (!button || button.disabled) return true;
 
-    await this.waitForGlobalDiscordCooldown();
     await session.rateLimiter.consume();
     await this.clickButton(message, button, session);
     return false;
@@ -2439,189 +2301,109 @@ export class AutoJoinManager extends EventEmitter {
     }
     await this.postInteraction(message, button, session);
   }
-  private async waitForGlobalDiscordCooldown(): Promise<void> {
-    while (!this.isShuttingDown) {
-      const remaining = Math.max(0, this.discordGlobalCooldownUntil - Date.now());
-      if (remaining <= 0) return;
-      await delay(remaining);
-    }
-  }
-
-  private readRateLimit(error: unknown): { retryAfterMs: number; global: boolean } | null {
-    const axiosErr = error as {
-      response?: {
-        status?: number;
-        headers?: Record<string, unknown>;
-        data?: unknown;
-      };
-    };
-    const response = axiosErr.response;
-    if (response?.status !== 429) return null;
-
-    const headers = response.headers ?? {};
-    const data = typeof response.data === 'string'
-      ? (() => { try { return JSON.parse(response.data); } catch { return {}; } })()
-      : (response.data && typeof response.data === 'object' ? response.data as Record<string, unknown> : {});
-
-    const bodyRetry = Number((data as any).retry_after);
-    const retryHeader = Number(headers['retry-after'] ?? headers['Retry-After']);
-    const resetAfter = Number(headers['x-ratelimit-reset-after'] ?? headers['X-RateLimit-Reset-After']);
-
-    const candidates = [bodyRetry, retryHeader, resetAfter].filter(Number.isFinite).filter(v => v >= 0);
-    const retryAfterSeconds = candidates.length > 0 ? Math.max(...candidates) : 1;
-    const retryAfterMs = Math.max(
-      RATE_LIMIT_MIN_DELAY_MS,
-      Math.min(RATE_LIMIT_MAX_DELAY_MS, Math.ceil(retryAfterSeconds * 1000)),
-    );
-
-    const globalValue = headers['x-ratelimit-global'] ?? headers['X-RateLimit-Global'] ?? (data as any).global;
-    const global = globalValue === true || String(globalValue).toLowerCase() === 'true';
-    return { retryAfterMs, global };
-  }
-
-  private applyDiscordRateLimit(session: UserSession, retryAfterMs: number, global: boolean): void {
-    const jittered = retryAfterMs + Math.floor(Math.random() * RATE_LIMIT_JITTER_MS);
-    session.rateLimiter.applyCooldown(jittered);
-    if (global) {
-      this.discordGlobalCooldownUntil = Math.max(
-        this.discordGlobalCooldownUntil,
-        Date.now() + jittered,
-      );
-    }
-  }
-
-  private isRetryableEntryError(error: unknown): boolean {
-    if (error instanceof DiscordRateLimitError || error instanceof RetryableNetworkError) return true;
-    const msg = formatError(error).toLowerCase();
-    return [
-      'econnreset',
-      'etimedout',
-      'econnrefused',
-      'socket hang up',
-      'network error',
-      'timeout',
-      '502',
-      '503',
-      '504',
-      'no response from application',
-    ].some(marker => msg.includes(marker));
-  }
-
-  private getRetryDelayForEntry(error: unknown, attempt: number): number {
-    if (error instanceof DiscordRateLimitError) {
-      return error.retryAfterMs + Math.floor(Math.random() * RATE_LIMIT_JITTER_MS);
-    }
-    const exponential = Math.min(
-      NETWORK_RETRY_MAX_MS,
-      NETWORK_RETRY_BASE_MS * Math.pow(2, Math.max(0, attempt - 1)),
-    );
-    return exponential + Math.floor(Math.random() * 250);
-  }
-
   private async postInteraction(message: Message, button: GiveawayButton, session: UserSession): Promise<void> {
     if (!message.guild) {
       throw new Error('Cannot click buttons in DMs - guild context required');
     }
-
-    await this.waitForGlobalDiscordCooldown();
-
-    let wsSessionId = session.gatewaySessionId;
-    if (!wsSessionId || Date.now() - session.lastSessionIdFetch > 30_000) {
-      wsSessionId = await this.getGatewaySessionId(session.client);
-      session.gatewaySessionId = wsSessionId;
-      session.lastSessionIdFetch = Date.now();
-    }
-    if (!wsSessionId) {
-      throw new RetryableNetworkError('No active gateway session ID available; websocket is reconnecting');
-    }
-
-    const applicationId = message.author?.id ||
-      (message as any).applicationId ||
-      (message as any).webhookId ||
-      (message as any).interaction?.application_id;
-    if (!applicationId) {
-      throw new Error('Could not determine application ID for interaction');
-    }
-
-    const token = session.decryptedToken;
-    if (!token) throw new Error('Token unavailable in session');
-
-    await this.waitForGlobalDiscordCooldown();
-
-    const nonce = `${Date.now()}${Math.random().toString(36).slice(2, 10)}`;
-    const payload = {
-      type: 3,
-      nonce,
-      guild_id: message.guild.id,
-      channel_id: message.channel.id,
-      message_id: message.id,
-      application_id: applicationId,
-      session_id: wsSessionId,
-      message_flags: 0,
-      data: {
-        component_type: 2,
-        custom_id: button.customId,
-      },
-    };
-
-    try {
-      const response = await this.http.post('https://discord.com/api/v10/interactions', payload, {
-        headers: {
-          'Authorization': token,
-          'Content-Type': 'application/json',
-          'Accept': 'application/json',
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-          'X-Discord-Locale': 'en-US',
+    await (async () => {
+      const client = message.client as any;
+      let wsSessionId = session.gatewaySessionId;
+      if (!wsSessionId || (Date.now() - session.lastSessionIdFetch > 30000)) {
+        wsSessionId = await this.getGatewaySessionId(client);
+        session.gatewaySessionId = wsSessionId;
+        session.lastSessionIdFetch = Date.now();
+      }
+      if (!wsSessionId) {
+        await delay(250);
+        wsSessionId = await this.getGatewaySessionId(client);
+        session.gatewaySessionId = wsSessionId;
+        session.lastSessionIdFetch = Date.now();
+      }
+      if (!wsSessionId) {
+        throw new Error('No active gateway session ID available; websocket is reconnecting');
+      }
+      const nonce = `${Date.now()}${Math.random().toString(36).slice(2, 8)}`;
+      const applicationId = message.author?.id ||
+        (message as any).applicationId ||
+        (message as any).webhookId ||
+        (message as any).interaction?.application_id;
+      if (!applicationId) {
+        throw new Error('Could not determine application ID for interaction');
+      }
+      const payload = {
+        type: 3,
+        nonce,
+        guild_id: message.guild!.id,
+        channel_id: message.channel.id,
+        message_id: message.id,
+        application_id: applicationId,
+        session_id: wsSessionId,
+        message_flags: 0,
+        data: {
+          component_type: 2,
+          custom_id: button.customId,
         },
-        timeout: 5_000,
-      });
-
-      this.metrics.apiCalls++;
-      if ([200, 201, 204].includes(response.status)) return;
-      throw new Error(`Unexpected Discord interaction status ${response.status}`);
-    } catch (error) {
-      this.metrics.apiCalls++;
-      this.metrics.apiErrors++;
-
-      const rateLimit = this.readRateLimit(error);
-      if (rateLimit) {
-        this.applyDiscordRateLimit(session, rateLimit.retryAfterMs, rateLimit.global);
-        this.asyncLogger.warn('Discord rate limit encountered', {
-          userId: session.userId,
-          retryAfterMs: rateLimit.retryAfterMs,
-          global: rateLimit.global,
-          channelId: message.channel.id,
-          messageId: message.id,
-        });
-        throw new DiscordRateLimitError(rateLimit.retryAfterMs, rateLimit.global);
+      };
+      const token = session.decryptedToken;
+      if (!token) {
+        throw new Error('Token unavailable in session');
       }
-
-      const axiosErr = error as { response?: { status?: number; data?: unknown } };
-      const status = axiosErr.response?.status;
-      const responseData = axiosErr.response?.data;
-      const errorMessage = typeof responseData === 'string'
-        ? responseData
-        : responseData && typeof responseData === 'object'
-          ? String((responseData as any).message ?? '')
-          : '';
-      const lower = errorMessage.toLowerCase();
-
-      if (status === 401) throw new Error('Discord interaction returned 401 Unauthorized');
-      if (status === 403) throw new Error('Discord interaction returned 403 Forbidden');
-      if (status === 404 || lower.includes('unknown interaction')) {
-        throw new Error('Interaction expired or button no longer exists');
+      for (let attempt = 0; attempt < INTERACTION_RETRY_ATTEMPTS; attempt++) {
+        try {
+          if (attempt > 0) await delay(INTERACTION_RETRY_DELAY_MS * attempt);
+          const response = await this.http.post('https://discord.com/api/v10/interactions', payload, {
+            headers: {
+              'Authorization': token,
+              'Content-Type': 'application/json',
+              'Accept': 'application/json',
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+              'X-Discord-Locale': 'en-US',
+            },
+            timeout: 5000,
+          });
+          this.metrics.apiCalls++;
+          if (response.status === 204 || response.status === 200 || response.status === 201) {
+            return;
+          }
+        } catch (error) {
+          this.metrics.apiCalls++;
+          this.metrics.apiErrors++;
+          const axiosErr = error as { response?: { status?: number; data?: { retry_after?: number; message?: string } } };
+          const status = axiosErr.response?.status;
+          const errorMessage = axiosErr.response?.data?.message;
+          if (errorMessage?.includes('No response') || errorMessage?.includes('no response')) {
+            if (attempt === INTERACTION_RETRY_ATTEMPTS - 1) {
+              throw new Error(`No response from Application after ${INTERACTION_RETRY_ATTEMPTS} attempts`);
+            }
+            if (attempt === 1) {
+              payload.nonce = `${Date.now()}${Math.random().toString(36).slice(2, 8)}`;
+            }
+            continue;
+          }
+          if (status === 429) {
+            const retryAfterMs = Math.ceil((axiosErr.response?.data?.retry_after ?? 1) * 1000);
+            await delay(Math.min(retryAfterMs, 1000));
+            continue;
+          }
+          if (status === 401 || status === 403) {
+            this.asyncLogger.error('Token appears to be blocked or invalid', {
+              userId: session.userId, status
+            });
+            await this.scheduleRetry(session.userId, session.guildId);
+            throw new Error(`Token ${status === 401 ? 'invalid' : 'blocked'}`);
+          }
+          if (status === 404 || errorMessage?.includes('unknown interaction')) {
+            throw new Error('Interaction expired or button no longer exists');
+          }
+          if (status === 502 || status === 504 || status === 500) {
+            if (attempt === INTERACTION_RETRY_ATTEMPTS - 1) throw error;
+            continue;
+          }
+          if (attempt === INTERACTION_RETRY_ATTEMPTS - 1) throw error;
+        }
       }
-      if (status === 500 || status === 502 || status === 503 || status === 504) {
-        throw new RetryableNetworkError(`Discord interaction server error ${status}`);
-      }
-      if (lower.includes('no response from application')) {
-        throw new RetryableNetworkError('No response from Application');
-      }
-      if ((error as any)?.code === 'ECONNRESET' || (error as any)?.code === 'ETIMEDOUT' || (error as any)?.code === 'ECONNREFUSED') {
-        throw new RetryableNetworkError(formatError(error));
-      }
-      throw error;
-    }
+      throw new Error(`Failed to send interaction after ${INTERACTION_RETRY_ATTEMPTS} attempts`);
+    });
   }
   private findButtonById(message: Message, customId: string): GiveawayButton | null {
     const msgAny = message as unknown as Record<string, unknown>;
@@ -3196,7 +2978,7 @@ export class AutoJoinManager extends EventEmitter {
         clearTimeout(retryTimer);
         this.retryScheduled.delete(retryKey);
       }
-      this.asyncLogger.info('AutoJoin session stopped', {
+      this.asyncLogger.info('⏹️ AutoJoin session stopped', {
         userId, guildId, sessionId: session.sessionId, memory: this.getMemoryUsage(),
       });
       this.emit('sessionStopped', { userId, guildId });
@@ -3205,10 +2987,10 @@ export class AutoJoinManager extends EventEmitter {
       this.sessionsByUserId.delete(userId);
     }
   }
-  async shutdown():Promise<void> {
+  async shutdown(): Promise<void> {
     if (this.isShuttingDown) return;
     this.isShuttingDown = true;
-    this.asyncLogger.info('Shutting down AutoJoinManager...', {
+    this.asyncLogger.info('🛑 Shutting down AutoJoinManager...', {
       worker: this.workerId, sessions: this.sessions.size, queueSize: this.joinQueue.getTotalSize(),
     });
     const intervals = [
@@ -3313,7 +3095,7 @@ export class AutoJoinManager extends EventEmitter {
   private logStats(): void {
     const stats = this.getStats();
     const mem = stats.memory;
-    this.asyncLogger.info('AutoJoin Stats', {
+    this.asyncLogger.info('📊 AutoJoin Stats', {
       worker: this.workerId,
       sessions: `${stats.activeSessions}/${stats.totalSessions} active`,
       memory: `${mem.heapUsedMB}MB / 8000MB (${mem.percentageUsed}%)`,
