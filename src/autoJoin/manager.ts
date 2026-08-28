@@ -115,6 +115,7 @@ interface UserSession {
     ready?: () => void;
     reconnecting?: () => void;
     resumed?: () => void;
+    raw?: (packet: any) => void;
   };
   sessionId: string;
   destroyed: boolean;
@@ -130,6 +131,12 @@ interface UserSession {
   stableSince: number;
   lastMessageEventAt: number;
   lastGiveawayDetectionAt: number;
+  lastGatewayActivityAt: number;
+  lastDetectionProgressAt: number;
+  staleRecoveryStartedAt: number;
+  staleRecoveryCount: number;
+  staleRecoveryWindowStartedAt: number;
+  recoveryGeneration: number;
   apiCircuitBreaker: CircuitBreaker;
 }
 interface SessionStats {
@@ -324,7 +331,13 @@ const RETRY_CHECK_INTERVAL_MS = 5 * 60 * 1000;
 const INITIAL_RETRY_DELAY_MS = 5000;
 const MAX_RETRY_DELAY_MS = 60000;
 const TOKEN_REACTIVATION_THRESHOLD_MS = 60 * 1000;
-const HEALTH_CHECK_INTERVAL_MS = 60000;
+const HEALTH_CHECK_INTERVAL_MS = 15000;
+const GATEWAY_STALE_AFTER_MS = 150000;
+const GATEWAY_STALE_HARD_LIMIT_MS = 300000;
+const GATEWAY_RECOVERY_COOLDOWN_MS = 45000;
+const MAX_STALE_RECOVERIES = 3;
+const STALE_RECOVERY_WINDOW_MS = 10 * 60 * 1000;
+const DETECTION_STALL_AFTER_MS = 60000;
 const MAX_CONCURRENT_ENTRIES_PER_ACCOUNT = 16;
 const DETECTION_CONCURRENCY_PER_SESSION = 12;
 const MAX_INGEST_QUEUE_SIZE = 20000;
@@ -989,6 +1002,7 @@ export class AutoJoinManager extends EventEmitter {
   private reconnectCountMap: Map<string, number> = new Map();
   private retryScheduled: Map<string, NodeJS.Timeout> = new Map();
   private tokenFailureTracker: Map<string, { failures: number; lastAttempt: number }> = new Map();
+  private sessionRecoveryPromises: Map<string, Promise<boolean>> = new Map();
   private httpAgent: http.Agent;
   private httpsAgent: https.Agent;
   private readonly http: AxiosInstance;
@@ -1394,6 +1408,12 @@ export class AutoJoinManager extends EventEmitter {
         stableSince: Date.now(),
         lastMessageEventAt: Date.now(),
         lastGiveawayDetectionAt: 0,
+        lastGatewayActivityAt: Date.now(),
+        lastDetectionProgressAt: Date.now(),
+        staleRecoveryStartedAt: 0,
+        staleRecoveryCount: 0,
+        staleRecoveryWindowStartedAt: 0,
+        recoveryGeneration: 0,
         apiCircuitBreaker: new CircuitBreaker(),
       };
       session.gatewaySessionId = await this.getGatewaySessionId(client);
@@ -1499,38 +1519,57 @@ export class AutoJoinManager extends EventEmitter {
   private registerEvents(session: UserSession): void {
     const { client, userId } = session;
     this.cleanupSessionListeners(session);
+
+    const touchGateway = (): void => {
+      const now = Date.now();
+      session.lastGatewayActivityAt = now;
+      session.lastMessageEventAt = now;
+    };
+
     const dispatchMessage = (message: Message, kind: 'create' | 'update'): void => {
-      if (this.isShuttingDown || session.destroyed || !session.isActive) return;
+      if (this.isShuttingDown || session.destroyed) return;
+
+      // IMPORTANT: record gateway activity before any filtering. The old
+      // implementation only updated lastMessageEventAt for GiveawayBot messages,
+      // which made a healthy session look dead whenever giveaways were quiet.
+      touchGateway();
+
+      if (!session.isActive) return;
       if (!message.guild) {
         this.purgeMessageFromCache(message);
         return;
       }
-      if (message.author?.id !== GIVEAWAY_BOT_ID) {
-        this.purgeMessageFromCache(message);
+
+      // We only need to put GiveawayBot messages through the expensive detector.
+      if (message.author?.id !== GIVEAWAY_BOT_ID || message.author?.id === client.user?.id) {
         return;
       }
-      if (message.author?.id === client.user?.id) {
-        this.purgeMessageFromCache(message);
-        return;
-      }
-      const now = Date.now();
-      const age = now - message.createdTimestamp;
-      session.lastMessageEventAt = now;
+
+      const age = Date.now() - message.createdTimestamp;
       this.metrics.totalMessagesProcessed++;
       this.liveMessageCache.set(`${message.channel.id}:${message.id}`, message);
       if (age > MAX_DETECTION_MESSAGE_AGE_MS) {
         this.purgeMessageFromCache(message);
         return;
       }
+
       this.enqueueDetection(session, message, kind);
     };
-    const messageCreateHandler = (message: Message) => {
-      dispatchMessage(message, 'create');
-    };
+
+    const messageCreateHandler = (message: Message) => dispatchMessage(message, 'create');
     const messageUpdateHandler = (oldMessage: Message | PartialMessage, updated: Message | PartialMessage) => {
       const message = (updated.guild ? updated : oldMessage) as Message;
       dispatchMessage(message, 'update');
     };
+
+    const rawHandler = (_packet: any) => {
+      if (this.isShuttingDown || session.destroyed) return;
+      // discord.js emits raw gateway packets even when no messageCreate event is
+      // produced. This is the heartbeat/activity signal used by the stale-session
+      // detector, so a quiet channel does not cause false reconnects.
+      touchGateway();
+    };
+
     const readyHandler = () => {
       const now = Date.now();
       session.isActive = true;
@@ -1542,11 +1581,16 @@ export class AutoJoinManager extends EventEmitter {
       session.lastDisconnectAt = 0;
       session.stableSince = now;
       session.lastMessageEventAt = now;
+      session.lastGatewayActivityAt = now;
+      session.lastDetectionProgressAt = now;
+      session.staleRecoveryStartedAt = 0;
       this.reconnectCountMap.delete(session.userId);
       this.tokenFailureTracker.delete(session.userId);
-      this.asyncLogger.info('✅ Session ready', { userId: session.userId });
-      this.startDetectionProcessor(session.userId);
+      void this.refreshGatewaySessionId(session);
+      this.asyncLogger.info('✅ Session ready', { userId });
+      this.startDetectionProcessor(userId);
     };
+
     const disconnectHandler = () => {
       if (this.isShuttingDown || session.destroyed) return;
       session.isActive = false;
@@ -1561,20 +1605,23 @@ export class AutoJoinManager extends EventEmitter {
         accountStats.reconnectCount = Math.min(accountStats.reconnectCount + 1, 1000000);
         this.accountStatsCache.set(session.userId, accountStats);
       }
-      this.asyncLogger.warn('⚠️ Session disconnected; preserving client for gateway auto-reconnect', {
+      this.asyncLogger.warn('⚠️ Session disconnected; waiting for gateway recovery', {
         userId: session.userId,
         attempt: session.reconnectAttempts,
       });
     };
+
     const reconnectingHandler = () => {
       if (this.isShuttingDown || session.destroyed) return;
       session.reconnectInProgress = true;
       session.lastReconnectAt = Date.now();
+      session.gatewaySessionId = null;
       this.asyncLogger.info('🔄 Session reconnecting...', {
         userId: session.userId,
         attempt: session.reconnectAttempts,
       });
     };
+
     const resumedHandler = () => {
       const now = Date.now();
       session.isActive = true;
@@ -1584,14 +1631,19 @@ export class AutoJoinManager extends EventEmitter {
       session.lastDisconnectAt = 0;
       session.stableSince = now;
       session.lastMessageEventAt = now;
+      session.lastGatewayActivityAt = now;
+      session.lastDetectionProgressAt = now;
+      session.staleRecoveryStartedAt = 0;
+      void this.refreshGatewaySessionId(session);
       this.startDetectionProcessor(session.userId);
-      this.asyncLogger.info('✅ Session resumed; direct giveaway event pipeline ready', { userId: session.userId });
+      this.asyncLogger.info('✅ Session resumed; giveaway event pipeline ready', { userId: session.userId });
     };
+
     const errorHandler = (error: Error) => {
-      if (error.message?.includes('token')) {
-        this.asyncLogger.error('Client error', { userId: session.userId, error: formatError(error) });
-      }
+      const msg = formatError(error);
+      this.asyncLogger.warn('⚠️ Gateway/client error', { userId: session.userId, error: msg });
     };
+
     session.listeners.messageCreate = messageCreateHandler;
     session.listeners.messageUpdate = messageUpdateHandler;
     session.listeners.ready = readyHandler;
@@ -1599,6 +1651,8 @@ export class AutoJoinManager extends EventEmitter {
     session.listeners.reconnecting = reconnectingHandler;
     session.listeners.resumed = resumedHandler;
     session.listeners.error = errorHandler;
+    session.listeners.raw = rawHandler;
+
     client.on('messageCreate', messageCreateHandler);
     client.on('messageUpdate', messageUpdateHandler);
     client.on('ready', readyHandler);
@@ -1606,7 +1660,22 @@ export class AutoJoinManager extends EventEmitter {
     client.on('reconnecting', reconnectingHandler);
     client.on('resumed', resumedHandler);
     client.on('error', errorHandler);
+    client.on('raw', rawHandler);
   }
+
+  private async refreshGatewaySessionId(session: UserSession): Promise<void> {
+    if (this.isShuttingDown || session.destroyed) return;
+    try {
+      const id = await this.getGatewaySessionId(session.client);
+      if (id) {
+        session.gatewaySessionId = id;
+        session.lastSessionIdFetch = Date.now();
+      }
+    } catch {
+      // A missing session ID is expected for a short period during resume.
+    }
+  }
+
   private cleanupSessionListeners(session: UserSession): void {
     const { client, listeners } = session;
     const handlers: Array<[string, ((...args: any[]) => any) | undefined]> = [
@@ -1617,6 +1686,7 @@ export class AutoJoinManager extends EventEmitter {
       ['ready', listeners.ready],
       ['reconnecting', listeners.reconnecting],
       ['resumed', listeners.resumed],
+      ['raw', listeners.raw],
     ];
     for (const [event, handler] of handlers) {
       if (!handler) continue;
@@ -1708,6 +1778,7 @@ export class AutoJoinManager extends EventEmitter {
       while (active.size < DETECTION_CONCURRENCY_PER_SESSION && queue.length > 0) {
         const task = queue.shift();
         if (!task) break;
+        current.lastDetectionProgressAt = Date.now();
         pending.delete(task.key);
 
         if (inFlight.has(task.key)) continue;
@@ -1728,6 +1799,7 @@ export class AutoJoinManager extends EventEmitter {
           .finally(() => {
             inFlight.delete(task.key);
             active.delete(promise);
+            current.lastDetectionProgressAt = Date.now();
 
             // A messageUpdate may have arrived while this task was running.
             // Process the newest message instead of dropping the update.
@@ -2542,77 +2614,181 @@ export class AutoJoinManager extends EventEmitter {
   private startHealthChecker(): void {
     this.healthCheckInterval = setInterval(() => {
       if (this.isShuttingDown) return;
-      const now = Date.now();
-      for (const session of this.sessions.values()) {
-        if (session.destroyed) continue;
-        try {
-          const client = session.client as any;
-          const readyState = client.ws?.connection?.readyState;
-          const isReady = client.isReady?.() === true;
-          const isConnected = isReady && readyState === 1;
-          if (isConnected) {
-            if (!session.reconnectInProgress) session.stableSince = session.stableSince || now;
-            continue;
-          }
-          if (session.lastDisconnectAt === 0) {
-            session.lastDisconnectAt = now;
-          }
-          if (now - session.lastDisconnectAt < RECONNECT_GRACE_MS) continue;
-          if (session.reconnectInProgress) continue;
-          if (now - session.lastReconnectAt < RECONNECT_COOLDOWN_MS) continue;
-          if (session.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-            this.asyncLogger.warn('⚠️ Session exceeded reconnect attempts; scheduling controlled replacement', {
-              userId: session.userId,
-              attempts: session.reconnectAttempts,
-            });
-            this.scheduleRetry(session.userId, session.guildId).catch(() => {});
-            continue;
-          }
-          session.reconnectInProgress = true;
-          session.reconnectAttempts++;
-          session.lastReconnectAt = now;
-          try {
-            client.ws?.reconnect?.();
-          } catch (error) {
-            session.reconnectInProgress = false;
-            this.asyncLogger.warn('Gateway reconnect request failed', {
-              userId: session.userId,
-              error: formatError(error),
-            });
-          }
-        } catch {
-        }
-      }
+      void this.runHealthCheck().catch(error => {
+        this.asyncLogger.error('Health checker failed', { error: formatError(error) });
+      });
     }, HEALTH_CHECK_INTERVAL_MS);
     if (this.healthCheckInterval.unref) this.healthCheckInterval.unref();
   }
-  private startStallChecker(): void {
-    this.stallCheckInterval = setInterval(() => {
-      if (this.isShuttingDown) return;
-      let stalled = 0;
-      for (const [_, session] of this.sessions) {
-        if (!session.isActive || session.destroyed) {
-          stalled++;
-          continue;
+
+  private async runHealthCheck(): Promise<void> {
+    const now = Date.now();
+
+    for (const session of this.sessions.values()) {
+      if (this.isShuttingDown || session.destroyed) continue;
+
+      const client = session.client as any;
+      const readyState = client.ws?.connection?.readyState;
+      const isReady = client.isReady?.() === true;
+      const isConnected = isReady && readyState === 1;
+
+      if (!isConnected) {
+        session.isActive = false;
+        if (session.lastDisconnectAt === 0) session.lastDisconnectAt = now;
+
+        const disconnectedFor = now - session.lastDisconnectAt;
+        if (disconnectedFor >= RECONNECT_GRACE_MS && !session.reconnectInProgress) {
+          await this.recoverSession(session, 'gateway_disconnected');
         }
+        continue;
+      }
+
+      // A socket reporting OPEN is not enough. A broken gateway can remain OPEN
+      // while the application receives no packets. raw gateway activity gives us
+      // a much better liveness signal than readyState alone.
+      const gatewaySilence = now - session.lastGatewayActivityAt;
+      if (gatewaySilence >= GATEWAY_STALE_AFTER_MS) {
+        await this.recoverSession(
+          session,
+          gatewaySilence >= GATEWAY_STALE_HARD_LIMIT_MS
+            ? 'gateway_hard_stall'
+            : 'gateway_stale',
+        );
+        continue;
+      }
+
+      if (!session.reconnectInProgress) {
+        session.stableSince = session.stableSince || now;
+      }
+
+      // Detection workers should never silently die while work is queued. We do
+      // not kill an active worker, but we restart the processor when there is
+      // queued work and the processor map is unexpectedly empty.
+      const queued = this.detectionQueues.get(session.userId)?.length || 0;
+      if (queued > 0 && !this.detectionProcessorPromises.has(session.userId)) {
+        this.asyncLogger.warn('⚠️ Detection queue had work but no processor; restarting', {
+          userId: session.userId, queued,
+        });
+        this.startDetectionProcessor(session.userId);
+      }
+
+      if (queued > 0 && now - session.lastDetectionProgressAt >= DETECTION_STALL_AFTER_MS) {
+        this.asyncLogger.warn('⚠️ Detection queue appears stalled', {
+          userId: session.userId,
+          queued,
+          stalledMs: now - session.lastDetectionProgressAt,
+          processors: this.detectionProcessorPromises.size,
+        });
+      }
+    }
+  }
+
+  private async recoverSession(session: UserSession, reason: string): Promise<boolean> {
+    if (this.isShuttingDown || session.destroyed) return false;
+
+    const existing = this.sessionRecoveryPromises.get(session.userId);
+    if (existing) return existing;
+
+    const now = Date.now();
+    if (now - session.lastReconnectAt < GATEWAY_RECOVERY_COOLDOWN_MS) return false;
+
+    if (session.staleRecoveryWindowStartedAt === 0 ||
+        now - session.staleRecoveryWindowStartedAt > STALE_RECOVERY_WINDOW_MS) {
+      session.staleRecoveryWindowStartedAt = now;
+      session.staleRecoveryCount = 0;
+    }
+
+    session.staleRecoveryCount++;
+    session.staleRecoveryStartedAt = now;
+    session.lastReconnectAt = now;
+    session.reconnectInProgress = true;
+
+    const promise = (async () => {
+      const forceReplace = session.staleRecoveryCount >= MAX_STALE_RECOVERIES || reason === 'gateway_hard_stall';
+
+      this.asyncLogger.warn('🩺 Recovering AutoJoin session', {
+        userId: session.userId,
+        reason,
+        gatewaySilenceMs: now - session.lastGatewayActivityAt,
+        recoveryCount: session.staleRecoveryCount,
+        forceReplace,
+      });
+
+      if (!forceReplace) {
         try {
-          const client = session.client as any;
-          if (!client.isReady() || client.ws?.connection?.readyState !== 1) {
-            stalled++;
+          session.client.ws?.reconnect?.();
+          // Give the existing client a chance to emit resumed/ready.
+          await delay(12000);
+          if (!session.destroyed && session.client.isReady?.() === true &&
+              session.client.ws?.connection?.readyState === 1 &&
+              Date.now() - session.lastGatewayActivityAt < GATEWAY_STALE_AFTER_MS) {
+            session.reconnectInProgress = false;
+            session.staleRecoveryStartedAt = 0;
+            await this.refreshGatewaySessionId(session);
+            this.asyncLogger.info('✅ Existing gateway recovered session', { userId: session.userId });
+            return true;
           }
-        } catch {
-          stalled++;
+        } catch (error) {
+          this.asyncLogger.warn('⚠️ Existing gateway reconnect failed', {
+            userId: session.userId, error: formatError(error),
+          });
         }
       }
-      if (stalled > 0) {
-        this.asyncLogger.debug(`⚠️ ${stalled} sessions appear stalled`, {
+
+      // The old client is considered poisoned. Replacing it is safer than
+      // endlessly calling reconnect() on a socket that reports OPEN but is not
+      // delivering events. Do NOT count this as a token failure.
+      session.recoveryGeneration++;
+      const userId = session.userId;
+      const guildId = session.guildId;
+      await this.stopSession(userId, guildId);
+      if (this.isShuttingDown) return false;
+
+      await delay(1000 + Math.floor(Math.random() * 1500));
+      const success = await this.startSession(userId, guildId);
+      if (success) {
+        this.asyncLogger.info('✅ Session replaced successfully after gateway stall', {
+          userId, reason,
+        });
+      } else {
+        this.asyncLogger.warn('⚠️ Session replacement failed; normal retry policy will handle it', { userId });
+      }
+      return success;
+    })().finally(() => {
+      this.sessionRecoveryPromises.delete(session.userId);
+    });
+
+    this.sessionRecoveryPromises.set(session.userId, promise);
+    return promise;
+  }
+
+  private startStallChecker(): void {
+    // Kept as a lightweight diagnostic layer. Actual recovery is centralized in
+    // runHealthCheck() so multiple timers can never fight over one session.
+    this.stallCheckInterval = setInterval(() => {
+      if (this.isShuttingDown) return;
+      const now = Date.now();
+      let stale = 0;
+      let queued = 0;
+      for (const session of this.sessions.values()) {
+        if (session.destroyed) continue;
+        const silence = now - session.lastGatewayActivityAt;
+        const queueSize = this.detectionQueues.get(session.userId)?.length || 0;
+        if (silence >= GATEWAY_STALE_AFTER_MS) stale++;
+        queued += queueSize;
+      }
+      if (stale > 0 || queued > 0) {
+        this.asyncLogger.debug('🩺 AutoJoin health snapshot', {
           worker: this.workerId,
-          totalSessions: this.sessions.size,
+          sessions: this.sessions.size,
+          staleSessions: stale,
+          queuedDetectionTasks: queued,
         });
       }
     }, 30000);
     if (this.stallCheckInterval.unref) this.stallCheckInterval.unref();
   }
+
   private startBatchDbWriter(): void {
     this.batchDbInterval = setInterval(async () => {
       if (this.isShuttingDown || this.joinOutcomeBuffer.length === 0) return;
@@ -2794,6 +2970,8 @@ export class AutoJoinManager extends EventEmitter {
           ...session.stats,
           lastMessageEventAt: session.lastMessageEventAt,
           lastGiveawayDetectionAt: session.lastGiveawayDetectionAt,
+          gatewaySilenceMs: Math.max(0, Date.now() - session.lastGatewayActivityAt),
+          detectionQueueSize: this.detectionQueues.get(session.userId)?.length || 0,
         } as SessionStats,
       });
       totalDetected += session.stats.detected;
@@ -3084,6 +3262,7 @@ export class AutoJoinManager extends EventEmitter {
     this.accountStatsCache.clear();
     this.reconnectCountMap.clear();
     this.tokenFailureTracker.clear();
+    this.sessionRecoveryPromises.clear();
     try { this.httpAgent.destroy(); } catch {}
     try { this.httpsAgent.destroy(); } catch {}
     this.asyncLogger.shutdown();
