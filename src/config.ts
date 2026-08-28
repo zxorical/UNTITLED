@@ -1,128 +1,300 @@
 import 'dotenv/config';
 import { AppConfig } from './types.js';
+
 function requireEnv(key: string): string {
   const val = process.env[key];
+
   if (!val || val.trim() === '') {
     throw new Error(`Missing required env var: ${key}`);
   }
+
   return val.trim();
 }
+
 function optionalEnv(key: string, fallback: string): string {
   const val = process.env[key];
+
   return val && val.trim() !== '' ? val.trim() : fallback;
 }
+
 function csvEnv(key: string): string[] {
   const val = process.env[key];
-  if (!val || val.trim() === '') return [];
-  return val.split(',').map(s => s.trim()).filter(Boolean);
+
+  if (!val || val.trim() === '') {
+    return [];
+  }
+
+  return val
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
 }
+
 function assertSnowflake(id: string, label: string): void {
   if (!/^\d{17,19}$/.test(id)) {
     throw new Error(`${label} "${id}" is not a valid Discord Snowflake`);
   }
 }
-function assertInt(raw: string, label: string, min: number, max: number): number {
+
+function assertInt(
+  raw: string,
+  label: string,
+  min: number,
+  max: number
+): number {
   const n = parseInt(raw, 10);
+
   if (isNaN(n) || n < min || n > max) {
-    throw new Error(`${label} must be between ${min} and ${max}, got "${raw}"`);
+    throw new Error(
+      `${label} must be between ${min} and ${max}, got "${raw}"`
+    );
   }
+
   return n;
 }
+
 function tokensEnv(): string[] {
   const multi = process.env.DISCORD_TOKENS;
+
   if (multi && multi.trim() !== '') {
-    const tokens = multi.split(',').map(s => s.trim()).filter(Boolean);
-    if (tokens.length === 0) throw new Error('DISCORD_TOKENS is empty');
+    const tokens = multi
+      .split(',')
+      .map(s => s.trim())
+      .filter(Boolean);
+
+    if (tokens.length === 0) {
+      throw new Error('DISCORD_TOKENS is empty');
+    }
+
     return tokens;
   }
+
   const single = process.env.DISCORD_TOKEN;
+
   if (single && single.trim() !== '') {
     return [single.trim()];
   }
+
   throw new Error('Missing DISCORD_TOKENS or DISCORD_TOKEN');
 }
+
 export const CONFIG: AppConfig = {
   tokens: tokensEnv(),
+
   botToken: requireEnv('DISCORD_BOT_TOKEN'),
+
   trackerChannelId: requireEnv('TRACKER_CHANNEL_ID'),
+
   scrimChannelId: optionalEnv('SCRIM_CHANNEL_ID', ''),
+
   eventChannelId: optionalEnv('EVENT_CHANNEL_ID', ''),
+
   monitoredChannels: csvEnv('MONITORED_CHANNELS'),
-  dbPath: optionalEnv('DB_PATH', './data/giveaways.json'),
-  logLevel: optionalEnv('LOG_LEVEL', 'info'),
-  logDir: optionalEnv('LOG_DIR', './logs'),
+
+  dbPath: optionalEnv(
+    'DB_PATH',
+    './data/giveaways.json'
+  ),
+
+  logLevel: optionalEnv(
+    'LOG_LEVEL',
+    'info'
+  ),
+
+  logDir: optionalEnv(
+    'LOG_DIR',
+    './logs'
+  ),
+
   notificationCooldown: assertInt(
     optionalEnv('NOTIFICATION_COOLDOWN', '30'),
-    'NOTIFICATION_COOLDOWN', 10, 3600
+    'NOTIFICATION_COOLDOWN',
+    10,
+    3600
   ),
+
   statsIntervalMs: assertInt(
     optionalEnv('STATS_INTERVAL_MS', '60000'),
-    'STATS_INTERVAL_MS', 10000, 3600000
+    'STATS_INTERVAL_MS',
+    10000,
+    3600000
   ),
+
   adminUserIds: csvEnv('ADMIN_USER_IDS'),
+
   maxRetries: assertInt(
     optionalEnv('MAX_RETRIES', '3'),
-    'MAX_RETRIES', 1, 10
+    'MAX_RETRIES',
+    1,
+    10
   ),
+
   retryDelayMs: assertInt(
     optionalEnv('RETRY_DELAY_MS', '2000'),
-    'RETRY_DELAY_MS', 500, 30000
+    'RETRY_DELAY_MS',
+    500,
+    30000
   ),
+
   buttonDelayMs: assertInt(
     optionalEnv('BUTTON_DELAY_MS', '500'),
-    'BUTTON_DELAY_MS', 0, 5000
+    'BUTTON_DELAY_MS',
+    0,
+    5000
   ),
+
   reactionDelayMs: assertInt(
     optionalEnv('REACTION_DELAY_MS', '300'),
-    'REACTION_DELAY_MS', 0, 5000
+    'REACTION_DELAY_MS',
+    0,
+    5000
   ),
-  webhookUrl: optionalEnv('WEBHOOK_URL', ''),
+
+  // Global win webhook only.
+  // No per-user/custom webhook.
   winWebhookUrl: optionalEnv('WIN_WEBHOOK_URL', ''),
 };
-CONFIG.monitoredChannels.forEach((id, i) => assertSnowflake(id, `MONITORED_CHANNELS[${i}]`));
-assertSnowflake(CONFIG.trackerChannelId, 'TRACKER_CHANNEL_ID');
+
+CONFIG.monitoredChannels.forEach((id, i) =>
+  assertSnowflake(
+    id,
+    `MONITORED_CHANNELS[${i}]`
+  )
+);
+
+assertSnowflake(
+  CONFIG.trackerChannelId,
+  'TRACKER_CHANNEL_ID'
+);
+
 if (CONFIG.scrimChannelId) {
-  assertSnowflake(CONFIG.scrimChannelId, 'SCRIM_CHANNEL_ID');
+  assertSnowflake(
+    CONFIG.scrimChannelId,
+    'SCRIM_CHANNEL_ID'
+  );
 }
+
 if (CONFIG.eventChannelId) {
-  assertSnowflake(CONFIG.eventChannelId, 'EVENT_CHANNEL_ID');
+  assertSnowflake(
+    CONFIG.eventChannelId,
+    'EVENT_CHANNEL_ID'
+  );
 }
-CONFIG.adminUserIds.forEach((id, i) => assertSnowflake(id, `ADMIN_USER_IDS[${i}]`));
+
+CONFIG.adminUserIds.forEach((id, i) =>
+  assertSnowflake(
+    id,
+    `ADMIN_USER_IDS[${i}]`
+  )
+);
+
 if (CONFIG.tokens.length === 0) {
-  throw new Error('At least one token is required in DISCORD_TOKENS');
+  throw new Error(
+    'At least one token is required in DISCORD_TOKENS'
+  );
 }
+
 const mongoUri = process.env.MONGO_URI;
+
 if (!mongoUri) {
-  console.warn('[Config] Warning: MONGO_URI not set — database will not connect');
+  console.warn(
+    '[Config] Warning: MONGO_URI not set — database will not connect'
+  );
 }
+
 const ownerId = process.env.OWNER_ID;
+
 if (!ownerId) {
-  console.warn('[Config] Warning: OWNER_ID not set — license panel will not work');
+  console.warn(
+    '[Config] Warning: OWNER_ID not set — license panel will not work'
+  );
 } else if (!/^\d{17,19}$/.test(ownerId)) {
-  console.warn('[Config] Warning: OWNER_ID is not a valid Discord Snowflake');
+  console.warn(
+    '[Config] Warning: OWNER_ID is not a valid Discord Snowflake'
+  );
 }
+
 const premiumRoleId = process.env.PREMIUM_ROLE_ID;
+
 if (!premiumRoleId) {
-  console.warn('[Config] Warning: PREMIUM_ROLE_ID not set — premium checks will not work');
+  console.warn(
+    '[Config] Warning: PREMIUM_ROLE_ID not set — premium checks will not work'
+  );
 } else if (!/^\d{17,19}$/.test(premiumRoleId)) {
-  console.warn('[Config] Warning: PREMIUM_ROLE_ID is not a valid Discord Snowflake');
+  console.warn(
+    '[Config] Warning: PREMIUM_ROLE_ID is not a valid Discord Snowflake'
+  );
 }
+
 console.log('[Config] Loaded successfully');
 console.log(`  - Accounts: ${CONFIG.tokens.length}`);
 console.log(`  - Bot Token: ${CONFIG.botToken ? 'Set' : 'Missing'}`);
-console.log(`  - Tracker Channel: ${CONFIG.trackerChannelId ? 'Set' : 'Missing'}`);
-console.log(`  - Scrim Channel: ${CONFIG.scrimChannelId || 'Not set (will use tracker channel)'}`);
-console.log(`  - Event Channel: ${CONFIG.eventChannelId || 'Not set (will use tracker channel)'}`);
-console.log(`  - Monitored Channels: ${CONFIG.monitoredChannels.length || 'All'}`);
-console.log(`  - MongoDB: ${mongoUri ? 'Set' : 'Missing'}`);
-console.log(`  - Log Level: ${CONFIG.logLevel}`);
-console.log(`  - Notification Cooldown: ${CONFIG.notificationCooldown}s`);
-console.log(`  - Admins: ${CONFIG.adminUserIds.length || 'None'}`);
-console.log(`  - Owner ID: ${ownerId ? 'Set' : 'Missing'}`);
-console.log(`  - Premium Role ID: ${premiumRoleId ? 'Set' : 'Missing'}`);
-console.log(`  - AutoJoin Settings:`);
-console.log(`    - Max Retries: ${CONFIG.maxRetries}`);
-console.log(`    - Retry Delay: ${CONFIG.retryDelayMs}ms`);
-console.log(`    - Button Delay: ${CONFIG.buttonDelayMs}ms`);
-console.log(`  - Webhooks: ${CONFIG.webhookUrl ? 'Set' : 'Not set'} | ${CONFIG.winWebhookUrl ? 'Win webhook set' : 'Win webhook not set'}`);
-console.log(`  - AutoJoiner: Monitors ALL servers (no GUILD_ID required)`);
+console.log(
+  `  - Tracker Channel: ${
+    CONFIG.trackerChannelId ? 'Set' : 'Missing'
+  }`
+);
+console.log(
+  `  - Scrim Channel: ${
+    CONFIG.scrimChannelId ||
+    'Not set (will use tracker channel)'
+  }`
+);
+console.log(
+  `  - Event Channel: ${
+    CONFIG.eventChannelId ||
+    'Not set (will use tracker channel)'
+  }`
+);
+console.log(
+  `  - Monitored Channels: ${
+    CONFIG.monitoredChannels.length || 'All'
+  }`
+);
+console.log(
+  `  - MongoDB: ${
+    mongoUri ? 'Set' : 'Missing'
+  }`
+);
+console.log(
+  `  - Log Level: ${CONFIG.logLevel}`
+);
+console.log(
+  `  - Notification Cooldown: ${CONFIG.notificationCooldown}s`
+);
+console.log(
+  `  - Admins: ${
+    CONFIG.adminUserIds.length || 'None'
+  }`
+);
+console.log(
+  `  - Owner ID: ${
+    ownerId ? 'Set' : 'Missing'
+  }`
+);
+console.log(
+  `  - Premium Role ID: ${
+    premiumRoleId ? 'Set' : 'Missing'
+  }`
+);
+
+console.log('  - AutoJoin Settings:');
+console.log(
+  `    - Max Retries: ${CONFIG.maxRetries}`
+);
+console.log(
+  `    - Retry Delay: ${CONFIG.retryDelayMs}ms`
+);
+console.log(
+  `    - Button Delay: ${CONFIG.buttonDelayMs}ms`
+);
+
+console.log(
+  `  - Win Webhook: ${
+    CONFIG.winWebhookUrl ? 'Set' : 'Not set'
+  }`
+);
+
+console.log(
+  '  - AutoJoiner: Monitors ALL servers (no GUILD_ID required)'
+);
