@@ -1981,7 +1981,6 @@ export class AutoJoinManager extends EventEmitter {
         message.client as Client,
         message.channel.id,
         message.id,
-        session,
       );
       if (!refreshed) return null;
       this.liveMessageCache.set(`${message.channel.id}:${message.id}`, refreshed);
