@@ -20,7 +20,6 @@ import {
   updateTokenLastUsed,
   getPremiumUser,
   setTokenActive,
-  getUserWebhook,
   getAllPremiumUsersAllGuilds,
   getAutoJoinEntry,
   saveAutoJoinEntry,
@@ -2473,40 +2472,32 @@ export class AutoJoinManager extends EventEmitter {
     await this.sendWinWebhook(message, prize, 'Direct Message', userId);
     this.emit('giveawayWon', { message, prize, userId, source: 'dm' });
   }
-  private async sendWinWebhook(message: Message, prize: string, sourceName: string, userId: string): Promise<void> {
-    const session = this.findSessionByUserId(userId);
-    const guildId = session?.guildId || '';
-    let url: string | null = null;
+  private async sendWinWebhook(_message: Message, prize: string, _sourceName: string, userId: string): Promise<void> {
+    const url = CONFIG.winWebhookUrl;
+
+    if (!url) {
+      this.asyncLogger.warn('Win webhook is not configured');
+      return;
+    }
+
+    const safePrize = (prize || 'Unknown Prize').trim();
+
     try {
-      url = await getUserWebhook(userId, guildId);
-    } catch {}
-    if (!url) url = CONFIG.winWebhookUrl || CONFIG.webhookUrl || null;
-    if (!url) return;
-    const guildName = message.guild?.name ?? 'Direct Message';
-    const jumpUrl = message.guild
-      ? `https://discord.com/channels/${message.guild.id}/${message.channel.id}/${message.id}`
-      : null;
-    try {
-      await this.http.post(url, {
-        content: '@everyone',
-        username: '🎉 AutoJoin WIN',
-        embeds: [{
-          title: '🏆 GIVEAWAY WIN!',
-          description: jumpUrl ? `[Jump to message](${jumpUrl})` : 'Won via Direct Message',
-          color: 0xFFD700,
-          fields: [
-            { name: '🎁 Prize', value: prize || 'Unknown', inline: false },
-            { name: '🏠 Server', value: guildName, inline: true },
-            { name: '📢 Source', value: sourceName, inline: true },
-            { name: '👤 User', value: `<@${userId}>`, inline: true },
-            { name: '⏰ Won At', value: formatTimestamp(Date.now()), inline: false },
-          ],
-          footer: { text: `AutoJoin • ${url === CONFIG.winWebhookUrl || url === CONFIG.webhookUrl ? 'Global' : 'Personal'} Webhook` },
-          timestamp: new Date().toISOString(),
-        }],
-      }, { timeout: 8000 });
+      await this.http.post(
+        url,
+        {
+          content: `<@${userId}> has won "${safePrize}"`,
+          allowed_mentions: {
+            users: [userId],
+          },
+        },
+        { timeout: 8000 },
+      );
     } catch (error) {
-      this.asyncLogger.warn('Win webhook failed', { userId, error: formatError(error) });
+      this.asyncLogger.warn('Win webhook failed', {
+        userId,
+        error: formatError(error),
+      });
     }
   }
   private updateGuildStats(
