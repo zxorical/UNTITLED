@@ -2627,10 +2627,14 @@ export class AutoJoinManager extends EventEmitter {
     for (const session of this.sessions.values()) {
       if (this.isShuttingDown || session.destroyed) continue;
 
-      const client = session.client as any;
-      const readyState = client.ws?.connection?.readyState;
+      const client = session.client;
+      // discord.js-selfbot-v13 does not expose the websocket's readyState
+      // publicly. Do not reach into WebSocketManager internals here.
+      // isReady() is the supported connection-state check; gateway activity
+      // below handles the more important case where the client reports ready
+      // but silently stops receiving events.
       const isReady = client.isReady?.() === true;
-      const isConnected = isReady && readyState === 1;
+      const isConnected = isReady;
 
       if (!isConnected) {
         session.isActive = false;
@@ -2714,30 +2718,15 @@ export class AutoJoinManager extends EventEmitter {
         forceReplace,
       });
 
-      if (!forceReplace) {
-        try {
-          session.client.ws?.reconnect?.();
-          // Give the existing client a chance to emit resumed/ready.
-          await delay(12000);
-          if (!session.destroyed && session.client.isReady?.() === true &&
-              session.client.ws?.connection?.readyState === 1 &&
-              Date.now() - session.lastGatewayActivityAt < GATEWAY_STALE_AFTER_MS) {
-            session.reconnectInProgress = false;
-            session.staleRecoveryStartedAt = 0;
-            await this.refreshGatewaySessionId(session);
-            this.asyncLogger.info('✅ Existing gateway recovered session', { userId: session.userId });
-            return true;
-          }
-        } catch (error) {
-          this.asyncLogger.warn('⚠️ Existing gateway reconnect failed', {
-            userId: session.userId, error: formatError(error),
-          });
-        }
-      }
-
+      // WebSocketManager.reconnect() is private in discord.js-selfbot-v13,
+      // and its internal connection/readyState property is not part of the
+      // public TypeScript API. More importantly, a silently stalled client
+      // can report READY while still being unusable. Replace the client
+      // instead of reaching into websocket internals.
+      //
       // The old client is considered poisoned. Replacing it is safer than
-      // endlessly calling reconnect() on a socket that reports OPEN but is not
-      // delivering events. Do NOT count this as a token failure.
+      // trying to revive an internal websocket object. Do NOT count this as
+      // a token failure.
       session.recoveryGeneration++;
       const userId = session.userId;
       const guildId = session.guildId;
