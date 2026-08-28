@@ -11,8 +11,8 @@ export interface AppConfig {
   tokens: string[];
   botToken: string;
   trackerChannelId: string;
-  scrimChannelId: string;    // NEW: Channel for scrim notifications
-  eventChannelId: string;    // NEW: Channel for event notifications (squid game, gagaball)
+  scrimChannelId: string;
+  eventChannelId: string;
   monitoredChannels: string[];
   dbPath: string;
   logLevel: string;
@@ -20,13 +20,12 @@ export interface AppConfig {
   notificationCooldown: number;
   statsIntervalMs: number;
   adminUserIds: string[];
-  
+
   // AutoJoin settings
   maxRetries: number;
   retryDelayMs: number;
   buttonDelayMs: number;
   reactionDelayMs: number;
-  webhookUrl: string;
   winWebhookUrl: string;
 }
 
