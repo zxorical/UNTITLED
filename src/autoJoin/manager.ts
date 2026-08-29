@@ -65,6 +65,7 @@ interface GiveawayEntry {
   detectionConfidence: number;
   detectionReasons: string[];
   crosspostSource?: string;
+  message?: Message;
 }
 interface AutoJoinEntry {
   _id: string;
@@ -975,6 +976,7 @@ export class AutoJoinManager extends EventEmitter {
   private sessionStartPromises: Map<string, Promise<boolean>> = new Map();
   private queueProcessorPromises: Map<string, Promise<void>> = new Map();
   private detectionInFlight: Map<string, Set<string>> = new Map();
+  private latestDetectionMessages: Map<string, { message: Message; kind: 'create' | 'update' }> = new Map();
   private detectionStartedCount = 0;
   private workerId: string;
   private memoryWarningLogged = false;
@@ -1049,11 +1051,12 @@ export class AutoJoinManager extends EventEmitter {
     });
   }
   private async initialize(): Promise<void> {
-    await this.joinQueue.restore();
-    const drainResult = this.joinQueue.emergencyDrain(3600000);
-    if (drainResult.clearedDeadLetters > 0 || drainResult.clearedPending > 0) {
-      this.asyncLogger.info('🧹 Startup queue drain complete', drainResult);
-    }
+    try {
+      const drainResult = this.joinQueue.emergencyDrain(3600000);
+      if (drainResult.clearedDeadLetters > 0 || drainResult.clearedPending > 0) {
+        this.asyncLogger.info('🧹 Startup queue drain complete', drainResult);
+      }
+    } catch {}
   }
   private getMemoryUsage(): { heapUsedMB: number; heapTotalMB: number; rssMB: number } {
     const mem = process.memoryUsage();
@@ -1540,8 +1543,14 @@ export class AutoJoinManager extends EventEmitter {
 
     const messageCreateHandler = (message: Message) => dispatchMessage(message, 'create');
     const messageUpdateHandler = (oldMessage: Message | PartialMessage, updated: Message | PartialMessage) => {
-      const message = (updated.guild ? updated : oldMessage) as Message;
-      dispatchMessage(message, 'update');
+      const updatedAny = updated as any;
+      const oldAny = oldMessage as any;
+      const authorId = updatedAny.author?.id ?? oldAny.author?.id;
+      if (authorId !== GIVEAWAY_BOT_ID) return;
+      if (!updatedAny.guild && oldAny.guild) updatedAny.guild = oldAny.guild;
+      if (!updatedAny.channel && oldAny.channel) updatedAny.channel = oldAny.channel;
+      if (!updatedAny.author && oldAny.author) updatedAny.author = oldAny.author;
+      dispatchMessage(updatedAny as Message, 'update');
     };
 
     const rawHandler = (_packet: any) => {
@@ -1700,9 +1709,10 @@ export class AutoJoinManager extends EventEmitter {
     const inFlight = this.detectionInFlight.get(session.userId) ?? new Set<string>();
     this.detectionInFlight.set(session.userId, inFlight);
 
-    // Do not run the same message concurrently. messageUpdate is expected and
-    // will be ignored if it arrives while the same event is being processed.
-    if (inFlight.has(entryId)) return;
+    if (inFlight.has(entryId)) {
+      this.latestDetectionMessages.set(entryId, { message, kind });
+      return;
+    }
 
     this.metrics.totalMessagesProcessed++;
     this.liveMessageCache.set(`${message.channel.id}:${message.id}`, message);
@@ -1807,6 +1817,7 @@ export class AutoJoinManager extends EventEmitter {
         correlationId,
         detectionConfidence: 1,
         detectionReasons: ['gateway_components', kind, `queue_wait_${Math.max(0, detectionStarted - queuedAt)}ms`],
+        message,
       };
 
       this.messageCache.set(cacheKey, {
@@ -1832,7 +1843,8 @@ export class AutoJoinManager extends EventEmitter {
 
       // Do not make MongoDB part of the critical join path. The in-memory entry
       // already contains everything needed to enter the giveaway.
-      void saveAutoJoinEntry(entryData as Omit<AutoJoinEntry, '_id'>)
+      const { message: _liveMessage, ...persistedEntryData } = entryData;
+      void saveAutoJoinEntry(persistedEntryData as Omit<AutoJoinEntry, '_id'>)
         .then(() => { this.metrics.dbQueries++; })
         .catch(error => {
           this.asyncLogger.warn('AutoJoin: background entry save failed', {
@@ -1842,10 +1854,19 @@ export class AutoJoinManager extends EventEmitter {
           });
         });
 
-      await this.queueOrEnter(entryId, session, entryData, correlationId);
+      this.queueOrEnter(entryId, session, entryData, correlationId);
     } finally {
       this.processingCache.delete(entryId);
       this.detectionInFlight.get(session.userId)?.delete(entryId);
+      const latest = this.latestDetectionMessages.get(entryId);
+      if (latest) {
+        this.latestDetectionMessages.delete(entryId);
+        const latestButton = this.extractEntryButton(latest.message);
+        const cached = this.messageCache.get(cacheKey);
+        if (latestButton && (!cached || latestButton.customId !== cached.buttonCustomId)) {
+          this.dispatchGiveawayDetection(session, latest.message, latest.kind);
+        }
+      }
     }
   }
   private async detectGiveawaySimple(message: Message): Promise<{ button?: GiveawayButton; prize: string } | null> {
@@ -1927,46 +1948,21 @@ export class AutoJoinManager extends EventEmitter {
     }
     return null;
   }
-  private async queueOrEnter(
+  private queueOrEnter(
     entryId: string,
     session: UserSession,
     entry: GiveawayEntry,
     correlationId: string
   ): Promise<void> {
-    const queueItem: QueueItem = {
-      entryId,
-      userId: session.userId,
-      guildId: entry.guildId,
-      channelId: entry.channelId,
-      messageId: entry.messageId,
-      priority: entry.endsAt ? Math.max(0, entry.endsAt - Date.now()) : 999999,
-      addedAt: Date.now(),
-      endsAt: entry.endsAt,
-      correlationId,
-      attempts: 0,
-      maxAttempts: CONFIG.maxRetries + 1,
-      buttonCustomId: entry.buttonCustomId,
-      cachedButtonId: entry.buttonCustomId,
-      cachedPrize: entry.prize,
-      cachedGuildName: entry.guildName,
-      cachedChannelName: entry.channelName,
-    };
-    const enqueued = this.joinQueue.enqueue(queueItem);
-    if (enqueued) {
-      // Queue state is in memory and the join worker can start immediately.
-      // Do not put a MongoDB write between detection and the click.
-      this.startQueueProcessor(session.userId);
-    } else {
-      // The queue is saturated; try the entry directly rather than silently
-      // dropping a live giveaway.
-      void this.enterGiveaway(entryId, session, entry).catch(error => {
-        this.asyncLogger.error('Direct giveaway entry failed after queue saturation', {
-          userId: session.userId,
-          messageId: entry.messageId,
-          error: formatError(error),
-        });
+    void correlationId;
+    void this.enterGiveaway(entryId, session, entry).catch(error => {
+      this.asyncLogger.error('AutoJoin: immediate giveaway entry failed', {
+        userId: session.userId,
+        messageId: entry.messageId,
+        guildId: entry.guildId,
+        error: formatError(error),
       });
-    }
+    });
   }
   private startQueueProcessor(userId: string): void {
     if (this.isShuttingDown) return;
@@ -2102,19 +2098,17 @@ export class AutoJoinManager extends EventEmitter {
       try {
         const skipped = await this.enterViaButton(entry as GiveawayEntry, session);
         if (skipped) {
-          await updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'skipped', {});
-          this.metrics.dbQueries++;
+          void updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'skipped', {}).then(() => { this.metrics.dbQueries++; }).catch(() => {});
           return;
         }
         session.stats.entered++;
         session.stats.lastEntryAt = Date.now();
         this.metrics.totalEntriesSucceeded++;
-        await updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'success', {
+        void updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'success', {
           attempts: attemptNum,
-        });
-        this.metrics.dbQueries++;
-        await incrementTokenEntries(session.userId, session.guildId);
-        await updateTokenLastUsed(session.userId, session.guildId);
+        }).then(() => { this.metrics.dbQueries++; }).catch(() => {});
+        void incrementTokenEntries(session.userId, session.guildId).catch(() => {});
+        void updateTokenLastUsed(session.userId, session.guildId).catch(() => {});
         this.joinOutcomeBuffer.push({
           userId: session.userId,
           messageId: entry.messageId,
@@ -2145,18 +2139,15 @@ export class AutoJoinManager extends EventEmitter {
         if (errorMsg.includes('already entered') ||
             errorMsg.includes('already joined') ||
             errorMsg.includes('already participating')) {
-          await updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'skipped', {
+          void updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'skipped', {
             lastError: 'Already entered',
-          });
-          this.metrics.dbQueries++;
-          this.joinQueue.cancelGiveaway(entry.messageId, entry.channelId);
+          }).then(() => { this.metrics.dbQueries++; }).catch(() => {});
           return;
         }
         if (errorMsg.includes('No buttonCustomId set')) {
-          await updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'skipped', {
+          void updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'skipped', {
             lastError: 'No button found - not a valid giveaway entry',
-          });
-          this.metrics.dbQueries++;
+          }).then(() => { this.metrics.dbQueries++; }).catch(() => {});
           return;
         }
         const lowerError = errorMsg.toLowerCase();
@@ -2175,11 +2166,10 @@ export class AutoJoinManager extends EventEmitter {
           }
           if (isNoResponse) continue;
         }
-        await updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'attempting', {
+        void updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'attempting', {
           attempts: attemptNum,
           lastError: errorMsg
-        });
-        this.metrics.dbQueries++;
+        }).then(() => { this.metrics.dbQueries++; }).catch(() => {});
         this.asyncLogger.warn(`AutoJoin: Attempt ${attemptNum}/${maxAttempts} failed`, {
           correlationId, userId: session.userId, entryId, error: errorMsg, worker: this.workerId,
         });
@@ -2200,11 +2190,10 @@ export class AutoJoinManager extends EventEmitter {
       buttonCustomId: entry.buttonCustomId,
     };
     this.joinQueue.moveToDeadLetter(queueItem, 'All retries exhausted');
-    await updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'dead_letter', {
+    void updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'dead_letter', {
       lastError: 'All retries exhausted',
       attempts: maxAttempts,
-    });
-    this.metrics.dbQueries++;
+    }).then(() => { this.metrics.dbQueries++; }).catch(() => {});
     session.stats.failed++;
     this.metrics.totalEntriesFailed++;
     this.asyncLogger.error('❌ AutoJoin: All retries exhausted - moved to dead letter', {
@@ -2235,7 +2224,7 @@ export class AutoJoinManager extends EventEmitter {
     }
 
     const cacheKey = `${entry.channelId}:${entry.messageId}`;
-    let message = this.liveMessageCache.get(cacheKey) ?? null;
+    let message = entry.message ?? this.liveMessageCache.get(cacheKey) ?? null;
 
     // Use the normal discord.js cache as a second fast path. Neither path
     // requires a network request when the gateway already delivered the message.
@@ -2755,7 +2744,6 @@ export class AutoJoinManager extends EventEmitter {
   private startQueuePersister(): void {
     this.queuePersistInterval = setInterval(() => {
       if (this.isShuttingDown) return;
-      this.joinQueue.persist().catch(() => {});
     }, QUEUE_PERSIST_INTERVAL_MS);
     if (this.queuePersistInterval.unref) this.queuePersistInterval.unref();
   }
@@ -3072,6 +3060,9 @@ export class AutoJoinManager extends EventEmitter {
     session.isActive = false;
     this.queueProcessorPromises.delete(userId);
     this.detectionInFlight.delete(userId);
+    for (const key of this.latestDetectionMessages.keys()) {
+      if (key.startsWith(`${userId}:`)) this.latestDetectionMessages.delete(key);
+    }
     try {
       this.cleanupSessionListeners(session);
       this.clearClientCaches(session.client);
@@ -3137,6 +3128,7 @@ export class AutoJoinManager extends EventEmitter {
     }
     this.queueProcessorPromises.clear();
     this.detectionInFlight.clear();
+    this.latestDetectionMessages.clear();
     await this.joinQueue.persist();
     if (this.joinOutcomeBuffer.length > 0) {
       try { await batchSaveJoinOutcomes(this.joinOutcomeBuffer); } catch {}
