@@ -1556,17 +1556,6 @@ export class AutoJoinManager extends EventEmitter {
         return;
       }
 
-      const channelId = (message as any)?.channelId ?? (message as any)?.channel?.id;
-      if (!channelId || !message.id) {
-        this.asyncLogger.debug('AutoJoin: ignored event with missing message identity', {
-          userId,
-          messageId: (message as any)?.id,
-          channelId,
-          kind,
-        });
-        return;
-      }
-
       const age = Date.now() - message.createdTimestamp;
       this.metrics.totalMessagesProcessed++;
       this.liveMessageCache.set(`${channelId}:${message.id}`, message);
