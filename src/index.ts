@@ -1,4 +1,4 @@
-*/**
+/**
  * @module index
  * Application entry point – supervised / self-healing version.
  *
