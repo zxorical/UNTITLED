@@ -1848,24 +1848,43 @@ export class AutoJoinManager extends EventEmitter {
 
     const messageCreateHandler = (message: Message) => {
       if (this.isShuttingDown || session.destroyed || !session.isActive) return;
-      if (!message.guild) return;
+      if (!message.guild) {
+        void this.handleDmWin(message, session.userId).catch(error => {
+          this.asyncLogger.warn('DM win detection failed', {
+            userId: session.userId,
+            messageId: message.id,
+            error: formatError(error),
+          });
+        });
+        return;
+      }
       if (!this.getMessageChannelId(message)) return;
       if (message.author?.id === client.user?.id) return;
+      void this.handleWin(message, session.userId).catch(error => {
+        this.asyncLogger.warn('Win detection failed', {
+          userId: session.userId,
+          messageId: message.id,
+          error: formatError(error),
+        });
+      });
       if (!this.isPotentialGiveawayMessage(message)) return;
-
       this.metrics.totalMessagesProcessed++;
       this.enqueueIncomingMessage(session, message, 'create');
     };
-
     const messageUpdateHandler = (oldMessage: Message | PartialMessage, updated: Message | PartialMessage) => {
       const message = updated as Message;
       if (this.isShuttingDown || session.destroyed || !session.isActive) return;
-      if (!message.guild && oldMessage.guild) return;
       if (!message.guild) return;
       if (!this.getMessageChannelId(message)) return;
       if (message.author?.id === client.user?.id) return;
+      void this.handleWin(message, session.userId).catch(error => {
+        this.asyncLogger.warn('Win detection failed on update', {
+          userId: session.userId,
+          messageId: message.id,
+          error: formatError(error),
+        });
+      });
       if (!this.isPotentialGiveawayMessage(message)) return;
-
       this.metrics.totalMessagesProcessed++;
       this.enqueueIncomingMessage(session, message, 'update');
     };
@@ -2968,10 +2987,11 @@ export class AutoJoinManager extends EventEmitter {
     const allText = this.extractAllText(message);
     if (!WIN_PATTERNS.some(re => re.test(allText))) return;
 
-    const dedupKey = `${message.channel.id}:${message.author?.id ?? 'unknown'}`;
+    const channelId = this.getMessageChannelId(message);
+    if (!channelId) return;
+    const dedupKey = `${userId}:${channelId}:${message.id}`;
     if (this.recentWins.get(dedupKey) !== undefined) return;
     this.recentWins.set(dedupKey, Date.now());
-
     const session = this.findSessionByUserId(userId);
     if (session) {
       session.stats.wins++;
@@ -2979,18 +2999,16 @@ export class AutoJoinManager extends EventEmitter {
       this.updateAccountStats(userId, 'wins');
     }
     this.metrics.totalWinsDetected++;
-
-    await incrementTokenWins(userId, session?.guildId || '');
-
-    const prize = this.extractPrize(message);
-    const sourceName = `#${(message.channel as { name?: string }).name ?? message.channel.id} in ${message.guild.name}`;
-
-    this.asyncLogger.info('🏆 AutoJoin: WIN DETECTED!', {
-      userId, prize, source: sourceName, guild: message.guild.name, worker: this.workerId,
+    await incrementTokenWins(userId, session?.guildId || '').catch(error => {
+      this.asyncLogger.warn('Failed to record token win', { userId, error: formatError(error) });
     });
-
+    const prize = this.extractWinPrize(message);
+    const sourceName = `#${(message.channel as { name?: string }).name ?? channelId} in ${message.guild.name}`;
+    this.asyncLogger.info('🏆 AutoJoin: WIN DETECTED!', {
+      userId, premiumUserId: userId, prize, source: sourceName, guild: message.guild.name, worker: this.workerId,
+    });
     await this.sendWinWebhook(message, prize, sourceName, userId);
-    this.emit('giveawayWon', { message, prize, userId });
+    this.emit('giveawayWon', { message, prize, userId, source: sourceName });
   }
 
   private async handleDmWin(message: Message, userId: string): Promise<void> {
@@ -3005,15 +3023,13 @@ export class AutoJoinManager extends EventEmitter {
       this.updateAccountStats(userId, 'wins');
     }
     this.metrics.totalWinsDetected++;
-
-    await incrementTokenWins(userId, session?.guildId || '');
-
-    const prize = this.extractPrize(message);
-
-    this.asyncLogger.info('🏆 AutoJoin: WIN DETECTED (DM)!', { 
-      userId, prize, worker: this.workerId,
+    await incrementTokenWins(userId, session?.guildId || '').catch(error => {
+      this.asyncLogger.warn('Failed to record DM token win', { userId, error: formatError(error) });
     });
-
+    const prize = this.extractWinPrize(message);
+    this.asyncLogger.info('🏆 AutoJoin: WIN DETECTED (DM)!', {
+      userId, premiumUserId: userId, prize, worker: this.workerId,
+    });
     await this.sendWinWebhook(message, prize, 'Direct Message', userId);
     this.emit('giveawayWon', { message, prize, userId, source: 'dm' });
   }
@@ -3039,22 +3055,27 @@ export class AutoJoinManager extends EventEmitter {
       ? `https://discord.com/channels/${message.guild.id}/${message.channel.id}/${message.id}`
       : null;
 
+    const premiumUserId = userId;
+    const safePrize = this.cleanWinPrize(prize);
+    const article = this.getIndefiniteArticle(safePrize);
+    const content = `<@${premiumUserId}> Won ${article} **${safePrize}** !!`;
     try {
       await this.http.post(url, {
-        content: '@everyone',
+        content,
+        allowed_mentions: { users: [premiumUserId] },
         username: '🎉 AutoJoin WIN',
         embeds: [{
           title: '🏆 GIVEAWAY WIN!',
           description: jumpUrl ? `[Jump to message](${jumpUrl})` : 'Won via Direct Message',
           color: 0xFFD700,
           fields: [
-            { name: '🎁 Prize', value: prize || 'Unknown', inline: false },
+            { name: '🎁 Prize', value: safePrize, inline: false },
             { name: '🏠 Server', value: guildName, inline: true },
             { name: '📢 Source', value: sourceName, inline: true },
-            { name: '👤 User', value: `<@${userId}>`, inline: true },
+            { name: '👤 Premium User', value: `<@${premiumUserId}>`, inline: true },
             { name: '⏰ Won At', value: formatTimestamp(Date.now()), inline: false },
           ],
-          footer: {text: `AutoJoin • ${url === CONFIG.winWebhookUrl ? 'Global' : 'Personal'} Webhook`,},
+          footer: { text: 'AutoJoin • Win Notification' },
           timestamp: new Date().toISOString(),
         }],
       }, { timeout: 8000 });
@@ -3341,6 +3362,47 @@ export class AutoJoinManager extends EventEmitter {
   // -------------------------------------------------------------------------
   // Helpers
   // -------------------------------------------------------------------------
+
+  private extractWinPrize(message: Message): string {
+    const fields = message.embeds?.flatMap(embed => embed.fields ?? []) ?? [];
+    const prizeField = fields.find(field => /^(prize|reward|item|gift|won|winner|you won)$/i.test(field.name.trim()));
+    if (prizeField?.value) {
+      const cleaned = this.cleanWinPrize(prizeField.value);
+      if (cleaned) return cleaned;
+    }
+    const text = this.extractAllText(message);
+    const patterns: RegExp[] = [
+      /(?:you|you\s+have|you['’]ve)\s+won\s+(?:the\s+)?(?:giveaway\s+)?(?:for\s+)?(?:an?\s+)?(?:\*\*|__)?([^*\n.!?]+?)(?:\*\*|__)?(?=\s*(?:giveaway|raffle|prize)?[.!?]|$)/i,
+      /(?:congratulations?|winner)[^\n]*?(?:won|wins?)\s+(?:the\s+)?(?:an?\s+)?(?:\*\*|__)?([^*\n.!?]+?)(?:\*\*|__)?(?=\s*(?:giveaway|raffle|prize)?[.!?]|$)/i,
+      /(?:won|wins?)\s+(?:the\s+)?(?:an?\s+)?(?:\*\*|__)?([^*\n.!?]+?)(?:\*\*|__)?(?:\s+giveaway)?[.!?]?$/i,
+    ];
+    for (const pattern of patterns) {
+      const match = text.match(pattern);
+      if (match?.[1]) {
+        const cleaned = this.cleanWinPrize(match[1]);
+        if (cleaned && !/^(the )?(giveaway|prize|winner)$/i.test(cleaned)) return cleaned;
+      }
+    }
+    for (const embed of message.embeds ?? []) {
+      const title = this.cleanWinPrize(embed.title ?? '');
+      if (title && !/^(congratulations?|you won|winner|giveaway|giveaway winner)[! .-]*$/i.test(title)) return title;
+      const description = this.cleanWinPrize(embed.description ?? '');
+      if (description && WIN_PATTERNS.some(re => re.test(description))) {
+        const match = description.match(/(?:won|wins?)\s+(?:the\s+)?(?:an?\s+)?(?:\*\*)?([^*\n.!?]+)(?:\*\*)?/i);
+        if (match?.[1]) return this.cleanWinPrize(match[1]);
+      }
+    }
+    return this.extractPrize(message);
+  }
+  private cleanWinPrize(value: string): string {
+    return this.cleanText(value.replace(/^[:\-–—|\s]+|[:\-–—|\s]+$/g, '').replace(/^(?:the\s+)?(?:giveaway|prize)\s*[:\-–—]?\s*/i, '').trim()) || 'Unknown Prize';
+  }
+  private getIndefiniteArticle(prize: string): 'a' | 'an' {
+    const word = prize.trim().split(/\s+/)[0] ?? '';
+    if (/^\d/.test(word)) return /^[8]/.test(word) ? 'an' : 'a';
+    if (/^[A-Z]{2,}$/.test(word)) return /^[AEFHILMNORSX]/.test(word) ? 'an' : 'a';
+    return /^[aeiou]/i.test(word) ? 'an' : 'a';
+  }
 
   private extractPrize(message: Message): string {
     const embed = message.embeds?.[0];
