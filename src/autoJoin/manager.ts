@@ -3031,7 +3031,7 @@ export class AutoJoinManager extends EventEmitter {
       url = await getUserWebhook(userId, guildId);
     } catch {}
 
-    if (!url) url = CONFIG.winWebhookUrl || CONFIG.webhookUrl || null;
+    if (!url) url = CONFIG.winWebhookUrl || null;
     if (!url) return;
 
     const guildName = message.guild?.name ?? 'Direct Message';
@@ -3054,7 +3054,7 @@ export class AutoJoinManager extends EventEmitter {
             { name: '👤 User', value: `<@${userId}>`, inline: true },
             { name: '⏰ Won At', value: formatTimestamp(Date.now()), inline: false },
           ],
-          footer: { text: `AutoJoin • ${url === CONFIG.winWebhookUrl || url === CONFIG.webhookUrl ? 'Global' : 'Personal'} Webhook` },
+          footer: {text: `AutoJoin • ${url === CONFIG.winWebhookUrl ? 'Global' : 'Personal'} Webhook`,},
           timestamp: new Date().toISOString(),
         }],
       }, { timeout: 8000 });
