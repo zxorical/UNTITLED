@@ -297,9 +297,9 @@ const INTERACTION_RETRY_DELAY_MS = 250;
 const NO_RESPONSE_COOLDOWN_MS = 2500;
 const BATCH_DB_WRITE_INTERVAL_MS = 2000;
 const ARCHIVE_AGE_MS = 24 * 60 * 60 * 1000;
-const MAX_QUEUE_SIZE = 5000;
-const MAX_QUEUE_PER_GUILD = 200;
-const MAX_DEAD_LETTER_QUEUE = 1000;
+const MAX_QUEUE_SIZE = 2000;
+const MAX_QUEUE_PER_GUILD = 100;
+const MAX_DEAD_LETTER_QUEUE = 500;
 const MAX_QUEUE_WAIT_SAMPLES = 1000;
 const QUEUE_PERSIST_INTERVAL_MS = 30000;
 const DEAD_LETTER_RETENTION_MS = 3600000;
@@ -317,9 +317,9 @@ const MEMORY_CRITICAL_THRESHOLD_MB = 3500;
 const MEMORY_MAX_THRESHOLD_MB = 5000;
 const RSS_WARNING_THRESHOLD_MB = 4500;
 const RSS_CRITICAL_THRESHOLD_MB = 6000;
-const MAX_LOG_QUEUE_SIZE = 1000;
+const MAX_LOG_QUEUE_SIZE = 500;
 const MAX_SESSION_START_PROMISES = 100;
-const MAX_JOIN_OUTCOME_BUFFER = 2000;
+const MAX_JOIN_OUTCOME_BUFFER = 1000;
 const MAX_TOKEN_FAILURE_TRACKER = 5000;
 const HTTP_MAX_SOCKETS = 50;
 const HTTP_MAX_FREE_SOCKETS = 10;
@@ -338,9 +338,9 @@ const GATEWAY_RECOVERY_COOLDOWN_MS = 45000;
 const MAX_STALE_RECOVERIES = 3;
 const STALE_RECOVERY_WINDOW_MS = 10 * 60 * 1000;
 const DETECTION_STALL_AFTER_MS = 60000;
-const MAX_CONCURRENT_ENTRIES_PER_ACCOUNT = 16;
-const DETECTION_CONCURRENCY_PER_SESSION = 12;
-const MAX_INGEST_QUEUE_SIZE = 20000;
+const MAX_CONCURRENT_ENTRIES_PER_ACCOUNT = 8;
+const DETECTION_CONCURRENCY_PER_SESSION = 4;
+const MAX_INGEST_QUEUE_SIZE = 2000;
 const MAX_DETECTION_MESSAGE_AGE_MS = 30 * 60 * 1000;
 class LRUCache<K, V> {
   private cache: Map<K, { value: V; timestamp: number }>;
@@ -430,7 +430,7 @@ class AsyncLogger {
     }
     this.queue.push({ level, msg, meta });
     this.totalLogged++;
-    if (this.queue.length > 50) this.flush();
+    if (this.queue.length > 50 && !this.processing) void this.flush();
   }
   private async flush(): Promise<void> {
     if (this.processing || this.queue.length === 0) return;
@@ -448,7 +448,7 @@ class AsyncLogger {
       }
     }
     this.processing = false;
-    if (this.queue.length > 0) this.flush();
+    if (this.queue.length > 0 && !this.processing) void this.flush();
   }
   shutdown(): void {
     if (this.interval) {
@@ -1016,7 +1016,7 @@ export class AutoJoinManager extends EventEmitter {
     this.noResponseCooldown = new LRUCache<string, number>(CACHE_MAX_COOLDOWN, NO_RESPONSE_COOLDOWN_MS + 10000);
     this.crosspostCache = new LRUCache<string, string>(CACHE_CROSSPOST, 30 * 60 * 1000);
     this.messageCache = new LRUCache<string, CachedMessageData>(CACHE_MESSAGES, 30000);
-    this.liveMessageCache = new LRUCache<string, Message>(3000, 60000);
+    this.liveMessageCache = new LRUCache<string, Message>(CACHE_MESSAGES, 60000);
     this.joinQueue = new JoinQueue();
     this.tokenManager = new TokenManager();
     this.asyncLogger = new AsyncLogger();
@@ -1327,8 +1327,8 @@ export class AutoJoinManager extends EventEmitter {
         partials: [],
         makeCache: Options.cacheWithLimits({
           MessageManager: 100,
-          UserManager: 1000,
-          GuildMemberManager: 1000,
+          UserManager: 500,
+          GuildMemberManager: 500,
           PresenceManager: 0,
           ReactionManager: 0,
           ThreadManager: 0,
@@ -2256,11 +2256,21 @@ export class AutoJoinManager extends EventEmitter {
           this.metrics.dbQueries++;
           return;
         }
-        const isNoResponse = errorMsg.toLowerCase().includes('no response from application');
-        if (isNoResponse && attempt < maxAttempts - 1) {
-          await delay(100);
-          try { await this.refreshButtonData(entry as GiveawayEntry, session); } catch {}
-          continue;
+        const lowerError = errorMsg.toLowerCase();
+        const isNoResponse = lowerError.includes('no response from application');
+        const isStaleComponent =
+          lowerError.includes('component validation failed') ||
+          lowerError.includes('button is stale') ||
+          lowerError.includes('interaction expired') ||
+          lowerError.includes('button no longer exists');
+
+        if ((isNoResponse || isStaleComponent) && attempt < maxAttempts - 1) {
+          await delay(isStaleComponent ? 150 : 100);
+          const refreshed = await this.refreshButtonData(entry as GiveawayEntry, session);
+          if (refreshed?.buttonCustomId) {
+            continue;
+          }
+          if (isNoResponse) continue;
         }
         await updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'attempting', {
           attempts: attemptNum,
@@ -2464,6 +2474,16 @@ export class AutoJoinManager extends EventEmitter {
             await this.scheduleRetry(session.userId, session.guildId);
             throw new Error(`Token ${status === 401 ? 'invalid' : 'blocked'}`);
           }
+          if (
+            status === 400 &&
+            (errorMessage?.includes('COMPONENT_VALIDATION_FAILED') ||
+              errorMessage?.toLowerCase().includes('component validation failed'))
+          ) {
+            // The component can become stale between gateway delivery and the
+            // click. Do not hammer Discord with identical invalid payloads.
+            throw new Error('Component validation failed; button is stale');
+          }
+
           if (status === 404 || errorMessage?.includes('unknown interaction')) {
             throw new Error('Interaction expired or button no longer exists');
           }
@@ -2628,9 +2648,16 @@ export class AutoJoinManager extends EventEmitter {
       if (this.isShuttingDown || session.destroyed) continue;
 
       const client = session.client as any;
-      const readyState = client.ws?.connection?.readyState;
+      const ws = client.ws;
+      const shard = ws?.shards?.first?.() ?? ws?.shards?.get?.(0);
+      const readyState =
+        ws?.connection?.readyState ??
+        shard?.connection?.readyState ??
+        shard?.ws?.readyState;
       const isReady = client.isReady?.() === true;
-      const isConnected = isReady && readyState === 1;
+      // Some selfbot-v13 versions do not expose a stable readyState property.
+      // In that case READY + recent gateway activity is the useful signal.
+      const isConnected = isReady && (readyState === undefined || readyState === 1);
 
       if (!isConnected) {
         session.isActive = false;
@@ -2716,15 +2743,41 @@ export class AutoJoinManager extends EventEmitter {
 
       if (!forceReplace) {
         try {
-          session.client.ws?.reconnect?.();
+          // discord.js-selfbot-v13 exposes gateway internals that are not part of
+          // its public TypeScript API. Keep this compatibility boundary isolated
+          // so the rest of the manager remains type-safe.
+          const clientAny = session.client as any;
+          const ws = clientAny.ws;
+          if (typeof ws?.reconnect === 'function') {
+            await Promise.resolve(ws.reconnect());
+          } else {
+            throw new Error('Gateway reconnect method is unavailable');
+          }
+
           // Give the existing client a chance to emit resumed/ready.
           await delay(12000);
-          if (!session.destroyed && session.client.isReady?.() === true &&
-              session.client.ws?.connection?.readyState === 1 &&
-              Date.now() - session.lastGatewayActivityAt < GATEWAY_STALE_AFTER_MS) {
+
+          const shard = ws?.shards?.first?.() ?? ws?.shards?.get?.(0);
+          const readyState =
+            ws?.connection?.readyState ??
+            shard?.connection?.readyState ??
+            shard?.ws?.readyState;
+
+          const socketLooksHealthy = readyState === undefined || readyState === 1;
+
+          if (
+            !session.destroyed &&
+            session.client.isReady?.() === true &&
+            socketLooksHealthy &&
+            Date.now() - session.lastGatewayActivityAt < GATEWAY_STALE_AFTER_MS
+          ) {
+            session.isActive = true;
             session.reconnectInProgress = false;
+            session.lastDisconnectAt = 0;
             session.staleRecoveryStartedAt = 0;
+            session.reconnectAttempts = 0;
             await this.refreshGatewaySessionId(session);
+            this.startDetectionProcessor(session.userId);
             this.asyncLogger.info('✅ Existing gateway recovered session', { userId: session.userId });
             return true;
           }
@@ -3265,11 +3318,11 @@ export class AutoJoinManager extends EventEmitter {
     this.sessionRecoveryPromises.clear();
     try { this.httpAgent.destroy(); } catch {}
     try { this.httpsAgent.destroy(); } catch {}
-    this.asyncLogger.shutdown();
-    if (global.gc) global.gc();
     this.asyncLogger.info('✅ AutoJoin shutdown complete', {
       worker: this.workerId, memory: this.getMemoryUsage(),
     });
+    this.asyncLogger.shutdown();
+    if (global.gc) global.gc();
   }
   private logStats(): void {
     const stats = this.getStats();
