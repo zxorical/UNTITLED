@@ -1,5 +1,4 @@
-```ts
-/**
+*/**
  * @module index
  * Application entry point – supervised / self-healing version.
  *
@@ -2877,4 +2876,3 @@ if (global.gc) {
 }
 
 void boot();
-```
