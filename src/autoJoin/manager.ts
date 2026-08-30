@@ -3043,11 +3043,22 @@ export class AutoJoinManager extends EventEmitter {
     await this.http.post(url, {
       content,
       allowed_mentions: { users: [premiumUserId] },
-      username: '🎉 AutoJoin WIN',
+      username: 'AutoJoin WIN',
     }, { timeout: 8000 });
   } catch (error) {
     this.asyncLogger.warn('Win webhook failed', { userId, error: formatError(error) });
   }
+}
+
+private cleanWinPrize(value: string): string {
+  return this.cleanText(value.replace(/^[:\-–—|\s]+|[:\-–—|\s]+$/g, '').replace(/^(?:the\s+)?(?:giveaway|prize)\s*[:\-–—]?\s*/i, '').trim()) || 'Unknown Prize';
+}
+
+private getIndefiniteArticle(prize: string): 'a' | 'an' {
+  const word = prize.trim().split(/\s+/)[0] ?? '';
+  if (/^\d/.test(word)) return /^[8]/.test(word) ? 'an' : 'a';
+  if (/^[A-Z]{2,}$/.test(word)) return /^[AEFHILMNORSX]/.test(word) ? 'an' : 'a';
+  return /^[aeiou]/i.test(word) ? 'an' : 'a';
 }
 
   // -------------------------------------------------------------------------
