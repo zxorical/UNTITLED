@@ -39,9 +39,8 @@ import { decryptToken } from '../premium/tokenManager.js';
 import { CONFIG } from '../config.js';
 process.on('unhandledRejection', (reason: any) => {
   const message = String(reason?.message ?? reason ?? '');
-  if (reason?.code === 500 && message.includes('token was unavailable')) return;
+  if (reason?.code === 500 && reason?.message?.includes('token was unavailable')) return;
   if (reason?.name === 'AbortError' || message.toLowerCase().includes('operation was aborted')) return;
-  if (message.toLowerCase().includes("socket 'secureconnect' timed out")) return;
   logger.error('[Process] Unhandled rejection', { reason: formatError(reason) });
 });
 interface GiveawayEntry {
@@ -956,7 +955,7 @@ export class AutoJoinManager extends EventEmitter {
   private noResponseCooldown: LRUCache<string, number>;
   private crosspostCache: LRUCache<string, string>;
   private messageCache: LRUCache<string, CachedMessageData>;
-  private liveMessageCache: LRUCache<string, Message>;
+  private liveMessageCache: LRUCache<string, WeakRef<Message>>;
   private joinQueue: JoinQueue;
   private tokenManager: TokenManager;
   private asyncLogger: AsyncLogger;
@@ -1005,7 +1004,7 @@ export class AutoJoinManager extends EventEmitter {
     this.noResponseCooldown = new LRUCache<string, number>(CACHE_MAX_COOLDOWN, NO_RESPONSE_COOLDOWN_MS + 10000);
     this.crosspostCache = new LRUCache<string, string>(CACHE_CROSSPOST, 30 * 60 * 1000);
     this.messageCache = new LRUCache<string, CachedMessageData>(CACHE_MESSAGES, 30000);
-    this.liveMessageCache = new LRUCache<string, Message>(CACHE_MESSAGES, 60000);
+    this.liveMessageCache = new LRUCache<string, WeakRef<Message>>(CACHE_MESSAGES, 60000);
     this.joinQueue = new JoinQueue();
     this.tokenManager = new TokenManager();
     this.asyncLogger = new AsyncLogger();
@@ -1260,19 +1259,16 @@ export class AutoJoinManager extends EventEmitter {
   }
   async startSession(userId: string, guildId: string): Promise<boolean> {
     const sessionKey = this.makeSessionKey(userId);
-    if (this.sessions.has(sessionKey)) {
-      const session = this.sessions.get(sessionKey);
-      if (session && session.isActive && !session.destroyed) {
+    const existingSession = this.sessions.get(sessionKey);
+    if (existingSession) {
+      if (existingSession.isActive && !existingSession.destroyed) {
         return true;
-      } else {
-        const staleSession = session;
-        if (staleSession) {
-          await this.stopSession(staleSession.userId, staleSession.guildId);
-        } else {
-          this.sessions.delete(sessionKey);
-          this.sessionsByUserId.delete(userId);
-        }
       }
+
+      // IMPORTANT: never just delete a dead session from the maps.
+      // The old client may still own websocket/timer/listener resources.
+      // That was allowing zombie clients to accumulate across reconnects.
+      await this.stopSession(existingSession.userId, existingSession.guildId);
     }
     if (this.sessionStartPromises.has(sessionKey)) {
       this.asyncLogger.debug('Session start already in progress, waiting...', { userId });
@@ -1294,28 +1290,6 @@ export class AutoJoinManager extends EventEmitter {
       this.sessionStartPromises.delete(sessionKey);
     }
   }
-  private async safeSetTokenActive(userId: string, guildId: string, active: boolean): Promise<boolean> {
-    try {
-      await setTokenActive(userId, guildId, active);
-      return true;
-    } catch (error) {
-      this.asyncLogger.warn('Token activity database update failed', {
-        userId, guildId, active, error: formatError(error),
-      });
-      return false;
-    }
-  }
-  private async safeUpdateTokenLastUsed(userId: string, guildId: string): Promise<boolean> {
-    try {
-      await updateTokenLastUsed(userId, guildId);
-      return true;
-    } catch (error) {
-      this.asyncLogger.warn('Token last-used database update failed', {
-        userId, guildId, error: formatError(error),
-      });
-      return false;
-    }
-  }
   private async _startSessionInternal(userId: string, guildId: string): Promise<boolean> {
     const sessionKey = this.makeSessionKey(userId);
     try {
@@ -1331,7 +1305,7 @@ export class AutoJoinManager extends EventEmitter {
         this.asyncLogger.error('❌ Failed to decrypt token', {
           userId, guildId, error: formatError(error), worker: this.workerId,
         });
-        await this.safeSetTokenActive(userId, guildId, false);
+        await setTokenActive(userId, guildId, false);
         return false;
       }
       const clientOptions: ClientOptions = {
@@ -1380,7 +1354,7 @@ export class AutoJoinManager extends EventEmitter {
           this.asyncLogger.error('❌ Permanent token failure - marking inactive', {
             userId, guildId, error: errorMsg, worker: this.workerId,
           });
-          await this.safeSetTokenActive(userId, guildId, false);
+          await setTokenActive(userId, guildId, false);
           this.tokenManager.clearCache(userId, guildId);
           this.emit('tokenRevoked', { userId, guildId, error: errorMsg });
         } else if (isTemporary) {
@@ -1446,8 +1420,8 @@ export class AutoJoinManager extends EventEmitter {
       this.sessions.set(sessionKey, session);
       this.sessionsByUserId.set(userId, session);
       this.tokenFailureTracker.delete(userId);
-      await this.safeSetTokenActive(userId, guildId, true);
-      await this.safeUpdateTokenLastUsed(userId, guildId);
+      await setTokenActive(userId, guildId, true);
+      await updateTokenLastUsed(userId, guildId);
       this.asyncLogger.info('✅ AutoJoin session started', {
         userId, label: session.label, username: client.user?.username,
         guilds: client.guilds.cache.size, worker: this.workerId,
@@ -1473,35 +1447,45 @@ export class AutoJoinManager extends EventEmitter {
   }
   private async waitForReady(client: Client): Promise<void> {
     return new Promise((resolve, reject) => {
+      if (client.isReady()) {
+        resolve();
+        return;
+      }
+
       const selfbotClient = client as any;
       let settled = false;
-      const cleanup = () => {
+
+      const cleanup = (): void => {
         clearTimeout(timeout);
-        try { selfbotClient.off('ready', onReady); } catch {}
-        try { selfbotClient.off('error', onError); } catch {}
+        try { selfbotClient.off('ready', onReady); } catch {
+          try { selfbotClient.removeListener('ready', onReady); } catch {}
+        }
+        try { selfbotClient.off('error', onError); } catch {
+          try { selfbotClient.removeListener('error', onError); } catch {}
+        }
       };
-      const onReady = () => {
+
+      const onReady = (): void => {
         if (settled) return;
         settled = true;
         cleanup();
         resolve();
       };
-      const onError = (err: Error) => {
+
+      const onError = (err: Error): void => {
         if (settled) return;
         settled = true;
         cleanup();
         reject(err);
       };
+
       const timeout = setTimeout(() => {
         if (settled) return;
         settled = true;
         cleanup();
         reject(new Error('Ready timeout'));
       }, READY_TIMEOUT_MS);
-      if (client.isReady()) {
-        onReady();
-        return;
-      }
+
       selfbotClient.once('ready', onReady);
       selfbotClient.once('error', onError);
     });
@@ -1524,7 +1508,7 @@ export class AutoJoinManager extends EventEmitter {
     }
     if (failureData.failures > 10) {
       this.asyncLogger.error('❌ Max retry attempts reached for user, permanently deactivating', { userId });
-      await this.safeSetTokenActive(userId, guildId, false);
+      await setTokenActive(userId, guildId, false);
       this.tokenFailureTracker.delete(userId);
       return;
     }
@@ -1534,8 +1518,7 @@ export class AutoJoinManager extends EventEmitter {
     this.asyncLogger.info(`⏰ Scheduling retry for ${userId} in ${Math.round(backoffMs/1000)}s (attempt #${failureData.failures})`);
     const timeout = setTimeout(async () => {
       this.retryScheduled.delete(key);
-      if (this.isShuttingDown) return;
-      try {
+      if (!this.isShuttingDown) {
         this.asyncLogger.info(`🔄 Retrying session for ${userId}`);
         const success = await this.startSession(userId, guildId);
         if (!success) {
@@ -1544,21 +1527,12 @@ export class AutoJoinManager extends EventEmitter {
             await this.scheduleRetry(userId, guildId);
           } else {
             this.asyncLogger.error('❌ Max retry attempts reached for user', { userId });
-            await this.safeSetTokenActive(userId, guildId, false);
+            await setTokenActive(userId, guildId, false);
             this.tokenFailureTracker.delete(userId);
           }
         } else {
           this.tokenFailureTracker.delete(userId);
         }
-      } catch (error) {
-        this.asyncLogger.warn('Session retry task failed', {
-          userId, guildId, error: formatError(error),
-        });
-        await this.scheduleRetry(userId, guildId).catch(retryError => {
-          this.asyncLogger.warn('Failed to reschedule session retry', {
-            userId, guildId, error: formatError(retryError),
-          });
-        });
       }
     }, backoffMs);
     this.retryScheduled.set(key, timeout);
@@ -1775,7 +1749,7 @@ export class AutoJoinManager extends EventEmitter {
     }
 
     this.metrics.totalMessagesProcessed++;
-    this.liveMessageCache.set(`${message.channel.id}:${message.id}`, message);
+    this.liveMessageCache.set(`${message.channel.id}:${message.id}`, new WeakRef(message));
     this.detectionStartedCount++;
 
     void this.handleMessage(message, session, kind, Date.now(), retryCount)
@@ -1798,7 +1772,7 @@ export class AutoJoinManager extends EventEmitter {
 
     const entryId = this.makeEntryId(session, message);
     const cacheKey = `${message.channel.id}:${message.id}`;
-    this.liveMessageCache.set(cacheKey, message);
+    this.liveMessageCache.set(cacheKey, new WeakRef(message));
 
     if (this.processedMessages.has(entryId)) {
       const known = this.messageCache.get(cacheKey);
@@ -1947,10 +1921,11 @@ export class AutoJoinManager extends EventEmitter {
     // populated locally. Give the update event a chance before one REST fallback.
     await delay(COMPONENT_RETRY_DELAY_MS);
 
-    const live = this.liveMessageCache.get(`${message.channel.id}:${message.id}`);
+    const liveRef = this.liveMessageCache.get(`${message.channel.id}:${message.id}`);
+    const live = liveRef?.deref();
     const latestButton = live ? this.extractEntryButton(live) : null;
-    if (latestButton) {
-      return { button: latestButton, prize: this.extractPrize(live!) };
+    if (latestButton && live) {
+      return { button: latestButton, prize: this.extractPrize(live) };
     }
 
     try {
@@ -1960,7 +1935,7 @@ export class AutoJoinManager extends EventEmitter {
         message.id,
       );
       if (!refreshed) return null;
-      this.liveMessageCache.set(`${message.channel.id}:${message.id}`, refreshed);
+      this.liveMessageCache.set(`${message.channel.id}:${message.id}`, new WeakRef(refreshed));
       const button = this.extractEntryButton(refreshed);
       if (button) return { button, prize: this.extractPrize(refreshed) };
     } catch {
@@ -2168,7 +2143,7 @@ export class AutoJoinManager extends EventEmitter {
           attempts: attemptNum,
         }).then(() => { this.metrics.dbQueries++; }).catch(() => {});
         void incrementTokenEntries(session.userId, session.guildId).catch(() => {});
-        void this.safeUpdateTokenLastUsed(session.userId, session.guildId);
+        void updateTokenLastUsed(session.userId, session.guildId).catch(() => {});
         this.joinOutcomeBuffer.push({
           userId: session.userId,
           messageId: entry.messageId,
@@ -2284,7 +2259,7 @@ export class AutoJoinManager extends EventEmitter {
     }
 
     const cacheKey = `${entry.channelId}:${entry.messageId}`;
-    let message = entry.message ?? this.liveMessageCache.get(cacheKey) ?? null;
+    let message = entry.message ?? this.liveMessageCache.get(cacheKey)?.deref() ?? null;
 
     // Use the normal discord.js cache as a second fast path. Neither path
     // requires a network request when the gateway already delivered the message.
@@ -2303,7 +2278,7 @@ export class AutoJoinManager extends EventEmitter {
     if (!message) throw new Error(`Message ${entry.messageId} not found`);
     if (!message.guild) throw new Error('Cannot enter giveaway in DM - buttons require guild context');
 
-    this.liveMessageCache.set(cacheKey, message);
+    this.liveMessageCache.set(cacheKey, new WeakRef(message));
 
     let button = this.findButtonById(message, entry.buttonCustomId);
     if (!button) {
