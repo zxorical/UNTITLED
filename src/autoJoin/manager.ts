@@ -1949,21 +1949,22 @@ export class AutoJoinManager extends EventEmitter {
     return null;
   }
   private queueOrEnter(
-    entryId: string,
-    session: UserSession,
-    entry: GiveawayEntry,
-    correlationId: string
-  ): Promise<void> {
-    void correlationId;
-    void this.enterGiveaway(entryId, session, entry).catch(error => {
-      this.asyncLogger.error('AutoJoin: immediate giveaway entry failed', {
-        userId: session.userId,
-        messageId: entry.messageId,
-        guildId: entry.guildId,
-        error: formatError(error),
-      });
+  entryId: string,
+  session: UserSession,
+  entry: GiveawayEntry,
+  correlationId: string
+): Promise<void> {
+  void correlationId;
+
+  return this.enterGiveaway(entryId, session, entry).catch(error => {
+    this.asyncLogger.error('AutoJoin: immediate giveaway entry failed', {
+      userId: session.userId,
+      messageId: entry.messageId,
+      guildId: entry.guildId,
+      error: formatError(error),
     });
-  }
+  });
+}
   private startQueueProcessor(userId: string): void {
     if (this.isShuttingDown) return;
     if (this.queueProcessorPromises.has(userId)) return;
