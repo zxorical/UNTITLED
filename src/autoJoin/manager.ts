@@ -1988,7 +1988,7 @@ export class AutoJoinManager extends EventEmitter {
     session: UserSession,
     entry: GiveawayEntry,
     correlationId: string
-  ): Promise<void> {
+  ): void {
     void correlationId;
     void this.enterGiveaway(entryId, session, entry).catch(error => {
       this.asyncLogger.error('AutoJoin: immediate giveaway entry failed', {
