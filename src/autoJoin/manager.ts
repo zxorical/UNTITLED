@@ -41,7 +41,7 @@ process.on('unhandledRejection', (reason: any) => {
   const message = String(reason?.message ?? reason ?? '');
   if (reason?.code === 500 && message.includes('token was unavailable')) return;
   if (reason?.name === 'AbortError' || message.toLowerCase().includes('operation was aborted')) return;
-  if (message.toLowerCase().includes('socket 'secureconnect' timed out')) return;
+  if (message.toLowerCase().includes("socket 'secureconnect' timed out")) return;
   logger.error('[Process] Unhandled rejection', { reason: formatError(reason) });
 });
 interface GiveawayEntry {
