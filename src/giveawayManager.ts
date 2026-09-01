@@ -135,7 +135,6 @@ const MAX_GUILD_STATS = 2000;
 const MAX_SCRIM_HISTORY = 5000;
 const SCRIM_HISTORY_TTL_MS = 2 * 60 * 60 * 1000;
 const SCRIM_CLEANUP_INTERVAL = 5 * 60 * 1000;
-const MAX_PROCESSING_MESSAGES = 5000;
 const PARSED_CACHE_TTL_MS = 30_000;
 const MAX_PARSED_CACHE_SIZE = 2000;
 
@@ -144,24 +143,24 @@ const STARTUP_GRACE_PERIOD_MS = 30_000;
 const MAX_STARTUP_MESSAGE_AGE_MS = 10_000;
 const MAX_GATEWAY_LATENCY_MS = 60_000;
 
-// ─── Parsed Message Cache ─────────────────────────────────────────────────
-const parsedMessageCache = new Map<string, { data: ParsedGiveawayData; timestamp: number }>();
+function cleanupParsedMessageCache(
+  cache: Map<string, { data: ParsedGiveawayData; timestamp: number }>,
+  now: number,
+): void {
+  if (cache.size === 0) return;
 
-function cleanupParsedMessageCache(now: number): void {
-  if (parsedMessageCache.size === 0) return;
-
-  for (const [key, entry] of parsedMessageCache) {
+  for (const [key, entry] of cache) {
     if (now - entry.timestamp > PARSED_CACHE_TTL_MS) {
-      parsedMessageCache.delete(key);
+      cache.delete(key);
     }
   }
 
-  if (parsedMessageCache.size <= MAX_PARSED_CACHE_SIZE) return;
+  if (cache.size <= MAX_PARSED_CACHE_SIZE) return;
 
-  const removeCount = parsedMessageCache.size - MAX_PARSED_CACHE_SIZE;
+  const removeCount = cache.size - MAX_PARSED_CACHE_SIZE;
   let removed = 0;
-  for (const key of parsedMessageCache.keys()) {
-    parsedMessageCache.delete(key);
+  for (const key of cache.keys()) {
+    cache.delete(key);
     if (++removed >= removeCount) break;
   }
 }
@@ -562,11 +561,15 @@ function getParsedCacheKey(message: Message): string {
   return `${message.id}:${message.channel.id}`;
 }
 
-function parseMessage(message: Message, now: number): ParsedGiveawayData {
-  cleanupParsedMessageCache(now);
+function parseMessage(
+  message: Message,
+  now: number,
+  cache: Map<string, { data: ParsedGiveawayData; timestamp: number }>,
+): ParsedGiveawayData {
+  cleanupParsedMessageCache(cache, now);
 
   const cacheKey = getParsedCacheKey(message);
-  const cached = parsedMessageCache.get(cacheKey);
+  const cached = cache.get(cacheKey);
 
   if (cached && now - cached.timestamp < PARSED_CACHE_TTL_MS) {
     return cached.data;
@@ -639,16 +642,20 @@ function parseMessage(message: Message, now: number): ParsedGiveawayData {
     contentHash,
   };
 
-  parsedMessageCache.set(cacheKey, { data: parsed, timestamp: now });
-  cleanupParsedMessageCache(now);
+  cache.set(cacheKey, { data: parsed, timestamp: now });
+  cleanupParsedMessageCache(cache, now);
 
   return parsed;
 }
 
-function refreshParsedMessage(message: Message, now: number): ParsedGiveawayData {
+function refreshParsedMessage(
+  message: Message,
+  now: number,
+  cache: Map<string, { data: ParsedGiveawayData; timestamp: number }>,
+): ParsedGiveawayData {
   const cacheKey = getParsedCacheKey(message);
-  parsedMessageCache.delete(cacheKey);
-  return parseMessage(message, now);
+  cache.delete(cacheKey);
+  return parseMessage(message, now, cache);
 }
 
 function simpleHash(str: string): string {
@@ -1369,9 +1376,10 @@ export class GiveawayManager extends EventEmitter {
   private readonly log: AppLogger;
   private readonly accountLabel: string;
   private readonly botManager: BotManager | null;
-  private readonly selfUserId: string;
+  private selfUserId: string;
 
   private processingMessages = new Set<string>();
+  private parsedMessageCache = new Map<string, { data: ParsedGiveawayData; timestamp: number }>();
 
   private creationCache = new LRUCache<string, { isCreation: boolean; score: number }>(MAX_CREATION_CACHE);
   private inviteCache = new LRUCache<string, { url: string; expiresAt: number }>(MAX_INVITE_CACHE);
@@ -1437,6 +1445,7 @@ export class GiveawayManager extends EventEmitter {
     this.client.once('ready', () => {
       setTimeout(() => {
         if (this.destroyed) return;
+        this.selfUserId = this.client.user?.id || this.selfUserId;
         this.readyEventReceived = true;
 
         const startupDuration = Date.now() - this.startupTime;
@@ -1456,6 +1465,7 @@ export class GiveawayManager extends EventEmitter {
       this.startupGraceTimer = setTimeout(() => {
         if (this.destroyed) return;
         if (!this.readyEventReceived) {
+          this.selfUserId = this.client.user?.id || this.selfUserId;
           this.readyEventReceived = true;
           this.log.warn('Ready event not received within grace period, forcing startup complete', {
             component: 'GiveawayManager',
@@ -1669,9 +1679,7 @@ export class GiveawayManager extends EventEmitter {
       if (messageAge > MAX_STARTUP_MESSAGE_AGE_MS) {
         return;
       }
-      if (this.pendingStartupMessages.size < MAX_PROCESSING_MESSAGES) {
-        this.pendingStartupMessages.add(message.id);
-      }
+      this.pendingStartupMessages.add(message.id);
     }
 
     if (now - message.createdTimestamp > MAX_MESSAGE_AGE_MS) {
@@ -1683,14 +1691,10 @@ export class GiveawayManager extends EventEmitter {
 
     const key = `${message.id}-${message.channel.id}`;
     if (this.processingMessages.has(key)) return;
-    if (this.processingMessages.size >= MAX_PROCESSING_MESSAGES) {
-      this.stats.skipped++;
-      return;
-    }
     this.processingMessages.add(key);
 
     try {
-      let parsed = parseMessage(message, now);
+      let parsed = parseMessage(message, now, this.parsedMessageCache);
 
       // ─── TIER 1: GIVEAWAY DETECTION (giveaway bot only) ──────────
       const isGiveawayBot = ALLOWED_GIVEAWAY_BOT_IDS.has(message.author?.id || '');
@@ -1707,7 +1711,7 @@ export class GiveawayManager extends EventEmitter {
         if (!creationResult.isCreation && shouldRefreshMessage(parsed)) {
           try {
             const refreshed = await message.channel.messages.fetch(message.id);
-            parsed = refreshParsedMessage(refreshed, now);
+            parsed = refreshParsedMessage(refreshed, now, this.parsedMessageCache);
             creationResult = detectCreation(parsed);
             this.creationCache.set(message.id, creationResult);
           } catch {
@@ -1881,7 +1885,7 @@ export class GiveawayManager extends EventEmitter {
     if (!existing || existing.status !== 'active') return;
 
     const now = Date.now();
-    const parsed = parseMessage(newMessage, now);
+    const parsed = parseMessage(newMessage, now, this.parsedMessageCache);
 
     if (isEndedGiveaway(parsed)) {
       await markEnded(newMessage.id, newMessage.channel.id);
@@ -2336,7 +2340,7 @@ export class GiveawayManager extends EventEmitter {
     this.log.info(`  Failed invites      : ${this.failedInviteCache.size}`);
     this.log.info(`  Watchlist items     : ${this.totalWatchlistItems}`);
     this.log.info(`  Guilds tracked      : ${this.guildStats.size}`);
-    this.log.info(`  Parse cache size    : ${parsedMessageCache.size}`);
+    this.log.info(`  Parse cache size    : ${this.parsedMessageCache.size}`);
     this.log.info(`  Ready received      : ${this.readyEventReceived}`);
     this.log.info(`────────────────────────────────────────────────────────`);
 
@@ -2376,7 +2380,7 @@ export class GiveawayManager extends EventEmitter {
       inviteCacheSize: this.inviteCache.size,
       failedInviteCacheSize: this.failedInviteCache.size,
       duplicateCacheSize: this.duplicateCache.size,
-      parseCacheSize: parsedMessageCache.size,
+      parseCacheSize: this.parsedMessageCache.size,
     };
   }
 
@@ -2413,7 +2417,7 @@ export class GiveawayManager extends EventEmitter {
     this.totalWatchlistItems = 0;
     this.watchlistCacheExpiry = 0;
 
-    parsedMessageCache.clear();
+    this.parsedMessageCache.clear();
     this.removeAllListeners();
 
     this.log.info(`Shutting down ${this.accountLabel}...`, {
