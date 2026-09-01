@@ -292,6 +292,58 @@ const EVENT_CONTEXT_WORDS = [
   'tournament', 'event', 'competition',
 ];
 
+const EVENT_MESSAGE_HINTS = [
+  'scrim', 'scrims', 'squid', 'squid game',
+  'gagaball', 'gaga ball', 'host:', 'hosts:',
+  'co host:', 'co-host:', 'time:', 'reward:', 'rewards:',
+  'prize:', 'teams:', 'team:', 'region:', 'server:',
+  'ticks:', '@everyone', '@here', 'register', 'sign up',
+];
+
+const CHANNEL_NAME_SMALL_CAPS_MAP: Record<string, string> = {
+  'ᴀ': 'a', 'ʙ': 'b', 'ᴄ': 'c', 'ᴅ': 'd', 'ᴇ': 'e', 'ꜰ': 'f',
+  'ɢ': 'g', 'ʜ': 'h', 'ɪ': 'i', 'ᴊ': 'j', 'ᴋ': 'k', 'ʟ': 'l',
+  'ᴍ': 'm', 'ɴ': 'n', 'ᴏ': 'o', 'ᴘ': 'p', 'ǫ': 'q', 'ʀ': 'r',
+  's': 's', 'ᴛ': 't', 'ᴜ': 'u', 'ᴠ': 'v', 'ᴡ': 'w', 'x': 'x',
+  'ʏ': 'y', 'ᴢ': 'z',
+};
+
+function normalizeChannelName(value: string): string {
+  let normalized = value.normalize('NFKC').toLowerCase();
+  normalized = normalized.normalize('NFKD').replace(/[\u0300-\u036f]/g, '');
+
+  let mapped = '';
+  for (const char of normalized) {
+    mapped += CHANNEL_NAME_SMALL_CAPS_MAP[char] || char;
+  }
+
+  return mapped.replace(/[^a-z0-9]+/g, '');
+}
+
+function classifyEventChannel(value: string): 'scrim' | 'squid_game' | 'gagaball' | null {
+  const channel = normalizeChannelName(value);
+
+  if (!channel) return null;
+
+  if (channel.includes('squidgame') || channel.includes('squid')) {
+    return 'squid_game';
+  }
+
+  if (channel.includes('gagaball') || channel.includes('gaga')) {
+    return 'gagaball';
+  }
+
+  if (channel.includes('scrim') || channel.includes('scrims')) {
+    return 'scrim';
+  }
+
+  return null;
+}
+
+function isEventChannel(value: string): boolean {
+  return classifyEventChannel(value) !== null;
+}
+
 const REGION_CONTEXT_KEYWORDS = [
   'region', 'server', 'host', 'team', 'scrim',
   'eu', 'na x', 'x na', 'only', 'reward', 'time',
@@ -1028,7 +1080,7 @@ function isTrackerMessage(message: Message): boolean {
   return false;
 }
 
-function detectScrim(parsed: ParsedGiveawayData): ScrimDetectionResult | null {
+function detectScrim(parsed: ParsedGiveawayData, channelName: string): ScrimDetectionResult | null {
   const { lowerText, fullText } = parsed;
 
   if (lowerText.includes('scrim detected') || lowerText.includes('event detected')) return null;
@@ -1039,8 +1091,13 @@ function detectScrim(parsed: ParsedGiveawayData): ScrimDetectionResult | null {
     return null;
   }
 
+  const channelType = classifyEventChannel(channelName);
+  if (!channelType) return null;
+
   const type = detectScrimType(fullText);
   if (!type) return null;
+
+  if (channelType !== type) return null;
 
   if (!hasEventContext(fullText)) return null;
   if (!hasScrimStructure(fullText, type)) return null;
@@ -1083,6 +1140,9 @@ function detectScrim(parsed: ParsedGiveawayData): ScrimDetectionResult | null {
 
   let score = 0;
   const signals: string[] = [];
+
+  score += 4;
+  signals.push('event_channel');
 
   if (hasEveryone) {
     score += SCRIM_SCORE.HAS_EVERYONE;
@@ -1805,7 +1865,22 @@ export class GiveawayManager extends EventEmitter {
           return;
         }
 
-        const scrimResult = detectScrim(parsed);
+        const channelName = (message.channel as any).name || '';
+        const channelType = classifyEventChannel(channelName);
+
+        if (!channelType) {
+          this.stats.falsePositivesBlocked++;
+          return;
+        }
+
+        const rawEventContent = (message.content || '').toLowerCase();
+        if (!EVENT_MESSAGE_HINTS.some(hint => rawEventContent.includes(hint)) &&
+            !parsed.hasAnyEmbed) {
+          this.stats.falsePositivesBlocked++;
+          return;
+        }
+
+        const scrimResult = detectScrim(parsed, channelName);
         if (scrimResult && scrimResult.score >= MINIMUM_SCRIM_SCORE_THRESHOLD) {
           const scrimDupKey = `scrim:${message.id}:${message.channel.id}`;
           if (this.duplicateCache.get(scrimDupKey)) return;
@@ -1816,6 +1891,7 @@ export class GiveawayManager extends EventEmitter {
           }
 
           this.duplicateCache.set(scrimDupKey, now);
+
           this.stats.detected++;
           this.stats.scrimsDetected++;
           this.recordGuildStat(message.guild!.id, 'detected');
@@ -1832,7 +1908,9 @@ export class GiveawayManager extends EventEmitter {
             scrimScore: scrimResult?.score || 0,
           });
         }
+        return;
       }
+
     } catch (error) {
       this.stats.errors++;
       this.log.error(`Error ${message.id}: ${formatError(error)}`);
