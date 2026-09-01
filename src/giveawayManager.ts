@@ -505,6 +505,10 @@ class LRUCache<K, V> {
   keys(): IterableIterator<K> {
     return this.map.keys();
   }
+
+  entries(): IterableIterator<[K, V]> {
+    return this.map.entries();
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1405,6 +1409,7 @@ export class GiveawayManager extends EventEmitter {
 
   private scrimHistory = new Map<string, ScrimHistoryEntry>();
   private scrimCleanupInterval: NodeJS.Timeout | null = null;
+  private inviteRefresherInterval: NodeJS.Timeout | null = null;
 
   private watchlistCacheExpiry = 0;
   private reverseWatchlistIndex: Map<string, string[]> = new Map();
@@ -2358,18 +2363,34 @@ export class GiveawayManager extends EventEmitter {
     }
   }
 
+  public clearInviteCache(guildId?: string): void {
+    if (guildId) {
+      this.inviteCache.delete(guildId);
+      this.failedInviteCache.delete(guildId);
+      return;
+    }
+
+    this.inviteCache.clear();
+    this.failedInviteCache.clear();
+  }
+
   private async refreshInvites(): Promise<void> {
     const now = Date.now();
-    const expired = Array.from(this.inviteCache.entries())
-      .filter(([, cached]) => cached.expiresAt <= now);
+    const expired: string[] = [];
+
+    for (const guildId of this.inviteCache.keys()) {
+      const cached = this.inviteCache.get(guildId);
+      if (cached && cached.expiresAt <= now) {
+        expired.push(guildId);
+      }
+    }
 
     if (expired.length === 0) return;
 
     this.log.debug(`Refreshing ${expired.length} expired invites`);
-    
-    for (const [guildId] of expired) {
+
+    for (const guildId of expired) {
       this.inviteCache.delete(guildId);
-      // Async refresh in background
       this.fetchInviteForGuild(guildId).catch((err) => {
         this.log.debug(`Failed to refresh invite for ${guildId}: ${formatError(err)}`);
       });
@@ -2504,14 +2525,18 @@ export class GiveawayManager extends EventEmitter {
       this.scrimCleanupInterval = null;
     }
 
+    if (this.inviteRefresherInterval) {
+      clearInterval(this.inviteRefresherInterval);
+      this.inviteRefresherInterval = null;
+    }
+
     if (this.startupGraceTimer) {
       clearTimeout(this.startupGraceTimer);
       this.startupGraceTimer = null;
     }
 
     this.creationCache.clear();
-    this.inviteCache.clear();
-    this.failedInviteCache.clear();
+    this.clearInviteCache();
     this.duplicateCache.clear();
     this.processingMessages.clear();
     this.pendingStartupMessages.clear();
