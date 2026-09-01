@@ -2308,12 +2308,12 @@ export class AutoJoinManager extends EventEmitter {
     if (!button || button.disabled) return true;
 
     if (this.isShuttingDown || session.destroyed || !session.isActive) {
-      return;
+      return false;
     }
 
     await session.rateLimiter.consume();
     if (this.isShuttingDown || session.destroyed || !session.isActive) {
-      return;
+      return false;
     }
     await this.clickButton(message, button, session);
     return false;
