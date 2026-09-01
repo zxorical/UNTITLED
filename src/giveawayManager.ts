@@ -144,11 +144,23 @@ const STARTUP_GRACE_PERIOD_MS = 30_000;
 const MAX_STARTUP_MESSAGE_AGE_MS = 10_000;
 const MAX_GATEWAY_LATENCY_MS = 60_000;
 
-const GIVEAWAY_RETRY_DELAYS_MS = [250, 750, 1500];
-const MAX_PENDING_GIVEAWAY_RETRIES = 1000;
-
 // ─── Parsed Message Cache ─────────────────────────────────────────────────
 const parsedMessageCache = new Map<string, { data: ParsedGiveawayData; timestamp: number }>();
+
+const globalGiveawayClaims = new Map<string, number>();
+const GLOBAL_GIVEAWAY_CLAIM_TTL_MS = 60 * 60 * 1000;
+
+function claimGiveawayOnce(key: string, now: number): boolean {
+  for (const [existingKey, expiresAt] of globalGiveawayClaims) {
+    if (expiresAt <= now) globalGiveawayClaims.delete(existingKey);
+  }
+
+  const existing = globalGiveawayClaims.get(key);
+  if (existing && existing > now) return false;
+
+  globalGiveawayClaims.set(key, now + GLOBAL_GIVEAWAY_CLAIM_TTL_MS);
+  return true;
+}
 
 function cleanupParsedMessageCache(now: number): void {
   if (parsedMessageCache.size === 0) return;
@@ -344,6 +356,7 @@ function isEventChannel(value: string): boolean {
   return classifyEventChannel(value) !== null;
 }
 
+
 const REGION_CONTEXT_KEYWORDS = [
   'region', 'server', 'host', 'team', 'scrim',
   'eu', 'na x', 'x na', 'only', 'reward', 'time',
@@ -505,10 +518,6 @@ class LRUCache<K, V> {
   keys(): IterableIterator<K> {
     return this.map.keys();
   }
-
-  entries(): IterableIterator<[K, V]> {
-    return this.map.entries();
-  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -574,70 +583,47 @@ function parseMessage(message: Message, now: number): ParsedGiveawayData {
 
   const cacheKey = getParsedCacheKey(message);
   const cached = parsedMessageCache.get(cacheKey);
-  if (cached && now - cached.timestamp < PARSED_CACHE_TTL_MS) return cached.data;
 
-  const embeds = Array.isArray(message.embeds) ? message.embeds : [];
-  const primaryEmbed = embeds[0];
+  if (cached && now - cached.timestamp < PARSED_CACHE_TTL_MS) {
+    return cached.data;
+  }
+
+  const embed = message.embeds?.[0];
   const messageAge = now - message.createdTimestamp;
+
   const content = message.content || '';
   const lowerContent = content.toLowerCase();
-
-  let title = '';
-  let description = '';
-  let footer = '';
-  let authorName = '';
+  const title = embed?.title || '';
+  const lowerTitle = title.toLowerCase();
+  const description = embed?.description || '';
+  const lowerDescription = description.toLowerCase();
+  const footer = embed?.footer?.text || '';
+  const lowerFooter = footer.toLowerCase();
+  const authorName = embed?.author?.name || '';
+  const lowerAuthor = authorName.toLowerCase();
 
   const fieldNames: string[] = [];
   const lowerFieldNames: string[] = [];
   const fieldValues: string[] = [];
   const lowerFieldValues: string[] = [];
 
-  const textParts: string[] = [content];
-
-  for (const embed of embeds) {
-    if (embed.title) {
-      if (!title) title = embed.title;
-      textParts.push(embed.title);
-    }
-    if (embed.description) {
-      if (!description) description = embed.description;
-      textParts.push(embed.description);
-    }
-    if (embed.footer?.text) {
-      if (!footer) footer = embed.footer.text;
-      textParts.push(embed.footer.text);
-    }
-    if (embed.author?.name) {
-      if (!authorName) authorName = embed.author.name;
-      textParts.push(embed.author.name);
-    }
-    if (embed.fields) {
-      for (const field of embed.fields) {
-        const name = field.name || '';
-        const value = field.value || '';
-        fieldNames.push(name);
-        lowerFieldNames.push(name.toLowerCase());
-        fieldValues.push(value);
-        lowerFieldValues.push(value.toLowerCase());
-        textParts.push(name, value);
-      }
+  if (embed?.fields) {
+    for (const field of embed.fields) {
+      fieldNames.push(field.name);
+      lowerFieldNames.push(field.name.toLowerCase());
+      fieldValues.push(field.value);
+      lowerFieldValues.push(field.value.toLowerCase());
     }
   }
 
+  const textParts = [content, title, description, footer, authorName, ...fieldNames, ...fieldValues];
   const fullText = textParts.filter(Boolean).join(' ');
   const lowerText = fullText.toLowerCase();
-  const lowerTitle = title.toLowerCase();
-  const lowerDescription = description.toLowerCase();
-  const lowerFooter = footer.toLowerCase();
-  const lowerAuthor = authorName.toLowerCase();
 
   const buttons = parseButtons((message as any).components);
   const timestamps = parseTimestamps(fullText, now);
   const prize = extractPrize(title, description, content, fieldNames, fieldValues);
-  const embedColor = embeds.find(embed => typeof embed?.color === 'number')?.color ?? null;
-  const contentHash = simpleHash(
-    `${message.guild?.id}|${message.id}|${fullText}|${JSON.stringify((message as any).components ?? null)}`
-  );
+  const contentHash = simpleHash(`${message.guild?.id}|${prize}|${timestamps.end}`);
 
   const parsed: ParsedGiveawayData = {
     parsedAt: now,
@@ -656,12 +642,12 @@ function parseMessage(message: Message, now: number): ParsedGiveawayData {
     lowerAuthor,
     buttons,
     timestamps,
-    embedColor,
+    embedColor: embed?.color || null,
     fieldNames,
     lowerFieldNames,
     fieldValues,
     lowerFieldValues,
-    hasAnyEmbed: embeds.length > 0,
+    hasAnyEmbed: !!embed,
     hasAnyComponent: buttons.labels.length > 0,
     isFromBot: message.author?.bot === true,
     botId: message.author?.id || '',
@@ -671,6 +657,7 @@ function parseMessage(message: Message, now: number): ParsedGiveawayData {
 
   parsedMessageCache.set(cacheKey, { data: parsed, timestamp: now });
   cleanupParsedMessageCache(now);
+
   return parsed;
 }
 
@@ -1224,6 +1211,7 @@ function detectScrim(parsed: ParsedGiveawayData, channelName: string): ScrimDete
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+
 // QUICK REJECT (Stage 1)
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -1417,8 +1405,6 @@ export class GiveawayManager extends EventEmitter {
   private totalWatchlistItems = 0;
 
   private pendingInvites = new Map<string, Promise<string>>();
-  private pendingGiveawayRetries = new Map<string, number>();
-  private retryingGiveaways = new Set<string>();
 
   private readyEventReceived = false;
   private readonly startupTime: number;
@@ -1696,79 +1682,69 @@ export class GiveawayManager extends EventEmitter {
 
     const now = Date.now();
     const processingStart = performance.now();
-    const messageKey = `${message.id}-${message.channel.id}`;
-    const isAllowedGiveawayBot = ALLOWED_GIVEAWAY_BOT_IDS.has(message.author?.id || '') && message.author?.bot === true;
-
-    if (now - message.createdTimestamp > MAX_MESSAGE_AGE_MS) return;
 
     if (!this.readyEventReceived) {
       const messageAge = now - message.createdTimestamp;
-      if (messageAge > MAX_STARTUP_MESSAGE_AGE_MS) return;
+      if (messageAge > MAX_STARTUP_MESSAGE_AGE_MS) {
+        return;
+      }
       if (this.pendingStartupMessages.size < MAX_PROCESSING_MESSAGES) {
         this.pendingStartupMessages.add(message.id);
       }
     }
 
-    const rejectReason = quickReject(message, this.selfUserId, now);
-    if (rejectReason) return;
-
-    if (this.processingMessages.has(messageKey)) return;
-
-    if (this.processingMessages.size >= MAX_PROCESSING_MESSAGES) {
-      this.stats.skipped++;
-      if (isAllowedGiveawayBot) this.scheduleGiveawayRetry(message);
+    if (now - message.createdTimestamp > MAX_MESSAGE_AGE_MS) {
       return;
     }
 
-    this.processingMessages.add(messageKey);
+    const rejectReason = quickReject(message, this.selfUserId, now);
+    if (rejectReason) return;
+
+    const key = `${message.id}-${message.channel.id}`;
+    if (this.processingMessages.has(key)) return;
+    if (this.processingMessages.size >= MAX_PROCESSING_MESSAGES) {
+      this.stats.skipped++;
+      return;
+    }
+    this.processingMessages.add(key);
 
     try {
       let parsed = parseMessage(message, now);
 
-      if (isAllowedGiveawayBot) {
-        if (isBlockedContent(parsed)) {
-          this.stats.falsePositivesBlocked++;
-          return;
-        }
+      // ─── TIER 1: GIVEAWAY DETECTION (giveaway bot only) ──────────
+      const isGiveawayBot = ALLOWED_GIVEAWAY_BOT_IDS.has(message.author?.id || '');
 
-        const creationKey = `${message.id}:${message.channel.id}`;
-        let creationResult = this.creationCache.get(creationKey);
+      if (isGiveawayBot && message.author?.bot) {
+        if (isBlockedContent(parsed)) { this.stats.falsePositivesBlocked++; return; }
+
+        let creationResult = this.creationCache.get(message.id);
         if (!creationResult) {
           creationResult = detectCreation(parsed);
-          this.creationCache.set(creationKey, creationResult);
+          this.creationCache.set(message.id, creationResult);
         }
 
-        if (!creationResult.isCreation && this.shouldRetryGiveawayParse(parsed)) {
-          const retryParsed = await this.fetchFreshGiveawayMessage(message, now);
-          if (retryParsed) {
-            parsed = retryParsed;
+        if (!creationResult.isCreation && shouldRefreshMessage(parsed)) {
+          try {
+            const refreshed = await message.channel.messages.fetch(message.id);
+            parsed = refreshParsedMessage(refreshed, now);
             creationResult = detectCreation(parsed);
-            this.creationCache.set(creationKey, creationResult);
+            this.creationCache.set(message.id, creationResult);
+          } catch {
+            // Ignore fetch errors
           }
         }
 
-        if (creationResult.isCreation) {
-          this.stats.draftsSkipped++;
-          return;
-        }
-        if (isDraftGiveaway(parsed)) {
-          this.stats.draftsSkipped++;
-          return;
-        }
+        if (creationResult.isCreation) { this.stats.draftsSkipped++; return; }
+        if (isDraftGiveaway(parsed)) { this.stats.draftsSkipped++; return; }
 
         const detection = calculateGiveawayScore(parsed);
-
-        // A message can arrive before buttons/embeds/timestamps are fully populated.
-        // Don't permanently reject those near-miss candidates: schedule a bounded refresh.
-        if (detection.score < MINIMUM_SCORE_THRESHOLD && this.shouldRetryGiveawayParse(parsed)) {
-          this.stats.falsePositivesBlocked++;
-          this.scheduleGiveawayRetry(message);
-          return;
-        }
-
         if (detection.score >= MINIMUM_SCORE_THRESHOLD) {
           const messageDupKey = `${message.id}:${message.channel.id}`;
           if (this.duplicateCache.get(messageDupKey)) return;
+
+          const globalKey = `giveaway:${message.id}:${message.channel.id}`;
+          if (!claimGiveawayOnce(globalKey, now)) return;
+
           this.duplicateCache.set(messageDupKey, now);
 
           const existing = await getGiveaway(message.id, message.channel.id);
@@ -1781,8 +1757,7 @@ export class GiveawayManager extends EventEmitter {
           }
 
           if (await wasNotifiedRecently(message.id, message.channel.id, CONFIG.notificationCooldown)) {
-            this.stats.skipped++;
-            return;
+            this.stats.skipped++; return;
           }
 
           this.stats.detected++;
@@ -1795,19 +1770,14 @@ export class GiveawayManager extends EventEmitter {
           const memberCount = (guild as any).memberCount ?? null;
 
           const data: Omit<GiveawayData, 'id' | 'status' | 'notifiedAt' | 'lastSeenAt'> = {
-            messageId: message.id,
-            channelId: message.channel.id,
-            guildId: guild.id,
-            guildName: guild.name,
+            messageId: message.id, channelId: message.channel.id,
+            guildId: guild.id, guildName: guild.name,
             channelName: (message.channel as any).name || 'unknown',
-            authorId: parsed.botId,
-            prize: parsed.prize,
+            authorId: parsed.botId, prize: parsed.prize,
             detectedAt: message.createdTimestamp,
             endsAt: parsed.timestamps.end,
             detectionTimeMs: processingTime,
-            guildIcon,
-            guildBanner,
-            memberCount,
+            guildIcon, guildBanner, memberCount,
           };
 
           const savePromise = insertGiveaway(data);
@@ -1818,15 +1788,9 @@ export class GiveawayManager extends EventEmitter {
           if (!inserted) return;
 
           const fullData: GiveawayData = {
-            ...data,
-            id: undefined,
-            status: 'active',
-            notifiedAt: null,
-            lastSeenAt: now,
-            inviteUrl,
-            guildIcon,
-            guildBanner,
-            memberCount,
+            ...data, id: undefined, status: 'active',
+            notifiedAt: null, lastSeenAt: now,
+            inviteUrl, guildIcon, guildBanner, memberCount,
           };
 
           try {
@@ -1846,14 +1810,7 @@ export class GiveawayManager extends EventEmitter {
           this.log.info(
             `Detected: "${parsed.prize}" [${detection.confidence}%] ` +
             `(processing: ${processingTime}ms) - ` +
-            detection.signals.join(', '),
-            {
-              component: 'GiveawayManager',
-              account: this.accountLabel,
-              guildId: guild.id,
-              channelId: message.channel.id,
-              messageId: message.id,
-            }
+            detection.signals.join(', ')
           );
 
           await watchlistPromise;
@@ -1890,6 +1847,9 @@ export class GiveawayManager extends EventEmitter {
           const scrimDupKey = `scrim:${message.id}:${message.channel.id}`;
           if (this.duplicateCache.get(scrimDupKey)) return;
 
+          const globalKey = `scrim:${message.id}:${message.channel.id}`;
+          if (!claimGiveawayOnce(globalKey, now)) return;
+
           if (this.shouldThrottleScrim(message.guild!.id, message.channel.id)) {
             this.stats.falsePositivesBlocked++;
             return;
@@ -1919,52 +1879,9 @@ export class GiveawayManager extends EventEmitter {
     } catch (error) {
       this.stats.errors++;
       this.log.error(`Error ${message.id}: ${formatError(error)}`);
-      if (isAllowedGiveawayBot) this.scheduleGiveawayRetry(message);
     } finally {
-      this.processingMessages.delete(messageKey);
+      this.processingMessages.delete(key);
     }
-  }
-
-  private shouldRetryGiveawayParse(parsed: ParsedGiveawayData): boolean {
-    if (!parsed.hasAnyEmbed) return false;
-    if (!parsed.buttons.entry) return true;
-    if (parsed.timestamps.end === null) return true;
-    return parsed.fullText.length < 50;
-  }
-
-  private async fetchFreshGiveawayMessage(message: Message, now: number): Promise<ParsedGiveawayData | null> {
-    try {
-      await delay(100);
-      const refreshed = await message.channel.messages.fetch(message.id);
-      return refreshParsedMessage(refreshed, now);
-    } catch {
-      return null;
-    }
-  }
-
-  private scheduleGiveawayRetry(message: Message): void {
-    if (this.destroyed) return;
-    if (!ALLOWED_GIVEAWAY_BOT_IDS.has(message.author?.id || '')) return;
-    if (this.pendingGiveawayRetries.size >= MAX_PENDING_GIVEAWAY_RETRIES) return;
-
-    const key = `${message.id}:${message.channel.id}`;
-    if (this.retryingGiveaways.has(key)) return;
-
-    const attempt = this.pendingGiveawayRetries.get(key) ?? 0;
-    if (attempt >= GIVEAWAY_RETRY_DELAYS_MS.length) return;
-
-    this.pendingGiveawayRetries.set(key, attempt + 1);
-    this.retryingGiveaways.add(key);
-
-    const delayMs = GIVEAWAY_RETRY_DELAYS_MS[attempt];
-    setTimeout(() => {
-      this.retryingGiveaways.delete(key);
-      if (this.destroyed) return;
-      if (attempt + 1 >= GIVEAWAY_RETRY_DELAYS_MS.length) {
-        this.pendingGiveawayRetries.delete(key);
-      }
-      void this.handleMessage(message);
-    }, delayMs).unref?.();
   }
 
   private shouldLogDebug(): boolean {
@@ -1980,36 +1897,20 @@ export class GiveawayManager extends EventEmitter {
   // MESSAGE UPDATE HANDLER
   // ═══════════════════════════════════════════════════════════════════════
 
-  public async handleMessageUpdate(oldMessage: Message, newMessage: Message): Promise<void> {
+  public async handleMessageUpdate(_oldMessage: Message, newMessage: Message): Promise<void> {
     if (this.destroyed) return;
     if (!newMessage.guild || !newMessage.author?.bot) return;
     if (!ALLOWED_GIVEAWAY_BOT_IDS.has(newMessage.author.id)) return;
 
-    const cacheKey = getParsedCacheKey(newMessage);
-    parsedMessageCache.delete(cacheKey);
-    this.creationCache.delete(`${newMessage.id}:${newMessage.channel.id}`);
-    this.duplicateCache.delete(`${newMessage.id}:${newMessage.channel.id}`);
+    const existing = await getGiveaway(newMessage.id, newMessage.channel.id);
+    if (!existing || existing.status !== 'active') return;
 
     const now = Date.now();
     const parsed = parseMessage(newMessage, now);
 
-    const existing = await getGiveaway(newMessage.id, newMessage.channel.id);
-    if (existing) {
-      if (existing.status === 'active' && isEndedGiveaway(parsed)) {
-        await markEnded(newMessage.id, newMessage.channel.id);
-        this.log.debug(`Giveaway ended via edit: ${newMessage.id}`);
-      } else if (existing.status === 'active') {
-        await updateLastSeen(newMessage.id, newMessage.channel.id);
-      }
-      return;
-    }
-
-    // A previously missed giveaway can become detectable when Discord edits the
-    // message after components/embed data have finished populating.
-    void this.handleMessage(newMessage);
-
-    if (parsed.hasAnyEmbed && this.shouldRetryGiveawayParse(parsed)) {
-      this.scheduleGiveawayRetry(newMessage);
+    if (isEndedGiveaway(parsed)) {
+      await markEnded(newMessage.id, newMessage.channel.id);
+      this.log.debug(`Giveaway ended via edit: ${newMessage.id}`);
     }
   }
 
@@ -2536,13 +2437,12 @@ export class GiveawayManager extends EventEmitter {
     }
 
     this.creationCache.clear();
-    this.clearInviteCache();
+    this.inviteCache.clear();
+    this.failedInviteCache.clear();
     this.duplicateCache.clear();
     this.processingMessages.clear();
     this.pendingStartupMessages.clear();
     this.pendingInvites.clear();
-    this.pendingGiveawayRetries.clear();
-    this.retryingGiveaways.clear();
     this.scrimHistory.clear();
     this.guildStats.clear();
 
@@ -2552,6 +2452,7 @@ export class GiveawayManager extends EventEmitter {
     this.watchlistCacheExpiry = 0;
 
     parsedMessageCache.clear();
+    globalGiveawayClaims.clear();
     this.removeAllListeners();
 
     this.log.info(`Shutting down ${this.accountLabel}...`, {
