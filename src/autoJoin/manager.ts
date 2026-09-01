@@ -1066,6 +1066,19 @@ export class AutoJoinManager extends EventEmitter {
       rssMB: Math.round(mem.rss / 1024 / 1024),
     };
   }
+  private async safeSetTokenActive(userId: string, guildId: string, active: boolean): Promise<void> {
+    try {
+      await setTokenActive(userId, guildId, active);
+      this.metrics.dbQueries++;
+    } catch (error) {
+      this.asyncLogger.warn('AutoJoin: token status database update failed', {
+        userId,
+        guildId,
+        active,
+        error: formatError(error),
+      });
+    }
+  }
   private checkMemory(): boolean {
     const now = Date.now();
     if (now - this.lastMemoryCheck < 5000) return this.healthStatus !== 'critical';
@@ -1245,17 +1258,13 @@ export class AutoJoinManager extends EventEmitter {
     }
   }
   private async getAllPremiumUsersAcrossAllGuilds(): Promise<any[]> {
-    try {
-      const users = await getAllPremiumUsersAllGuilds();
-      if (users.length === 0) {
-        const { getAllPremiumUsers } = await import('../database.js');
-        const guildId = process.env.GUILD_ID;
-        if (guildId) return await getAllPremiumUsers(guildId);
-      }
-      return users;
-    } catch (error) {
-      return [];
+    const users = await getAllPremiumUsersAllGuilds();
+    if (users.length === 0) {
+      const { getAllPremiumUsers } = await import('../database.js');
+      const guildId = process.env.GUILD_ID;
+      if (guildId) return await getAllPremiumUsers(guildId);
     }
+    return users;
   }
   async startSession(userId: string, guildId: string): Promise<boolean> {
     const sessionKey = this.makeSessionKey(userId);
@@ -1305,7 +1314,7 @@ export class AutoJoinManager extends EventEmitter {
         this.asyncLogger.error('❌ Failed to decrypt token', {
           userId, guildId, error: formatError(error), worker: this.workerId,
         });
-        await setTokenActive(userId, guildId, false);
+        await this.safeSetTokenActive(userId, guildId, false);
         return false;
       }
       const clientOptions: ClientOptions = {
@@ -1354,7 +1363,7 @@ export class AutoJoinManager extends EventEmitter {
           this.asyncLogger.error('❌ Permanent token failure - marking inactive', {
             userId, guildId, error: errorMsg, worker: this.workerId,
           });
-          await setTokenActive(userId, guildId, false);
+          await this.safeSetTokenActive(userId, guildId, false);
           this.tokenManager.clearCache(userId, guildId);
           this.emit('tokenRevoked', { userId, guildId, error: errorMsg });
         } else if (isTemporary) {
@@ -1420,7 +1429,7 @@ export class AutoJoinManager extends EventEmitter {
       this.sessions.set(sessionKey, session);
       this.sessionsByUserId.set(userId, session);
       this.tokenFailureTracker.delete(userId);
-      await setTokenActive(userId, guildId, true);
+      await this.safeSetTokenActive(userId, guildId, true);
       await updateTokenLastUsed(userId, guildId);
       this.asyncLogger.info('✅ AutoJoin session started', {
         userId, label: session.label, username: client.user?.username,
@@ -1507,10 +1516,15 @@ export class AutoJoinManager extends EventEmitter {
       for (const [oldUserId] of oldest) this.tokenFailureTracker.delete(oldUserId);
     }
     if (failureData.failures > 10) {
-      this.asyncLogger.error('❌ Max retry attempts reached for user, permanently deactivating', { userId });
-      await setTokenActive(userId, guildId, false);
-      this.tokenFailureTracker.delete(userId);
-      return;
+      // Network/gateway failures are not proof that the token is invalid.
+      // Keep the session eligible for recovery instead of permanently
+      // disabling it after repeated transient failures.
+      failureData.failures = 10;
+      this.tokenFailureTracker.set(userId, failureData);
+      this.asyncLogger.warn('⚠️ Retry limit reached; continuing recovery checks without disabling token', {
+        userId,
+        guildId,
+      });
     }
     const baseDelay = INITIAL_RETRY_DELAY_MS * Math.pow(2, Math.min(failureData.failures - 1, 6));
     const jitter = Math.random() * 2000;
@@ -1526,9 +1540,12 @@ export class AutoJoinManager extends EventEmitter {
           if (data && data.failures < 10) {
             await this.scheduleRetry(userId, guildId);
           } else {
-            this.asyncLogger.error('❌ Max retry attempts reached for user', { userId });
-            await setTokenActive(userId, guildId, false);
-            this.tokenFailureTracker.delete(userId);
+            // Keep retrying transient failures. A genuinely invalid token is
+            // handled by _startSessionInternal() based on the login error.
+            this.asyncLogger.warn('⚠️ Session retry still failing; leaving token active for future recovery', {
+              userId,
+              guildId,
+            });
           }
         } else {
           this.tokenFailureTracker.delete(userId);
@@ -2080,6 +2097,7 @@ export class AutoJoinManager extends EventEmitter {
     session: UserSession,
     preFetchedEntry?: GiveawayEntry
   ): Promise<void> {
+    if (this.isShuttingDown || session.destroyed || !session.isActive) return;
     let entry: AutoJoinEntry | null = null;
     if (preFetchedEntry && preFetchedEntry.buttonCustomId) {
       entry = {
@@ -2125,6 +2143,7 @@ export class AutoJoinManager extends EventEmitter {
     const maxAttempts = CONFIG.maxRetries + 1;
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       const attemptNum = attempt + 1;
+      if (this.isShuttingDown || session.destroyed || !session.isActive) return;
       this.metrics.totalEntriesAttempted++;
       if (attempt > 0) {
         const backoffMs = exponentialBackoff(attempt - 1, CONFIG.retryDelayMs, 30000);
@@ -2288,7 +2307,14 @@ export class AutoJoinManager extends EventEmitter {
 
     if (!button || button.disabled) return true;
 
+    if (this.isShuttingDown || session.destroyed || !session.isActive) {
+      return;
+    }
+
     await session.rateLimiter.consume();
+    if (this.isShuttingDown || session.destroyed || !session.isActive) {
+      return;
+    }
     await this.clickButton(message, button, session);
     return false;
   }
@@ -2602,12 +2628,18 @@ export class AutoJoinManager extends EventEmitter {
       // a much better liveness signal than readyState alone.
       const gatewaySilence = now - session.lastGatewayActivityAt;
       if (gatewaySilence >= GATEWAY_STALE_AFTER_MS) {
-        await this.recoverSession(
-          session,
-          gatewaySilence >= GATEWAY_STALE_HARD_LIMIT_MS
-            ? 'gateway_hard_stall'
-            : 'gateway_stale',
-        );
+        // A session can legitimately be quiet. Only recover when the hard
+        // silence limit is reached, or when the session has already reported
+        // a disconnect. This avoids destroying healthy clients just because
+        // raw gateway activity was sparse.
+        if (gatewaySilence >= GATEWAY_STALE_HARD_LIMIT_MS || session.lastDisconnectAt > 0) {
+          await this.recoverSession(
+            session,
+            gatewaySilence >= GATEWAY_STALE_HARD_LIMIT_MS
+              ? 'gateway_hard_stall'
+              : 'gateway_stale',
+          );
+        }
         continue;
       }
 
@@ -3108,10 +3140,12 @@ export class AutoJoinManager extends EventEmitter {
       this.sessionsByUserId.delete(userId);
       this.tokenManager.clearCache(userId, guildId);
       const retryKey = `${userId}:${guildId}`;
-      const retryTimer = this.retryScheduled.get(retryKey);
-      if (retryTimer) {
-        clearTimeout(retryTimer);
-        this.retryScheduled.delete(retryKey);
+      if (this.isShuttingDown) {
+        const retryTimer = this.retryScheduled.get(retryKey);
+        if (retryTimer) {
+          clearTimeout(retryTimer);
+          this.retryScheduled.delete(retryKey);
+        }
       }
       this.asyncLogger.info('⏹️ AutoJoin session stopped', {
         userId, guildId, sessionId: session.sessionId, memory: this.getMemoryUsage(),
