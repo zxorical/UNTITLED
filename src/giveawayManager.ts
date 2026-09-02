@@ -289,6 +289,45 @@ const EVENT_CONTEXT_WORDS = [
   'tournament', 'event', 'competition',
 ];
 
+const EVENT_MESSAGE_HINTS = [
+  'scrim', 'scrims', 'squid', 'squid game',
+  'gagaball', 'gaga ball', 'host:', 'hosts:',
+  'co host:', 'co-host:', 'time:', 'reward:', 'rewards:',
+  'prize:', 'teams:', 'team:', 'region:', 'server:',
+  'ticks:', '@everyone', '@here', 'register', 'sign up',
+];
+
+const CHANNEL_NAME_SMALL_CAPS_MAP: Record<string, string> = {
+  'ᴀ': 'a', 'ʙ': 'b', 'ᴄ': 'c', 'ᴅ': 'd', 'ᴇ': 'e', 'ꜰ': 'f',
+  'ɢ': 'g', 'ʜ': 'h', 'ɪ': 'i', 'ᴊ': 'j', 'ᴋ': 'k', 'ʟ': 'l',
+  'ᴍ': 'm', 'ɴ': 'n', 'ᴏ': 'o', 'ᴘ': 'p', 'ǫ': 'q', 'ʀ': 'r',
+  's': 's', 'ᴛ': 't', 'ᴜ': 'u', 'ᴠ': 'v', 'ᴡ': 'w', 'x': 'x',
+  'ʏ': 'y', 'ᴢ': 'z',
+};
+
+function normalizeChannelName(value: string): string {
+  let normalized = value.normalize('NFKC').toLowerCase();
+  normalized = normalized.normalize('NFKD').replace(/[\u0300-\u036f]/g, '');
+  let mapped = '';
+  for (const char of normalized) {
+    mapped += CHANNEL_NAME_SMALL_CAPS_MAP[char] || char;
+  }
+  return mapped.replace(/[^a-z0-9]+/g, '');
+}
+
+function classifyEventChannel(value: string): 'scrim' | 'squid_game' | 'gagaball' | null {
+  const channel = normalizeChannelName(value);
+  if (!channel) return null;
+  if (channel.includes('squidgame') || channel.includes('squid')) return 'squid_game';
+  if (channel.includes('gagaball') || channel.includes('gaga')) return 'gagaball';
+  if (channel.includes('scrim') || channel.includes('scrims')) return 'scrim';
+  return null;
+}
+
+function isEventChannel(value: string): boolean {
+  return classifyEventChannel(value) !== null;
+}
+
 const REGION_CONTEXT_KEYWORDS = [
   'region', 'server', 'host', 'team', 'scrim',
   'eu', 'na x', 'x na', 'only', 'reward', 'time',
@@ -1003,7 +1042,7 @@ function isTrackerMessage(message: Message): boolean {
   return false;
 }
 
-function detectScrim(parsed: ParsedGiveawayData): ScrimDetectionResult | null {
+function detectScrim(parsed: ParsedGiveawayData, channelName: string): ScrimDetectionResult | null {
   const { lowerText, fullText } = parsed;
 
   if (lowerText.includes('scrim detected') || lowerText.includes('event detected')) return null;
@@ -1014,8 +1053,12 @@ function detectScrim(parsed: ParsedGiveawayData): ScrimDetectionResult | null {
     return null;
   }
 
+  const channelType = classifyEventChannel(channelName);
+  if (!channelType) return null;
+
   const type = detectScrimType(fullText);
   if (!type) return null;
+  if (channelType !== type) return null;
 
   if (!hasEventContext(fullText)) return null;
   if (!hasScrimStructure(fullText, type)) return null;
@@ -1309,7 +1352,7 @@ export class GiveawayManager extends EventEmitter {
   private readonly log: AppLogger;
   private readonly accountLabel: string;
   private readonly botManager: BotManager | null;
-  private readonly selfUserId: string;
+  private selfUserId: string;
 
   private processingMessages = new Set<string>();
 
@@ -1375,6 +1418,7 @@ export class GiveawayManager extends EventEmitter {
 
   private setupReadyHandler(): void {
     this.client.once('ready', () => {
+      this.selfUserId = this.client.user?.id || this.selfUserId;
       setTimeout(() => {
         if (this.destroyed) return;
         this.readyEventReceived = true;
@@ -1745,7 +1789,20 @@ export class GiveawayManager extends EventEmitter {
           return;
         }
 
-        const scrimResult = detectScrim(parsed);
+        const channelName = (message.channel as any).name || '';
+        const channelType = classifyEventChannel(channelName);
+        if (!channelType) {
+          this.stats.falsePositivesBlocked++;
+          return;
+        }
+
+        const rawEventContent = (message.content || '').toLowerCase();
+        if (!EVENT_MESSAGE_HINTS.some(hint => rawEventContent.includes(hint)) && !parsed.hasAnyEmbed) {
+          this.stats.falsePositivesBlocked++;
+          return;
+        }
+
+        const scrimResult = detectScrim(parsed, channelName);
         if (scrimResult && scrimResult.score >= MINIMUM_SCRIM_SCORE_THRESHOLD) {
           const scrimDupKey = `scrim:${message.id}:${message.channel.id}`;
           if (this.duplicateCache.get(scrimDupKey)) return;
@@ -2066,8 +2123,8 @@ export class GiveawayManager extends EventEmitter {
       }
 
       // ── 3. Resolve self member for permission checks ──────────────
-      let botMember = guild.members.cache.get(this.selfUserId);
-      if (!botMember) {
+      let botMember = this.selfUserId ? guild.members.cache.get(this.selfUserId) : undefined;
+      if (!botMember && this.selfUserId) {
         try {
           botMember = await guild.members.fetch({ user: this.selfUserId, force: false });
         } catch {
@@ -2146,14 +2203,33 @@ export class GiveawayManager extends EventEmitter {
           }
         } catch (err: any) {
           const code = err?.code ?? err?.httpStatus;
-          // Perm denied on this specific channel — try next
           if (code === 50013 || code === 403) continue;
-          // Transient (rate limit, network) — log and try next
           this.log.debug(`createInvite failed ch ${channel.id}: ${formatError(err)}`);
         }
       }
 
-      // ── 6. All attempts exhausted ─────────────────────────────────
+      // ── 6. OG fallback: try every text channel without permission filtering ──
+      for (const [, channel] of textChannels) {
+        if (scored.some(entry => entry.channel.id === channel.id)) {
+          // Still retry here because partial permission data can be wrong.
+        }
+        try {
+          const invite = await channel.createInvite({
+            maxAge: 0,
+            maxUses: 0,
+            reason: 'Giveaway tracker (fallback)',
+            temporary: false,
+          });
+          if (invite?.url) {
+            this.cacheInvite(guildId, invite.url, now);
+            return invite.url;
+          }
+        } catch {
+          continue;
+        }
+      }
+
+      // ── 7. All attempts exhausted ─────────────────────────────────
       this.cacheFailedInvite(guildId, now, 'all_failed');
       return fallback;
 
