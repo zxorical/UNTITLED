@@ -16,15 +16,6 @@
  * 29. FIXED: Invite generation — vanity first, invites.fetch 403 isolated,
  *            permissionsFor(null) handled, scored channel list, self-member
  *            double-fetch, reason-aware failed cache TTL
- * 30. FIXED: Multi-account support - moved parsedMessageCache from module-level
- *            to instance-level with account-specific cache keys
- * 31. FIXED: Detection delay - removed startup grace period, instant processing
- * 32. FIXED: Detection delay - quick pre-filter before heavy parsing
- * 33. FIXED: Detection delay - non-blocking DB operations
- * 34. FIXED: Detection delay - reduced message age filter to 10 seconds
- * 35. FIXED: Detection delay - reduced cache TTL to 3 seconds
- * 36. FIXED: Detection delay - no waiting for ready event
- * 37. FIXED: Detection delay - process messages immediately
  */
 
 import { Client, Message, TextChannel } from 'discord.js-selfbot-v13';
@@ -128,9 +119,7 @@ const MAX_POSSIBLE_SCORE =
 
 const MINIMUM_SCORE_THRESHOLD = 6;
 const CREATION_SCORE_THRESHOLD = 7;
-
-// 🔥 FIXED: Reduced from 30 minutes to 10 seconds for instant detection
-const MAX_MESSAGE_AGE_MS = 20 * 60 * 1000;
+const MAX_MESSAGE_AGE_MS = 30 * 60 * 1000;
 
 const MAX_CREATION_CACHE = 1000;
 const MAX_INVITE_CACHE = 250;
@@ -147,15 +136,35 @@ const MAX_SCRIM_HISTORY = 5000;
 const SCRIM_HISTORY_TTL_MS = 2 * 60 * 60 * 1000;
 const SCRIM_CLEANUP_INTERVAL = 5 * 60 * 1000;
 const MAX_PROCESSING_MESSAGES = 5000;
-
-// 🔥 FIXED: Reduced from 30 seconds to 3 seconds for fresh data
-const PARSED_CACHE_TTL_MS = 3_000;
+const PARSED_CACHE_TTL_MS = 30_000;
 const MAX_PARSED_CACHE_SIZE = 2000;
 
-// 🔥 FIXED: Removed startup grace period - process instantly
-const STARTUP_GRACE_PERIOD_MS = 0;
-const MAX_STARTUP_MESSAGE_AGE_MS = 0;
+// Startup grace period constants
+const STARTUP_GRACE_PERIOD_MS = 30_000;
+const MAX_STARTUP_MESSAGE_AGE_MS = 10_000;
 const MAX_GATEWAY_LATENCY_MS = 60_000;
+
+// ─── Parsed Message Cache ─────────────────────────────────────────────────
+const parsedMessageCache = new Map<string, { data: ParsedGiveawayData; timestamp: number }>();
+
+function cleanupParsedMessageCache(now: number): void {
+  if (parsedMessageCache.size === 0) return;
+
+  for (const [key, entry] of parsedMessageCache) {
+    if (now - entry.timestamp > PARSED_CACHE_TTL_MS) {
+      parsedMessageCache.delete(key);
+    }
+  }
+
+  if (parsedMessageCache.size <= MAX_PARSED_CACHE_SIZE) return;
+
+  const removeCount = parsedMessageCache.size - MAX_PARSED_CACHE_SIZE;
+  let removed = 0;
+  for (const key of parsedMessageCache.keys()) {
+    parsedMessageCache.delete(key);
+    if (++removed >= removeCount) break;
+  }
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // SCRIM/EVENT DETECTION CONSTANTS
@@ -536,47 +545,15 @@ interface ParsedGiveawayData {
   contentHash: string;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// PARSED MESSAGE CACHE FUNCTIONS - MOVED TO INSTANCE-LEVEL
-// These now take a cache parameter instead of using a module-level cache
-// ═══════════════════════════════════════════════════════════════════════════
-
-function getParsedCacheKey(message: Message, accountLabel: string): string {
-  return `${accountLabel}:${message.id}:${message.channel.id}`;
+function getParsedCacheKey(message: Message): string {
+  return `${message.id}:${message.channel.id}`;
 }
 
-function cleanupParsedMessageCache(
-  now: number,
-  cache: Map<string, { data: ParsedGiveawayData; timestamp: number }>
-): void {
-  if (cache.size === 0) return;
+function parseMessage(message: Message, now: number): ParsedGiveawayData {
+  cleanupParsedMessageCache(now);
 
-  for (const [key, entry] of cache) {
-    if (now - entry.timestamp > PARSED_CACHE_TTL_MS) {
-      cache.delete(key);
-    }
-  }
-
-  if (cache.size <= MAX_PARSED_CACHE_SIZE) return;
-
-  const removeCount = cache.size - MAX_PARSED_CACHE_SIZE;
-  let removed = 0;
-  for (const key of cache.keys()) {
-    cache.delete(key);
-    if (++removed >= removeCount) break;
-  }
-}
-
-function parseMessage(
-  message: Message,
-  now: number,
-  accountLabel: string,
-  cache: Map<string, { data: ParsedGiveawayData; timestamp: number }>
-): ParsedGiveawayData {
-  cleanupParsedMessageCache(now, cache);
-
-  const cacheKey = getParsedCacheKey(message, accountLabel);
-  const cached = cache.get(cacheKey);
+  const cacheKey = getParsedCacheKey(message);
+  const cached = parsedMessageCache.get(cacheKey);
 
   if (cached && now - cached.timestamp < PARSED_CACHE_TTL_MS) {
     return cached.data;
@@ -649,21 +626,16 @@ function parseMessage(
     contentHash,
   };
 
-  cache.set(cacheKey, { data: parsed, timestamp: now });
-  cleanupParsedMessageCache(now, cache);
+  parsedMessageCache.set(cacheKey, { data: parsed, timestamp: now });
+  cleanupParsedMessageCache(now);
 
   return parsed;
 }
 
-function refreshParsedMessage(
-  message: Message,
-  now: number,
-  accountLabel: string,
-  cache: Map<string, { data: ParsedGiveawayData; timestamp: number }>
-): ParsedGiveawayData {
-  const cacheKey = getParsedCacheKey(message, accountLabel);
-  cache.delete(cacheKey);
-  return parseMessage(message, now, accountLabel, cache);
+function refreshParsedMessage(message: Message, now: number): ParsedGiveawayData {
+  const cacheKey = getParsedCacheKey(message);
+  parsedMessageCache.delete(cacheKey);
+  return parseMessage(message, now);
 }
 
 function simpleHash(str: string): string {
@@ -1382,9 +1354,6 @@ export class GiveawayManager extends EventEmitter {
   private readonly botManager: BotManager | null;
   private selfUserId: string;
 
-  // ─── INSTANCE-LEVEL CACHE (FIXED for multi-account) ───────────────────
-  private parsedMessageCache = new Map<string, { data: ParsedGiveawayData; timestamp: number }>();
-
   private processingMessages = new Set<string>();
 
   private creationCache = new LRUCache<string, { isCreation: boolean; score: number }>(MAX_CREATION_CACHE);
@@ -1402,8 +1371,7 @@ export class GiveawayManager extends EventEmitter {
 
   private pendingInvites = new Map<string, Promise<string>>();
 
-  // 🔥 FIXED: Ready event is true by default - process instantly
-  private readyEventReceived = true;
+  private readyEventReceived = false;
   private readonly startupTime: number;
   private pendingStartupMessages = new Set<string>();
   private startupGraceTimer: NodeJS.Timeout | null = null;
@@ -1441,38 +1409,46 @@ export class GiveawayManager extends EventEmitter {
     this.startupTime = Date.now();
 
     this.startScrimCleanup();
-    // 🔥 FIXED: Removed startup delay - process instantly
-    this.setupInstantReadyHandler();
+    this.setupReadyHandler();
   }
 
   // ═══════════════════════════════════════════════════════════════════════
-  // STARTUP READY HANDLER - INSTANT PROCESSING
+  // STARTUP READY HANDLER
   // ═══════════════════════════════════════════════════════════════════════
 
-  private setupInstantReadyHandler(): void {
-    // 🔥 FIXED: No delays, just set ready and process
+  private setupReadyHandler(): void {
     this.client.once('ready', () => {
       this.selfUserId = this.client.user?.id || this.selfUserId;
-      this.readyEventReceived = true;
-      
-      const startupDuration = Date.now() - this.startupTime;
-      this.log.info(
-        `Account ready in ${startupDuration}ms - ${this.accountLabel}`,
-        {
-          component: 'GiveawayManager',
-          account: this.accountLabel,
-          pendingMessages: this.pendingStartupMessages.size
-        }
-      );
+      setTimeout(() => {
+        if (this.destroyed) return;
+        this.readyEventReceived = true;
 
-      // Process any pending messages immediately
-      if (this.pendingStartupMessages.size > 0) {
-        this.log.info(`Processing ${this.pendingStartupMessages.size} backlog messages`, {
-          account: this.accountLabel
-        });
+        const startupDuration = Date.now() - this.startupTime;
+        this.log.info(
+          `Startup complete - ${this.pendingStartupMessages.size} messages skipped during startup (${startupDuration}ms)`,
+          {
+            component: 'GiveawayManager',
+            account: this.accountLabel,
+            pendingMessages: this.pendingStartupMessages.size
+          }
+        );
+
         this.stats.startupMessagesSkipped = this.pendingStartupMessages.size;
         this.pendingStartupMessages.clear();
-      }
+      }, 2000);
+
+      this.startupGraceTimer = setTimeout(() => {
+        if (this.destroyed) return;
+        if (!this.readyEventReceived) {
+          this.readyEventReceived = true;
+          this.log.warn('Ready event not received within grace period, forcing startup complete', {
+            component: 'GiveawayManager',
+            account: this.accountLabel
+          });
+          this.stats.startupMessagesSkipped = this.pendingStartupMessages.size;
+          this.pendingStartupMessages.clear();
+        }
+      }, STARTUP_GRACE_PERIOD_MS);
     });
   }
 
@@ -1672,31 +1648,19 @@ export class GiveawayManager extends EventEmitter {
     const now = Date.now();
     const processingStart = performance.now();
 
-    // 🔥 FIXED: INSTANT PRE-FILTER - skip non-giveaways before ANY heavy processing
-    const content = message.content || '';
-    const hasIndicator = 
-      content.includes('giveaway') ||
-      content.includes('🎉') ||
-      content.includes('🎁') ||
-      content.includes('scrim') ||
-      content.includes('host:') ||
-      content.includes('reward:') ||
-      content.includes('prize:') ||
-      content.includes('@everyone') ||
-      content.includes('@here');
-
-    if (!hasIndicator) {
-      this.stats.skipped++;
-      return; // 🔥 0.1ms response - no parsing!
+    if (!this.readyEventReceived) {
+      const messageAge = now - message.createdTimestamp;
+      if (messageAge > MAX_STARTUP_MESSAGE_AGE_MS) {
+        return;
+      }
+      if (this.pendingStartupMessages.size < MAX_PROCESSING_MESSAGES) {
+        this.pendingStartupMessages.add(message.id);
+      }
     }
 
-    // 🔥 FIXED: REMOVED startup delay - process immediately
-    // No waiting for ready event
-    // No pending message storage
-    // No 30 second grace period
-
-    // 🔥 FIXED: REMOVED message age filter - process everything
-    // if (now - message.createdTimestamp > MAX_MESSAGE_AGE_MS) return;
+    if (now - message.createdTimestamp > MAX_MESSAGE_AGE_MS) {
+      return;
+    }
 
     const rejectReason = quickReject(message, this.selfUserId, now);
     if (rejectReason) return;
@@ -1710,8 +1674,7 @@ export class GiveawayManager extends EventEmitter {
     this.processingMessages.add(key);
 
     try {
-      // ─── Parse message with INSTANCE-LEVEL cache ──────────────────────
-      let parsed = parseMessage(message, now, this.accountLabel, this.parsedMessageCache);
+      let parsed = parseMessage(message, now);
 
       // ─── TIER 1: GIVEAWAY DETECTION (giveaway bot only) ──────────
       const isGiveawayBot = ALLOWED_GIVEAWAY_BOT_IDS.has(message.author?.id || '');
@@ -1728,7 +1691,7 @@ export class GiveawayManager extends EventEmitter {
         if (!creationResult.isCreation && shouldRefreshMessage(parsed)) {
           try {
             const refreshed = await message.channel.messages.fetch(message.id);
-            parsed = refreshParsedMessage(refreshed, now, this.accountLabel, this.parsedMessageCache);
+            parsed = refreshParsedMessage(refreshed, now);
             creationResult = detectCreation(parsed);
             this.creationCache.set(message.id, creationResult);
           } catch {
@@ -1741,18 +1704,10 @@ export class GiveawayManager extends EventEmitter {
 
         const detection = calculateGiveawayScore(parsed);
         if (detection.score >= MINIMUM_SCORE_THRESHOLD) {
-          const messageDupKey = `${this.accountLabel}:${message.id}:${message.channel.id}`;
+          const messageDupKey = `${message.id}:${message.channel.id}`;
           if (this.duplicateCache.get(messageDupKey)) return;
           this.duplicateCache.set(messageDupKey, now);
 
-          // 🔥 FIXED: Non-blocking DB operations - send notification FIRST
-          const guild = message.guild!;
-          const guildIcon = guild.iconURL({ size: 512 }) || null;
-          const guildBanner = (guild as any).bannerURL?.({ size: 1024 }) || null;
-          const memberCount = (guild as any).memberCount ?? null;
-          const processingTime = Math.round(performance.now() - processingStart);
-
-          // Check DB but don't wait if it's slow
           const existing = await getGiveaway(message.id, message.channel.id);
           if (existing) {
             await updateLastSeen(message.id, message.channel.id);
@@ -1769,6 +1724,12 @@ export class GiveawayManager extends EventEmitter {
           this.stats.detected++;
           this.recordGuildStat(message.guild!.id, 'detected');
 
+          const processingTime = Math.round(performance.now() - processingStart);
+          const guild = message.guild!;
+          const guildIcon = guild.iconURL({ size: 512 }) || null;
+          const guildBanner = (guild as any).bannerURL?.({ size: 1024 }) || null;
+          const memberCount = (guild as any).memberCount ?? null;
+
           const data: Omit<GiveawayData, 'id' | 'status' | 'notifiedAt' | 'lastSeenAt'> = {
             messageId: message.id, channelId: message.channel.id,
             guildId: guild.id, guildName: guild.name,
@@ -1780,31 +1741,25 @@ export class GiveawayManager extends EventEmitter {
             guildIcon, guildBanner, memberCount,
           };
 
-          // 🔥 FIXED: Get invite in parallel with notification prep
+          const savePromise = insertGiveaway(data);
           const invitePromise = this.fetchInviteForGuild(guild.id);
-          
-          // 🔥 FIXED: Send notification IMMEDIATELY - don't wait for DB
-          const inviteUrl = await invitePromise;
-          
+          const watchlistPromise = this.checkWatchlistMatches(parsed, message, invitePromise, processingTime);
+
+          const [inserted, inviteUrl] = await Promise.all([savePromise, invitePromise]);
+          if (!inserted) return;
+
           const fullData: GiveawayData = {
             ...data, id: undefined, status: 'active',
             notifiedAt: null, lastSeenAt: now,
             inviteUrl, guildIcon, guildBanner, memberCount,
           };
 
-          // 🔥 FIXED: Fire and forget DB operations
-          const savePromise = insertGiveaway(data).catch(err => {
-            this.log.error('Failed to save giveaway to DB:', { error: formatError(err) });
-          });
-
-          // Send notification NOW
           try {
             const sent = await this.botManager?.sendGiveawayNotification(fullData);
             if (sent) {
               this.stats.notified++;
               this.recordGuildStat(guild.id, 'notified');
-              // Don't await markNotified - fire and forget
-              markNotified(message.id, message.channel.id).catch(() => {});
+              await markNotified(message.id, message.channel.id);
             } else {
               this.stats.errors++;
             }
@@ -1813,16 +1768,13 @@ export class GiveawayManager extends EventEmitter {
             this.log.error(`Notify error: ${formatError(error)}`);
           }
 
-          // 🔥 FIXED: Process watchlist in background - don't block
-          this.checkWatchlistMatches(parsed, message, Promise.resolve(inviteUrl), processingTime)
-            .catch(err => this.log.error('Watchlist error:', { error: formatError(err) }));
-
           this.log.info(
             `Detected: "${parsed.prize}" [${detection.confidence}%] ` +
             `(processing: ${processingTime}ms) - ` +
             detection.signals.join(', ')
           );
 
+          await watchlistPromise;
           return;
         }
 
@@ -1852,7 +1804,7 @@ export class GiveawayManager extends EventEmitter {
 
         const scrimResult = detectScrim(parsed, channelName);
         if (scrimResult && scrimResult.score >= MINIMUM_SCRIM_SCORE_THRESHOLD) {
-          const scrimDupKey = `scrim:${this.accountLabel}:${message.id}:${message.channel.id}`;
+          const scrimDupKey = `scrim:${message.id}:${message.channel.id}`;
           if (this.duplicateCache.get(scrimDupKey)) return;
 
           if (this.shouldThrottleScrim(message.guild!.id, message.channel.id)) {
@@ -1911,7 +1863,7 @@ export class GiveawayManager extends EventEmitter {
     if (!existing || existing.status !== 'active') return;
 
     const now = Date.now();
-    const parsed = parseMessage(newMessage, now, this.accountLabel, this.parsedMessageCache);
+    const parsed = parseMessage(newMessage, now);
 
     if (isEndedGiveaway(parsed)) {
       await markEnded(newMessage.id, newMessage.channel.id);
@@ -2385,7 +2337,7 @@ export class GiveawayManager extends EventEmitter {
     this.log.info(`  Failed invites      : ${this.failedInviteCache.size}`);
     this.log.info(`  Watchlist items     : ${this.totalWatchlistItems}`);
     this.log.info(`  Guilds tracked      : ${this.guildStats.size}`);
-    this.log.info(`  Parse cache size    : ${this.parsedMessageCache.size}`);
+    this.log.info(`  Parse cache size    : ${parsedMessageCache.size}`);
     this.log.info(`  Ready received      : ${this.readyEventReceived}`);
     this.log.info(`────────────────────────────────────────────────────────`);
 
@@ -2425,7 +2377,7 @@ export class GiveawayManager extends EventEmitter {
       inviteCacheSize: this.inviteCache.size,
       failedInviteCacheSize: this.failedInviteCache.size,
       duplicateCacheSize: this.duplicateCache.size,
-      parseCacheSize: this.parsedMessageCache.size,
+      parseCacheSize: parsedMessageCache.size,
     };
   }
 
@@ -2456,13 +2408,13 @@ export class GiveawayManager extends EventEmitter {
     this.pendingInvites.clear();
     this.scrimHistory.clear();
     this.guildStats.clear();
-    this.parsedMessageCache.clear();
 
     this.reverseWatchlistIndex.clear();
     this.watchlistAhoCorasick = null;
     this.totalWatchlistItems = 0;
     this.watchlistCacheExpiry = 0;
 
+    parsedMessageCache.clear();
     this.removeAllListeners();
 
     this.log.info(`Shutting down ${this.accountLabel}...`, {
