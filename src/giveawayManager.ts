@@ -130,7 +130,7 @@ const MINIMUM_SCORE_THRESHOLD = 6;
 const CREATION_SCORE_THRESHOLD = 7;
 
 // 🔥 FIXED: Reduced from 30 minutes to 10 seconds for instant detection
-const MAX_MESSAGE_AGE_MS = 10 * 1000;
+const MAX_MESSAGE_AGE_MS = 20 * 60 * 1000;
 
 const MAX_CREATION_CACHE = 1000;
 const MAX_INVITE_CACHE = 250;
