@@ -1509,7 +1509,7 @@ export class GiveawayManager extends EventEmitter {
 
       // 🔥 SMART: Scan past giveaways on startup
       this.scanAllPastGiveaways().catch(err => {
-        this.log.error(`[${this.accountLabel}] Past scan failed:`, formatError(err));
+        this.log.error(`[${this.accountLabel}] Past scan failed:`, { error: formatError(err) });
       });
 
       // Process any pending messages
@@ -1642,7 +1642,8 @@ export class GiveawayManager extends EventEmitter {
       }
       
     } catch (error) {
-      this.log.error(`[${this.accountLabel}] Past scan error in #${channel.name}:`, formatError(error));
+      this.log.error(`[${this.accountLabel}] Past scan error in #${channel.name}:`, { error: formatError(error) });
+
     }
   }
 
@@ -1726,7 +1727,7 @@ export class GiveawayManager extends EventEmitter {
         await delay(300); // Stagger between channels
         
       } catch (error) {
-        this.log.error(`[${this.accountLabel}] Failed to scan ${channelId}:`, formatError(error));
+        this.log.error(`[${this.accountLabel}] Failed to scan ${channelId}:`, { error: formatError(error) });
       }
     }
     
