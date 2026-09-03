@@ -25,6 +25,10 @@
  * 35. FIXED: Detection delay - reduced cache TTL to 3 seconds
  * 36. FIXED: Detection delay - no waiting for ready event
  * 37. FIXED: Detection delay - process messages immediately
+ * 38. FIXED: Smart channel scanning - 15 minutes deep in giveaway channels
+ * 39. FIXED: Periodic rescan - catches missed giveaways every 5 minutes
+ * 40. FIXED: Different scan depths per channel type (giveaway/scrim/event/general)
+ * 41. FIXED: Font/unicode channel name handling for different servers
  */
 
 import { Client, Message, TextChannel } from 'discord.js-selfbot-v13';
@@ -129,8 +133,12 @@ const MAX_POSSIBLE_SCORE =
 const MINIMUM_SCORE_THRESHOLD = 6;
 const CREATION_SCORE_THRESHOLD = 7;
 
-// 🔥 FIXED: Reduced from 30 minutes to 10 seconds for instant detection
-const MAX_MESSAGE_AGE_MS = 10 * 1000;
+// 🔥 SMART: Different max ages for different channel types
+const MAX_MESSAGE_AGE_MS = 10 * 1000; // 10 seconds for real-time
+const PAST_SCAN_MAX_AGE_GIVEAWAY = 15 * 60 * 1000; // 15 MINUTES DEEP for giveaway channels
+const PAST_SCAN_MAX_AGE_SCRIM = 10 * 60 * 1000; // 10 minutes for scrim channels
+const PAST_SCAN_MAX_AGE_EVENT = 20 * 60 * 1000; // 20 minutes for event channels
+const PAST_SCAN_MAX_AGE_GENERAL = 30 * 1000; // 30 seconds for general channels
 
 const MAX_CREATION_CACHE = 1000;
 const MAX_INVITE_CACHE = 250;
@@ -148,14 +156,15 @@ const SCRIM_HISTORY_TTL_MS = 2 * 60 * 60 * 1000;
 const SCRIM_CLEANUP_INTERVAL = 5 * 60 * 1000;
 const MAX_PROCESSING_MESSAGES = 5000;
 
-// 🔥 FIXED: Reduced from 30 seconds to 3 seconds for fresh data
 const PARSED_CACHE_TTL_MS = 3_000;
 const MAX_PARSED_CACHE_SIZE = 2000;
 
-// 🔥 FIXED: Removed startup grace period - process instantly
 const STARTUP_GRACE_PERIOD_MS = 0;
 const MAX_STARTUP_MESSAGE_AGE_MS = 0;
 const MAX_GATEWAY_LATENCY_MS = 60_000;
+
+// 🔥 SMART: Rescan interval - catch missed giveaways
+const RESCAN_INTERVAL_MS = 5 * 60 * 1000; // Every 5 minutes
 
 // ═══════════════════════════════════════════════════════════════════════════
 // SCRIM/EVENT DETECTION CONSTANTS
@@ -317,6 +326,38 @@ function classifyEventChannel(value: string): 'scrim' | 'squid_game' | 'gagaball
 
 function isEventChannel(value: string): boolean {
   return classifyEventChannel(value) !== null;
+}
+
+// 🔥 SMART: Channel classification for scanning depth
+function classifyChannelType(channelName: string): 'giveaway' | 'scrim' | 'event' | 'general' {
+  const name = normalizeChannelName(channelName);
+  if (!name) return 'general';
+  
+  if (name.includes('giveaway') || 
+      name.includes('raffle') || 
+      name.includes('sweepstakes') ||
+      name.includes('prize') ||
+      name.includes('gift') ||
+      name.includes('gаvеаwаy')) { // Handles different fonts
+    return 'giveaway';
+  }
+  
+  if (name.includes('scrim') || 
+      name.includes('tournament') || 
+      name.includes('comp') ||
+      name.includes('match') ||
+      name.includes('scrims')) {
+    return 'scrim';
+  }
+  
+  if (name.includes('event') || 
+      name.includes('announcement') || 
+      name.includes('news') ||
+      name.includes('updates')) {
+    return 'event';
+  }
+  
+  return 'general';
 }
 
 const REGION_CONTEXT_KEYWORDS = [
@@ -538,7 +579,6 @@ interface ParsedGiveawayData {
 
 // ═══════════════════════════════════════════════════════════════════════════
 // PARSED MESSAGE CACHE FUNCTIONS - MOVED TO INSTANCE-LEVEL
-// These now take a cache parameter instead of using a module-level cache
 // ═══════════════════════════════════════════════════════════════════════════
 
 function getParsedCacheKey(message: Message, accountLabel: string): string {
@@ -1382,7 +1422,7 @@ export class GiveawayManager extends EventEmitter {
   private readonly botManager: BotManager | null;
   private selfUserId: string;
 
-  // ─── INSTANCE-LEVEL CACHE (FIXED for multi-account) ───────────────────
+  // ─── INSTANCE-LEVEL CACHE ──────────────────────────────────────────────
   private parsedMessageCache = new Map<string, { data: ParsedGiveawayData; timestamp: number }>();
 
   private processingMessages = new Set<string>();
@@ -1402,12 +1442,14 @@ export class GiveawayManager extends EventEmitter {
 
   private pendingInvites = new Map<string, Promise<string>>();
 
-  // 🔥 FIXED: Ready event is true by default - process instantly
   private readyEventReceived = true;
   private readonly startupTime: number;
   private pendingStartupMessages = new Set<string>();
   private startupGraceTimer: NodeJS.Timeout | null = null;
   private destroyed = false;
+
+  // 🔥 SMART: Periodic rescan timer
+  private rescanTimer: NodeJS.Timeout | null = null;
 
   private stats = {
     detected: 0, notified: 0, skipped: 0, errors: 0,
@@ -1416,6 +1458,7 @@ export class GiveawayManager extends EventEmitter {
     startupMessagesSkipped: 0,
     scrimsDetected: 0,
     scrimsNotified: 0,
+    pastDetected: 0,
   };
 
   private guildStats = new Map<string, {
@@ -1441,8 +1484,8 @@ export class GiveawayManager extends EventEmitter {
     this.startupTime = Date.now();
 
     this.startScrimCleanup();
-    // 🔥 FIXED: Removed startup delay - process instantly
     this.setupInstantReadyHandler();
+    this.startPeriodicRescan();
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -1450,7 +1493,6 @@ export class GiveawayManager extends EventEmitter {
   // ═══════════════════════════════════════════════════════════════════════
 
   private setupInstantReadyHandler(): void {
-    // 🔥 FIXED: No delays, just set ready and process
     this.client.once('ready', () => {
       this.selfUserId = this.client.user?.id || this.selfUserId;
       this.readyEventReceived = true;
@@ -1465,7 +1507,12 @@ export class GiveawayManager extends EventEmitter {
         }
       );
 
-      // Process any pending messages immediately
+      // 🔥 SMART: Scan past giveaways on startup
+      this.scanAllPastGiveaways().catch(err => {
+        this.log.error(`[${this.accountLabel}] Past scan failed:`, formatError(err));
+      });
+
+      // Process any pending messages
       if (this.pendingStartupMessages.size > 0) {
         this.log.info(`Processing ${this.pendingStartupMessages.size} backlog messages`, {
           account: this.accountLabel
@@ -1474,6 +1521,216 @@ export class GiveawayManager extends EventEmitter {
         this.pendingStartupMessages.clear();
       }
     });
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // 🔥 SMART: PERIODIC RESCAN - Catches missed giveaways every 5 minutes
+  // ═══════════════════════════════════════════════════════════════════════
+
+  private startPeriodicRescan(): void {
+    if (this.rescanTimer) clearInterval(this.rescanTimer);
+
+    this.rescanTimer = setInterval(() => {
+      if (this.destroyed) return;
+
+      this.log.debug(`[${this.accountLabel}] Periodic rescan...`);
+      
+      // Only scan high-priority channels to avoid rate limits
+      const channels = CONFIG.monitoredChannels || [];
+      
+      if (channels.length === 0) {
+        // Scan all guilds' giveaway/scrim channels
+        this.scanAllPastGiveaways().catch(() => {});
+        return;
+      }
+
+      for (const channelId of channels) {
+        const channel = this.client.channels.cache.get(channelId) as TextChannel;
+        if (!channel) continue;
+        
+        const channelType = classifyChannelType((channel as any).name || '');
+        
+        // Only rescan giveaway and scrim channels
+        if (channelType === 'giveaway' || channelType === 'scrim') {
+          this.scanPastGiveawaysSmart(channel).catch(() => {});
+        }
+      }
+    }, RESCAN_INTERVAL_MS);
+
+    this.rescanTimer.unref?.();
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // 🔥 SMART: PAST SCAN - Different depths per channel type
+  // ═══════════════════════════════════════════════════════════════════════
+
+  private async scanPastGiveawaysSmart(channel: TextChannel): Promise<void> {
+    try {
+      const channelName = (channel as any).name || '';
+      const channelType = classifyChannelType(channelName);
+      
+      // Determine scan settings based on channel type
+      let maxAge: number;
+      let limit: number;
+      let delayMs: number;
+      
+      switch (channelType) {
+        case 'giveaway':
+          maxAge = PAST_SCAN_MAX_AGE_GIVEAWAY; // 15 MINUTES DEEP
+          limit = 200;
+          delayMs = 30;
+          break;
+        case 'scrim':
+          maxAge = PAST_SCAN_MAX_AGE_SCRIM; // 10 minutes
+          limit = 150;
+          delayMs = 50;
+          break;
+        case 'event':
+          maxAge = PAST_SCAN_MAX_AGE_EVENT; // 20 minutes
+          limit = 100;
+          delayMs = 75;
+          break;
+        default:
+          maxAge = PAST_SCAN_MAX_AGE_GENERAL; // 30 seconds
+          limit = 50;
+          delayMs = 100;
+          return; // Skip general channels entirely
+      }
+      
+      // Check if channel has recent activity
+      const lastMessage = await channel.messages.fetch({ limit: 1 });
+      const lastMsg = lastMessage.first();
+      if (!lastMsg) return;
+      
+      const lastMsgAge = Date.now() - lastMsg.createdTimestamp;
+      if (lastMsgAge > maxAge) {
+        this.log.debug(`[${this.accountLabel}] #${channelName} inactive - skipping`);
+        return;
+      }
+      
+      this.log.info(
+        `[${this.accountLabel}] Scanning #${channelName} (${channelType}) - ` +
+        `limit: ${limit}, maxAge: ${maxAge/1000}s`
+      );
+      
+      const messages = await channel.messages.fetch({ limit });
+      const now = Date.now();
+      let found = 0;
+      
+      for (const [, message] of messages) {
+        // Skip if already processed
+        const existing = await getGiveaway(message.id, channel.id);
+        if (existing) continue;
+        
+        const messageAge = now - message.createdTimestamp;
+        if (messageAge > maxAge) continue;
+        
+        // Check if it's a giveaway based on channel type
+        const content = message.content || '';
+        const isMatch = this.isGiveawayMessage(content, message, channelType);
+        
+        if (isMatch) {
+          await this.handleMessage(message);
+          found++;
+          this.stats.pastDetected++;
+          await delay(delayMs);
+        }
+      }
+      
+      if (found > 0) {
+        this.log.info(`[${this.accountLabel}] Found ${found} past items in #${channelName}`);
+      }
+      
+    } catch (error) {
+      this.log.error(`[${this.accountLabel}] Past scan error in #${channel.name}:`, formatError(error));
+    }
+  }
+
+  private isGiveawayMessage(content: string, message: Message, channelType: string): boolean {
+    // For giveaway channels - very lenient
+    if (channelType === 'giveaway') {
+      return (
+        content.includes('giveaway') ||
+        content.includes('🎉') ||
+        content.includes('🎁') ||
+        message.embeds?.length > 0 ||
+        content.includes('win') ||
+        content.includes('prize') ||
+        content.includes('raffle')
+      );
+    }
+    
+    // For scrim channels
+    if (channelType === 'scrim') {
+      return (
+        content.includes('scrim') ||
+        content.includes('host:') ||
+        content.includes('reward:') ||
+        content.includes('team:') ||
+        content.includes('@everyone')
+      );
+    }
+    
+    // For event channels
+    if (channelType === 'event') {
+      return (
+        content.includes('event') ||
+        content.includes('tournament') ||
+        content.includes('competition') ||
+        content.includes('register')
+      );
+    }
+    
+    // General - strict
+    return (
+      content.includes('giveaway') ||
+      content.includes('🎉') ||
+      content.includes('🎁')
+    );
+  }
+
+  // ─── SCAN ALL CHANNELS ───────────────────────────────────────────────────
+
+  public async scanAllPastGiveaways(): Promise<void> {
+    if (this.destroyed) return;
+    
+    this.log.info(`[${this.accountLabel}] Scanning all channels for past giveaways...`);
+    
+    const channels = CONFIG.monitoredChannels || [];
+    
+    if (channels.length === 0) {
+      // Scan ALL text channels in ALL guilds
+      this.log.warn(`[${this.accountLabel}] No monitored channels - scanning ALL text channels`);
+      
+      for (const [, guild] of this.client.guilds.cache) {
+        for (const [, channel] of guild.channels.cache) {
+          if (channel.type === 'GUILD_TEXT') {
+            await this.scanPastGiveawaysSmart(channel as TextChannel);
+            await delay(100);
+          }
+        }
+      }
+      return;
+    }
+    
+    // Scan monitored channels with smart settings
+    let totalFound = 0;
+    for (const channelId of channels) {
+      try {
+        const channel = this.client.channels.cache.get(channelId) as TextChannel;
+        if (!channel) continue;
+        
+        const beforeScan = this.stats.pastDetected;
+        await this.scanPastGiveawaysSmart(channel);
+        totalFound += this.stats.pastDetected - beforeScan;
+        await delay(300); // Stagger between channels
+        
+      } catch (error) {
+        this.log.error(`[${this.accountLabel}] Failed to scan ${channelId}:`, formatError(error));
+      }
+    }
+    
+    this.log.info(`[${this.accountLabel}] Past scan complete! Found ${totalFound} items`);
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -1672,7 +1929,7 @@ export class GiveawayManager extends EventEmitter {
     const now = Date.now();
     const processingStart = performance.now();
 
-    // 🔥 FIXED: INSTANT PRE-FILTER - skip non-giveaways before ANY heavy processing
+    // 🔥 INSTANT PRE-FILTER - skip non-giveaways before ANY heavy processing
     const content = message.content || '';
     const hasIndicator = 
       content.includes('giveaway') ||
@@ -1687,16 +1944,8 @@ export class GiveawayManager extends EventEmitter {
 
     if (!hasIndicator) {
       this.stats.skipped++;
-      return; // 🔥 0.1ms response - no parsing!
+      return;
     }
-
-    // 🔥 FIXED: REMOVED startup delay - process immediately
-    // No waiting for ready event
-    // No pending message storage
-    // No 30 second grace period
-
-    // 🔥 FIXED: REMOVED message age filter - process everything
-    // if (now - message.createdTimestamp > MAX_MESSAGE_AGE_MS) return;
 
     const rejectReason = quickReject(message, this.selfUserId, now);
     if (rejectReason) return;
@@ -1710,10 +1959,8 @@ export class GiveawayManager extends EventEmitter {
     this.processingMessages.add(key);
 
     try {
-      // ─── Parse message with INSTANCE-LEVEL cache ──────────────────────
       let parsed = parseMessage(message, now, this.accountLabel, this.parsedMessageCache);
 
-      // ─── TIER 1: GIVEAWAY DETECTION (giveaway bot only) ──────────
       const isGiveawayBot = ALLOWED_GIVEAWAY_BOT_IDS.has(message.author?.id || '');
 
       if (isGiveawayBot && message.author?.bot) {
@@ -1745,14 +1992,12 @@ export class GiveawayManager extends EventEmitter {
           if (this.duplicateCache.get(messageDupKey)) return;
           this.duplicateCache.set(messageDupKey, now);
 
-          // 🔥 FIXED: Non-blocking DB operations - send notification FIRST
           const guild = message.guild!;
           const guildIcon = guild.iconURL({ size: 512 }) || null;
           const guildBanner = (guild as any).bannerURL?.({ size: 1024 }) || null;
           const memberCount = (guild as any).memberCount ?? null;
           const processingTime = Math.round(performance.now() - processingStart);
 
-          // Check DB but don't wait if it's slow
           const existing = await getGiveaway(message.id, message.channel.id);
           if (existing) {
             await updateLastSeen(message.id, message.channel.id);
@@ -1780,10 +2025,7 @@ export class GiveawayManager extends EventEmitter {
             guildIcon, guildBanner, memberCount,
           };
 
-          // 🔥 FIXED: Get invite in parallel with notification prep
           const invitePromise = this.fetchInviteForGuild(guild.id);
-          
-          // 🔥 FIXED: Send notification IMMEDIATELY - don't wait for DB
           const inviteUrl = await invitePromise;
           
           const fullData: GiveawayData = {
@@ -1792,8 +2034,8 @@ export class GiveawayManager extends EventEmitter {
             inviteUrl, guildIcon, guildBanner, memberCount,
           };
 
-          // 🔥 FIXED: Fire and forget DB operations
-          const savePromise = insertGiveaway(data).catch(err => {
+          // Fire and forget DB
+          insertGiveaway(data).catch(err => {
             this.log.error('Failed to save giveaway to DB:', { error: formatError(err) });
           });
 
@@ -1803,7 +2045,6 @@ export class GiveawayManager extends EventEmitter {
             if (sent) {
               this.stats.notified++;
               this.recordGuildStat(guild.id, 'notified');
-              // Don't await markNotified - fire and forget
               markNotified(message.id, message.channel.id).catch(() => {});
             } else {
               this.stats.errors++;
@@ -1813,7 +2054,7 @@ export class GiveawayManager extends EventEmitter {
             this.log.error(`Notify error: ${formatError(error)}`);
           }
 
-          // 🔥 FIXED: Process watchlist in background - don't block
+          // Process watchlist in background
           this.checkWatchlistMatches(parsed, message, Promise.resolve(inviteUrl), processingTime)
             .catch(err => this.log.error('Watchlist error:', { error: formatError(err) }));
 
@@ -1830,7 +2071,7 @@ export class GiveawayManager extends EventEmitter {
         return;
       }
 
-      // ─── TIER 2: SCRIM/EVENT DETECTION (non-bot messages) ─────────
+      // ─── TIER 2: SCRIM/EVENT DETECTION ──────────────────────────────
       if (!parsed.isFromBot) {
         if (!/scrim|squid|gaga|event|host|reward|prize|team|region/i.test(parsed.lowerText)) {
           this.stats.falsePositivesBlocked++;
@@ -2090,29 +2331,18 @@ export class GiveawayManager extends EventEmitter {
 
   // ═══════════════════════════════════════════════════════════════════════
   // INVITE GENERATION — FIXED (v29)
-  //
-  // Root causes addressed:
-  //   1. permissionsFor() returns null on partial guild cache → null-safe
-  //   2. guild.invites.fetch() 403 was bubbling and aborting function → isolated
-  //   3. Vanity URL moved before invites.fetch() (free, no perms needed)
-  //   4. Channel iteration now uses a scored list best-first, single loop
-  //   5. self-member fetch now retries with force:true on first failure
-  //   6. cacheFailedInvite accepts reason → structural failures get 4× TTL
   // ═══════════════════════════════════════════════════════════════════════
 
   private async fetchInviteForGuild(guildId: string): Promise<string> {
     const now = Date.now();
     const fallback = `https://discord.com/channels/${guildId}`;
 
-    // Hard-failed recently — don't hammer API
     const failedUntil = this.failedInviteCache.get(guildId);
     if (failedUntil && failedUntil > now) return fallback;
 
-    // Valid cached invite
     const cached = this.inviteCache.get(guildId);
     if (cached && cached.expiresAt > now) return cached.url;
 
-    // Deduplicate concurrent calls for same guild
     const pending = this.pendingInvites.get(guildId);
     if (pending) return pending;
 
@@ -2135,7 +2365,6 @@ export class GiveawayManager extends EventEmitter {
         return fallback;
       }
 
-      // ── 1. Vanity URL (free, no MANAGE_GUILD needed) ─────────────
       try {
         const vanity = (guild as any).vanityURLCode as string | null | undefined;
         if (vanity) {
@@ -2144,11 +2373,9 @@ export class GiveawayManager extends EventEmitter {
           return url;
         }
       } catch {
-        // vanityURLCode access can throw on partial guilds — ignore
+        // ignore
       }
 
-      // ── 2. Fetch existing invites (requires MANAGE_GUILD) ─────────
-      // Isolated so a 403 doesn't abort the rest of the function.
       try {
         const invites = await guild.invites.fetch();
         if (invites?.size) {
@@ -2162,35 +2389,25 @@ export class GiveawayManager extends EventEmitter {
           }
         }
       } catch (err: any) {
-        // 403 / 50013 = no MANAGE_GUILD — expected, skip silently
         const code = err?.code ?? err?.httpStatus;
         if (code !== 403 && code !== 50013) {
-          this.log.debug(`invites.fetch non-perm error guild ${guildId}: ${formatError(err)}`);
+          this.log.debug(`invites.fetch error guild ${guildId}: ${formatError(err)}`);
         }
-        // Fall through to createInvite path
       }
 
-      // ── 3. Resolve self member for permission checks ──────────────
       let botMember = this.selfUserId ? guild.members.cache.get(this.selfUserId) : undefined;
       if (!botMember && this.selfUserId) {
         try {
           botMember = await guild.members.fetch({ user: this.selfUserId, force: false });
         } catch {
-          // Retry with force:true
           try {
             botMember = await guild.members.fetch({ user: this.selfUserId, force: true });
           } catch (fetchErr) {
             this.log.debug(`Cannot fetch self member in ${guildId}: ${formatError(fetchErr)}`);
-            // botMember stays undefined — we'll try channels without perm filtering
           }
         }
       }
 
-      // ── 4. Score text channels by invite-ability ──────────────────
-      // Score 2: explicit overwrite grant
-      // Score 1: permissionsFor() passes
-      // Score 0: permissionsFor() returned null (partial guild data)
-      // Excluded: permissionsFor() explicitly denies
       const textChannels = guild.channels.cache.filter(
         (ch): ch is TextChannel => ch.type === 'GUILD_TEXT'
       );
@@ -2211,30 +2428,23 @@ export class GiveawayManager extends EventEmitter {
             const perms = ch.permissionsFor(botMember);
 
             if (perms === null) {
-              // null means partial guild cache; unknown — include at score 0
               score = 0;
             } else if (perms.has('CREATE_INSTANT_INVITE')) {
-              // Check if explicitly granted via overwrite (score 2) or inherited (score 1)
               const overwrite = ch.permissionOverwrites?.cache.get(this.selfUserId);
               score = overwrite?.allow?.has('CREATE_INSTANT_INVITE') ? 2 : 1;
             } else {
-              // Explicitly denied — skip channel entirely
               continue;
             }
           } catch {
-            // permissionsFor threw (evicted partial data) — include at score 0
             score = 0;
           }
         }
-        // If botMember is null we have no info — include everything at score 0
 
         scored.push({ channel: ch, score });
       }
 
-      // Sort best candidates first
       scored.sort((a, b) => b.score - a.score);
 
-      // ── 5. Try createInvite on scored channels ────────────────────
       const INVITE_OPTIONS = {
         maxAge: 0,
         maxUses: 0,
@@ -2256,11 +2466,7 @@ export class GiveawayManager extends EventEmitter {
         }
       }
 
-      // ── 6. OG fallback: try every text channel without permission filtering ──
       for (const [, channel] of textChannels) {
-        if (scored.some(entry => entry.channel.id === channel.id)) {
-          // Still retry here because partial permission data can be wrong.
-        }
         try {
           const invite = await channel.createInvite({
             maxAge: 0,
@@ -2277,7 +2483,6 @@ export class GiveawayManager extends EventEmitter {
         }
       }
 
-      // ── 7. All attempts exhausted ─────────────────────────────────
       this.cacheFailedInvite(guildId, now, 'all_failed');
       return fallback;
 
@@ -2292,15 +2497,14 @@ export class GiveawayManager extends EventEmitter {
     this.inviteCache.set(guildId, { url, expiresAt: now + INVITE_CACHE_TTL });
   }
 
-  // Reason-aware TTL: structural failures are retried much less often
   private cacheFailedInvite(
     guildId: string,
     now: number,
     reason: InviteFailReason = 'all_failed',
   ): void {
     const retryMs = (reason === 'no_guild' || reason === 'no_text_channels')
-      ? FAILED_INVITE_RETRY_MS * 4   // 60 min — structural, won't change soon
-      : FAILED_INVITE_RETRY_MS;      // 15 min — might be transient
+      ? FAILED_INVITE_RETRY_MS * 4
+      : FAILED_INVITE_RETRY_MS;
 
     this.failedInviteCache.set(guildId, now + retryMs);
     this.log.debug(
@@ -2371,6 +2575,7 @@ export class GiveawayManager extends EventEmitter {
     const uptime = (Date.now() - s.startedAt) / 1000;
     this.log.info(`── ${this.accountLabel} Stats ──────────────────────────`);
     this.log.info(`  Detected            : ${s.detected}`);
+    this.log.info(`  Past Detected       : ${s.pastDetected}`);
     this.log.info(`  Notified            : ${s.notified}`);
     this.log.info(`  Skipped (cooldown)  : ${s.skipped}`);
     this.log.info(`  Errors              : ${s.errors}`);
@@ -2409,6 +2614,7 @@ export class GiveawayManager extends EventEmitter {
       startupMessagesSkipped: 0,
       scrimsDetected: 0,
       scrimsNotified: 0,
+      pastDetected: 0,
     };
     this.guildStats.clear();
   }
@@ -2440,6 +2646,11 @@ export class GiveawayManager extends EventEmitter {
     if (this.scrimCleanupInterval) {
       clearInterval(this.scrimCleanupInterval);
       this.scrimCleanupInterval = null;
+    }
+
+    if (this.rescanTimer) {
+      clearInterval(this.rescanTimer);
+      this.rescanTimer = null;
     }
 
     if (this.startupGraceTimer) {
