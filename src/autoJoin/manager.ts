@@ -250,9 +250,9 @@ const GIVEAWAY_BOT_ID = '530082442967646230';
 const GIVEAWAY_BOT_NAMES = new Set(['GiveawayBot', 'Giveaway Bot']);
 
 const KNOWN_GIVEAWAY_BOT_IDS: ReadonlySet<string> = new Set([
-  '530082442967646230',
+  '530082442967646230', // GiveawayBot
   '294882584201003009',
-  '739448630517039104',
+  '739448630517039104', // GiveawayBoat ✅
   '515195524879237130',
   '235148962103951360',
   '282859044593598464',
@@ -3033,7 +3033,7 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   // -------------------------------------------------------------------------
-  // Webhooks
+  // Webhooks - FIXED: Proper DM handling and prize text cleaning
   // -------------------------------------------------------------------------
 
   private async sendWinWebhook(message: Message, prize: string, sourceName: string, userId: string): Promise<void> {
@@ -3049,6 +3049,8 @@ export class AutoJoinManager extends EventEmitter {
     if (!url) return;
 
     const premiumUserId = userId;
+    
+    // 🔥 FIXED: Clean prize text - remove markdown links, keep just the display text
     const safePrize = this.cleanWinPrize(prize);
     const article = this.getIndefiniteArticle(safePrize);
 
@@ -3065,10 +3067,16 @@ export class AutoJoinManager extends EventEmitter {
       );
     }
 
-    const guildName = message.guild?.name || sourceName;
-    const channelName = message.guild
-      ? `#${(message.channel as { name?: string }).name ?? message.channel.id}`
-      : null;
+    // 🔥 FIXED: Build location text properly for DMs vs guild messages
+    let locationText: string;
+    if (message.guild) {
+      const guildName = message.guild.name;
+      const channelName = `#${(message.channel as { name?: string }).name ?? message.channel.id}`;
+      locationText = `**Server:** ${guildName}\n**Channel:** ${channelName}`;
+    } else {
+      // DM message - just show "Direct Message"
+      locationText = 'Direct Message';
+    }
 
     const components: any[] = [
       {
@@ -3090,10 +3098,7 @@ export class AutoJoinManager extends EventEmitter {
           },
           {
             type: 10,
-            content: [
-              `**Server:** ${guildName}`,
-              channelName ? `**Channel:** ${channelName}` : null,
-            ].filter(Boolean).join('\n'),
+            content: locationText,
           },
         ],
       },
@@ -3527,7 +3532,7 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   // -------------------------------------------------------------------------
-  // Helpers
+  // Helpers - FIXED: cleanWinPrize now properly removes markdown links
   // -------------------------------------------------------------------------
 
   private extractWinPrize(message: Message): string {
@@ -3561,18 +3566,22 @@ export class AutoJoinManager extends EventEmitter {
     }
     return this.extractPrize(message);
   }
+
   private cleanWinPrize(value: string): string {
+    // 🔥 FIXED: More aggressive markdown link cleaning
     const cleaned = value
-      .replace(/\[([^\]]+)\]\(https?:\/\/[^\s)]+\)/gi, '$1')
-      .replace(/https?:\/\/[^\s)]+/gi, '')
-      .replace(/\*\*|__|~~|`/g, '')
-      .replace(/^[:\-–—|\s]+|[:\-–—|\s]+$/g, '')
-      .replace(/^(?:the\s+)?(?:giveaway|prize)\s*[:\-–—]?\s*/i, '')
-      .replace(/\s{2,}/g, ' ')
+      .replace(/\[([^\]]+)\]\(https?:\/\/[^\s)]+\)/gi, '$1') // Extract text from markdown links
+      .replace(/\[([^\]]+)\]\([^)]+\)/gi, '$1') // Extract text from any markdown link
+      .replace(/https?:\/\/[^\s)]+/gi, '') // Remove raw URLs
+      .replace(/\*\*|__|~~|`/g, '') // Remove formatting
+      .replace(/^[:\-–—|\s]+|[:\-–—|\s]+$/g, '') // Trim punctuation
+      .replace(/^(?:the\s+)?(?:giveaway|prize)\s*[:\-–—]?\s*/i, '') // Remove prefixes
+      .replace(/\s{2,}/g, ' ') // Collapse spaces
       .trim();
 
     return this.cleanText(cleaned) || 'Unknown Prize';
   }
+
   private getIndefiniteArticle(prize: string): 'a' | 'an' {
     const word = prize.trim().split(/\s+/)[0] ?? '';
     if (/^\d/.test(word)) return /^[8]/.test(word) ? 'an' : 'a';
