@@ -1393,6 +1393,10 @@ export class GiveawayManager extends EventEmitter {
   private totalWatchlistItems = 0;
 
   private pendingInvites = new Map<string, Promise<string>>();
+  private inviteRetryState = new Map<string, { attempts: number; running: boolean; preferredChannelId?: string }>();
+  private inviteWarmupQueue: Array<{ guildId: string; preferredChannelId?: string }> = [];
+  private inviteWarmupQueued = new Set<string>();
+  private activeInviteWarmups = 0;
 
   private readyEventReceived = false;
   private readonly startupTime: number;
@@ -1442,6 +1446,11 @@ export class GiveawayManager extends EventEmitter {
   private setupReadyHandler(): void {
     this.client.once('ready', () => {
       this.selfUserId = this.client.user?.id || this.selfUserId;
+
+      // Warm every guild's invite cache in the background. This never blocks
+      // message detection or notification delivery.
+      void this.warmupAllGuildInvites();
+
       setTimeout(() => {
         if (this.destroyed) return;
         this.readyEventReceived = true;
@@ -1607,7 +1616,7 @@ export class GiveawayManager extends EventEmitter {
       `[View Message](https://discord.com/channels/${guild.id}/${message.channel.id}/${message.id})`,
     ].filter(Boolean).join('\n');
 
-    const inviteUrl = await this.fetchInviteForGuild(guild.id, message.channel.id);
+    const inviteUrl = this.getInviteUrlOrFallback(guild.id, message.channel.id);
 
     try {
       const sent = await this.botManager.sendScrimNotification({
@@ -1766,10 +1775,16 @@ export class GiveawayManager extends EventEmitter {
           };
 
           const savePromise = insertGiveaway(data);
-          const invitePromise = this.fetchInviteForGuild(guild.id, message.channel.id);
-          const watchlistPromise = this.checkWatchlistMatches(parsed, message, invitePromise, processingTime);
 
-          const [inserted, inviteUrl] = await Promise.all([savePromise, invitePromise]);
+          // NEVER block giveaway notifications on invite generation.
+          // Use the already-cached invite instantly, otherwise use the channel
+          // link instantly and generate the invite in the background.
+          const inviteUrl = this.getInviteUrlOrFallback(guild.id, message.channel.id);
+          const watchlistPromise = this.checkWatchlistMatches(
+            parsed, message, inviteUrl, processingTime,
+          );
+
+          const inserted = await savePromise;
           if (!inserted) return;
 
           const fullData: GiveawayData = {
@@ -1902,7 +1917,7 @@ export class GiveawayManager extends EventEmitter {
   private async checkWatchlistMatches(
     parsed: ParsedGiveawayData,
     message: Message,
-    invitePromise: Promise<string>,
+    inviteUrl: string,
     processingTime: number,
   ): Promise<void> {
     if (!this.botManager) return;
@@ -1941,8 +1956,6 @@ export class GiveawayManager extends EventEmitter {
       this.stats.watchlistMatches += uniqueUsers.length;
 
       const messageUrl = `https://discord.com/channels/${message.guild!.id}/${message.channel.id}/${message.id}`;
-      const inviteUrl = await invitePromise;
-
       await this.sendWatchlistDMs(uniqueUsers, parsed.prize, message, parsed.timestamps.end, messageUrl, inviteUrl, processingTime);
 
     } catch (err) {
@@ -2065,70 +2078,188 @@ export class GiveawayManager extends EventEmitter {
   }
 
   // ═══════════════════════════════════════════════════════════════════════
-  // INVITE GENERATION — FIXED (v29)
+  // INVITE GENERATION — BACKGROUND WARMUP + PASSIVE RETRIES
   //
-  // Root causes addressed:
-  //   1. permissionsFor() returns null on partial guild cache → null-safe
-  //   2. guild.invites.fetch() 403 was bubbling and aborting function → isolated
-  //   3. Vanity URL moved before invites.fetch() (free, no perms needed)
-  //   4. Channel iteration now uses a scored list best-first, single loop
-  //   5. self-member fetch now retries with force:true on first failure
-  //   6. cacheFailedInvite accepts reason → structural failures get 4× TTL
+  // Design goals:
+  //   1. Every guild is warmed after startup.
+  //   2. Giveaway detection/notification NEVER waits for invite generation.
+  //   3. A failed generation is retried passively up to 20 times.
+  //   4. Only a small number of guilds generate invites concurrently.
+  //   5. Successful invites are cached for 30 minutes.
+  //   6. The giveaway's own channel is tried first when available.
   // ═══════════════════════════════════════════════════════════════════════
 
-    private async fetchInviteForGuild(
-    guildId: string,
-    preferredChannelId?: string,
-  ): Promise<string> {
+  private getInviteUrlOrFallback(guildId: string, preferredChannelId?: string): string {
     const now = Date.now();
-    const fallback = `https://discord.com/channels/${guildId}`;
-
     const cached = this.inviteCache.get(guildId);
-    if (cached && cached.expiresAt > now && cached.url) return cached.url;
+
+    if (cached && cached.expiresAt > now && cached.url) {
+      return cached.url;
+    }
+
     if (cached) this.inviteCache.delete(guildId);
 
-    const pending = this.pendingInvites.get(guildId);
-    if (pending) return pending;
+    // Kick off background generation, but DO NOT await it.
+    this.enqueueInviteWarmup(guildId, preferredChannelId);
 
-    const failedUntil = this.failedInviteCache.get(guildId);
-    if (failedUntil && failedUntil > now) return fallback;
-    if (failedUntil) this.failedInviteCache.delete(guildId);
+    return `https://discord.com/channels/${guildId}`;
+  }
 
-    const promise = this.doFetchInviteWithRetries(guildId, preferredChannelId);
-    this.pendingInvites.set(guildId, promise);
+  private enqueueInviteWarmup(guildId: string, preferredChannelId?: string): void {
+    const existing = this.inviteRetryState.get(guildId);
+    if (existing) {
+      if (preferredChannelId) existing.preferredChannelId = preferredChannelId;
+      return;
+    }
 
-    try {
-      return await promise;
-    } finally {
-      this.pendingInvites.delete(guildId);
+    this.inviteRetryState.set(guildId, {
+      attempts: 0,
+      running: false,
+      preferredChannelId,
+    });
+
+    if (!this.inviteWarmupQueued.has(guildId)) {
+      this.inviteWarmupQueued.add(guildId);
+      this.inviteWarmupQueue.push({ guildId, preferredChannelId });
+    }
+
+    this.pumpInviteWarmupQueue();
+  }
+
+  private pumpInviteWarmupQueue(): void {
+    if (this.destroyed) return;
+
+    while (
+      this.activeInviteWarmups < INVITE_WARMUP_CONCURRENCY &&
+      this.inviteWarmupQueue.length > 0
+    ) {
+      const job = this.inviteWarmupQueue.shift()!;
+      this.inviteWarmupQueued.delete(job.guildId);
+      this.activeInviteWarmups++;
+
+      void this.runInviteWarmup(job.guildId, job.preferredChannelId)
+        .catch(error => {
+          this.log.debug(`Invite warmup crashed for ${job.guildId}: ${formatError(error)}`, {
+            component: 'GiveawayManager',
+            account: this.accountLabel,
+          });
+        })
+        .finally(() => {
+          this.activeInviteWarmups--;
+          this.pumpInviteWarmupQueue();
+        });
     }
   }
 
-  private async doFetchInviteWithRetries(
+  private async warmupAllGuildInvites(): Promise<void> {
+    if (this.destroyed) return;
+
+    const guildIds = Array.from(this.client.guilds.cache.keys());
+    if (guildIds.length === 0) return;
+
+    this.log.info(
+      `Starting background invite warmup for ${guildIds.length} guilds`,
+      { component: 'GiveawayManager', account: this.accountLabel },
+    );
+
+    for (const guildId of guildIds) {
+      this.enqueueInviteWarmup(guildId);
+    }
+  }
+
+  private async runInviteWarmup(
     guildId: string,
     preferredChannelId?: string,
-  ): Promise<string> {
-    const fallback = `https://discord.com/channels/${guildId}`;
-    const guild = this.client.guilds.cache.get(guildId);
+  ): Promise<void> {
+    const state = this.inviteRetryState.get(guildId);
+    if (!state || this.destroyed) return;
+    if (state.running) return;
 
-    if (!guild) {
-      this.cacheFailedInvite(guildId, Date.now(), 'no_guild');
-      return fallback;
+    state.running = true;
+    if (preferredChannelId) state.preferredChannelId = preferredChannelId;
+
+    try {
+      for (let attempt = 1; attempt <= INVITE_MAX_ATTEMPTS; attempt++) {
+        if (this.destroyed) return;
+
+        state.attempts = attempt;
+
+        const cached = this.getCachedInvite(guildId);
+        if (cached) {
+          this.log.debug(`Invite warmup already satisfied for ${guildId}`, {
+            component: 'GiveawayManager',
+            account: this.accountLabel,
+          });
+          return;
+        }
+
+        const result = await this.tryGenerateInviteOnce(
+          guildId,
+          state.preferredChannelId,
+        );
+
+        if (result) {
+          this.cacheInvite(guildId, result, Date.now());
+          this.log.info(
+            `Invite ready for guild ${guildId} on attempt ${attempt}/${INVITE_MAX_ATTEMPTS}`,
+            { component: 'GiveawayManager', account: this.accountLabel },
+          );
+          return;
+        }
+
+        if (attempt < INVITE_MAX_ATTEMPTS) {
+          const waitMs = INVITE_RETRY_DELAYS_MS[
+            Math.min(attempt - 1, INVITE_RETRY_DELAYS_MS.length - 1)
+          ];
+
+          this.log.debug(
+            `Invite retry ${attempt + 1}/${INVITE_MAX_ATTEMPTS} for guild ${guildId} in ${waitMs}ms`,
+            { component: 'GiveawayManager', account: this.accountLabel },
+          );
+
+          await delay(waitMs);
+        }
+      }
+
+      this.log.warn(
+        `Invite warmup exhausted ${INVITE_MAX_ATTEMPTS} attempts for guild ${guildId}; channel links will be used until the next warmup cycle`,
+        { component: 'GiveawayManager', account: this.accountLabel },
+      );
+    } finally {
+      const current = this.inviteRetryState.get(guildId);
+      if (current === state) this.inviteRetryState.delete(guildId);
+    }
+  }
+
+  private getCachedInvite(guildId: string): string | null {
+    const cached = this.inviteCache.get(guildId);
+    if (!cached) return null;
+
+    if (cached.expiresAt <= Date.now() || !cached.url) {
+      this.inviteCache.delete(guildId);
+      return null;
     }
 
-    // Reuse a vanity URL immediately.
+    return cached.url;
+  }
+
+  private async tryGenerateInviteOnce(
+    guildId: string,
+    preferredChannelId?: string,
+  ): Promise<string | null> {
+    const guild = this.client.guilds.cache.get(guildId);
+    if (!guild) return null;
+
+    // Vanity is effectively free and should always win.
     try {
       const vanity = (guild as any).vanityURLCode as string | null | undefined;
-      if (vanity) {
-        const url = `https://discord.gg/${vanity}`;
-        this.cacheInvite(guildId, url, Date.now());
-        return url;
-      }
+      if (vanity) return `https://discord.gg/${vanity}`;
     } catch {
       // Continue.
     }
 
-    // Reuse an existing invite. A 403/50013 here must NOT prevent creation.
+    // Existing invites are preferred because this avoids creating unnecessary
+    // invites. A permissions error is expected and must not stop creation.
     try {
       const invites = await guild.invites.fetch();
       if (invites?.size) {
@@ -2136,64 +2267,61 @@ export class GiveawayManager extends EventEmitter {
           invites.find(inv => inv.maxAge === 0 && inv.maxUses === 0) ??
           invites.find(inv => inv.maxAge === 0) ??
           invites.first();
-        if (best?.url) {
-          this.cacheInvite(guildId, best.url, Date.now());
-          return best.url;
-        }
+
+        if (best?.url) return best.url;
       }
     } catch (error: any) {
       const code = error?.code ?? error?.httpStatus;
       if (code !== 403 && code !== 50013) {
         this.log.debug(`Existing invite fetch failed for ${guildId}: ${formatError(error)}`, {
-          component: 'GiveawayManager', account: this.accountLabel,
+          component: 'GiveawayManager',
+          account: this.accountLabel,
         });
       }
     }
 
-    const textChannels = guild.channels.cache.filter(
-      (ch): ch is TextChannel => ch.type === 'GUILD_TEXT',
-    );
+    const textChannels = Array.from(guild.channels.cache.values())
+      .filter((ch): ch is TextChannel => ch.type === 'GUILD_TEXT');
 
-    if (!textChannels.size) {
-      this.cacheFailedInvite(guildId, Date.now(), 'no_text_channels');
-      return fallback;
-    }
+    if (!textChannels.length) return null;
 
-    // IMPORTANT: restore v8's explicit self-member fetch. A cold member cache
-    // must not make us falsely assume invite permission is unavailable.
     let botMember = this.selfUserId
       ? guild.members.cache.get(this.selfUserId)
       : undefined;
 
+    // Keep v8's proven behavior: if the member cache is cold, fetch it.
     if (!botMember && this.selfUserId) {
       try {
         botMember = await guild.members.fetch(this.selfUserId);
       } catch (error) {
         this.log.debug(`Could not fetch self member for invite in ${guildId}: ${formatError(error)}`, {
-          component: 'GiveawayManager', account: this.accountLabel,
+          component: 'GiveawayManager',
+          account: this.accountLabel,
         });
       }
     }
 
     const candidates: TextChannel[] = [];
     const added = new Set<string>();
-    const addCandidate = (channel: TextChannel) => {
+    const add = (channel: TextChannel) => {
       if (!added.has(channel.id)) {
         added.add(channel.id);
         candidates.push(channel);
       }
     };
 
-    // Giveaway channel gets first attempt.
+    // Giveaway channel gets first shot.
     if (preferredChannelId) {
-      const preferred = textChannels.get(preferredChannelId);
-      if (preferred) addCandidate(preferred);
+      const preferred = guild.channels.cache.get(preferredChannelId);
+      if (preferred && preferred.type === 'GUILD_TEXT') {
+        add(preferred as TextChannel);
+      }
     }
 
-    const permitted: Array<{ channel: TextChannel; score: number }> = [];
+    const permitted: TextChannel[] = [];
     const unknown: TextChannel[] = [];
 
-    for (const [, channel] of textChannels) {
+    for (const channel of textChannels) {
       if (added.has(channel.id)) continue;
 
       if (!botMember) {
@@ -2203,34 +2331,25 @@ export class GiveawayManager extends EventEmitter {
 
       try {
         const permissions = channel.permissionsFor(botMember);
+
         if (permissions === null) {
           unknown.push(channel);
           continue;
         }
 
-        if (!permissions.has('CREATE_INSTANT_INVITE')) {
-          continue;
+        if (permissions.has('CREATE_INSTANT_INVITE')) {
+          permitted.push(channel);
         }
-
-        const overwrite = channel.permissionOverwrites?.cache.get(this.selfUserId);
-        const score = overwrite?.allow?.has('CREATE_INSTANT_INVITE') ? 2 : 1;
-        permitted.push({ channel, score });
       } catch {
         unknown.push(channel);
       }
     }
 
-    permitted.sort((a, b) => b.score - a.score);
-    for (const entry of permitted) addCandidate(entry.channel);
-    for (const channel of unknown) addCandidate(channel);
+    for (const channel of permitted) add(channel);
+    for (const channel of unknown) add(channel);
 
-    // API is authoritative if local permission state was incomplete.
-    for (const [, channel] of textChannels) addCandidate(channel);
-
-    if (!candidates.length) {
-      this.cacheFailedInvite(guildId, Date.now(), 'all_failed');
-      return fallback;
-    }
+    // If local permission state is incomplete, Discord remains authoritative.
+    for (const channel of textChannels) add(channel);
 
     const options = {
       maxAge: 0,
@@ -2239,58 +2358,26 @@ export class GiveawayManager extends EventEmitter {
       temporary: false,
     } as const;
 
-    // Four full createInvite attempts. No artificial request timeout here:
-    // v8's reliable behavior depended on allowing Discord's request to finish.
-    for (let attempt = 1; attempt <= INVITE_MAX_ATTEMPTS; attempt++) {
-      // Rotate the starting channel each retry.
-      const startIndex = (attempt - 1) % candidates.length;
-      const ordered = [
-        ...candidates.slice(startIndex),
-        ...candidates.slice(0, startIndex),
-      ];
+    // One background attempt can try every reasonable text channel. The outer
+    // warmup loop provides the 20 passive attempts.
+    for (const channel of candidates) {
+      try {
+        const invite = await channel.createInvite(options);
+        if (invite?.url) return invite.url;
+      } catch (error: any) {
+        const code = error?.code ?? error?.httpStatus;
 
-      for (const channel of ordered) {
-        try {
-          const invite = await channel.createInvite(options);
-          if (!invite?.url) continue;
+        // Explicit permission denial: immediately move to the next channel.
+        if (code === 403 || code === 50013) continue;
 
-          this.cacheInvite(guildId, invite.url, Date.now());
-          this.log.debug(
-            `Generated invite for ${guild.name} in #${channel.name} ` +
-            `(attempt ${attempt}/${INVITE_MAX_ATTEMPTS})`,
-            { component: 'GiveawayManager', account: this.accountLabel },
-          );
-          return invite.url;
-        } catch (error: any) {
-          const code = error?.code ?? error?.httpStatus;
-          if (code === 403 || code === 50013) {
-            continue;
-          }
-
-          this.log.debug(
-            `createInvite failed in #${channel.name} ` +
-            `(attempt ${attempt}/${INVITE_MAX_ATTEMPTS}): ${formatError(error)}`,
-            { component: 'GiveawayManager', account: this.accountLabel },
-          );
-        }
-      }
-
-      if (attempt < INVITE_MAX_ATTEMPTS) {
-        const waitMs = INVITE_RETRY_DELAYS_MS[attempt - 1] ?? 1000;
         this.log.debug(
-          `Invite retry ${attempt + 1}/${INVITE_MAX_ATTEMPTS} for ${guild.name} in ${waitMs}ms`,
+          `createInvite failed in #${channel.name} for ${guildId}: ${formatError(error)}`,
           { component: 'GiveawayManager', account: this.accountLabel },
         );
-        await delay(waitMs);
       }
     }
 
-    this.cacheFailedInvite(guildId, Date.now(), 'all_failed');
-    this.log.warn(
-      `Invite generation exhausted ${INVITE_MAX_ATTEMPTS} attempts for ${guild.name}; using channel link fallback`,
-      { component: 'GiveawayManager', account: this.accountLabel },
-    );
-    return fallback;
+    return null;
   }
 
   private cacheInvite(guildId: string, url: string, now: number): void {
@@ -2459,6 +2546,9 @@ export class GiveawayManager extends EventEmitter {
     this.processingMessages.clear();
     this.pendingStartupMessages.clear();
     this.pendingInvites.clear();
+    this.inviteRetryState.clear();
+    this.inviteWarmupQueue.length = 0;
+    this.inviteWarmupQueued.clear();
     this.scrimHistory.clear();
     this.guildStats.clear();
     this.parsedMessageCache.clear();
