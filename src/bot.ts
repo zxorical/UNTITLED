@@ -2256,18 +2256,14 @@ export class BotManager {
 
       const container = createV2Container(
         "Premium Access",
-        "Activate your premium access with a license key, or manage your existing premium account.",
+        "Activate your premium access with a license key or check your premium status!",
         0x5865f2
       );
       const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
         new ButtonBuilder()
-          .setCustomId("license_activate")
-          .setLabel("Activate Key")
-          .setStyle(ButtonStyle.Primary),
-        new ButtonBuilder()
           .setCustomId("activate_premium")
           .setLabel("Activate Premium")
-          .setStyle(ButtonStyle.Secondary),
+          .setStyle(ButtonStyle.Primary),
         new ButtonBuilder()
           .setCustomId("check_premium")
           .setLabel("Check Premium")
@@ -2315,8 +2311,8 @@ export class BotManager {
       }
 
       const container = createV2Container(
-        "Premium AutoJoiner",
-        "Premium access for the AutoJoiner. Activate premium to use the premium features.",
+        "Premium Panel",
+        "Premium settings",
         0x5865f2
       );
       const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
