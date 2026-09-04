@@ -2101,6 +2101,16 @@ export class GiveawayManager extends EventEmitter {
 
     if (cached) this.inviteCache.delete(guildId);
 
+    // Vanity URLs are available locally and must be returned immediately.
+    // This keeps notifications useful even while a normal invite is warming.
+    const guild = this.client.guilds.cache.get(guildId);
+    const vanity = (guild as any)?.vanityURLCode as string | null | undefined;
+    if (vanity) {
+      const url = `https://discord.gg/${vanity}`;
+      this.cacheInvite(guildId, url, now);
+      return url;
+    }
+
     // Kick off background generation, but DO NOT await it.
     this.enqueueInviteWarmup(guildId, preferredChannelId);
 
