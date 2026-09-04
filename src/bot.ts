@@ -2472,7 +2472,7 @@ export class BotManager {
         .setCustomId("query")
         .setLabel("Search prize, server, or channel")
         .setStyle(TextInputStyle.Short)
-        .setPlaceholder("Example: Nitro, VRFS, giveaways")
+        .setPlaceholder("Example: VFA, VSL, VRLL")
         .setRequired(false)
         .setMaxLength(100);
       modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
