@@ -3013,6 +3013,13 @@ export class AutoJoinManager extends EventEmitter {
     if (message.guild) return;
     if (!message.author?.bot || message.author.id !== GIVEAWAY_BOT_ID) return;
 
+    const myId = message.client.user?.id;
+    if (!myId) return;
+
+    const mentionedInUsers = message.mentions?.users?.has(myId) ?? false;
+    const mentionedInContent = (message.content ?? '').includes(myId);
+    if (!mentionedInUsers && !mentionedInContent) return;
+
     const allText = this.extractAllText(message);
     if (!WIN_PATTERNS.some(re => re.test(allText))) return;
 
