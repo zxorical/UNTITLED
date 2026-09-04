@@ -534,36 +534,12 @@ function getParsedCacheKey(message: Message, accountLabel: string): string {
   return `${accountLabel}:${message.id}:${message.channel.id}`;
 }
 
-function cleanupParsedMessageCache(
-  now: number,
-  cache: Map<string, { data: ParsedGiveawayData; timestamp: number }>
-): void {
-  if (cache.size === 0) return;
-
-  for (const [key, entry] of cache) {
-    if (now - entry.timestamp > PARSED_CACHE_TTL_MS) {
-      cache.delete(key);
-    }
-  }
-
-  if (cache.size <= MAX_PARSED_CACHE_SIZE) return;
-
-  const removeCount = cache.size - MAX_PARSED_CACHE_SIZE;
-  let removed = 0;
-  for (const key of cache.keys()) {
-    cache.delete(key);
-    if (++removed >= removeCount) break;
-  }
-}
-
 function parseMessage(
   message: Message,
   now: number,
   accountLabel: string,
-  cache: Map<string, { data: ParsedGiveawayData; timestamp: number }>
+  cache: LRUCache<string, { data: ParsedGiveawayData; timestamp: number }>
 ): ParsedGiveawayData {
-  cleanupParsedMessageCache(now, cache);
-
   const cacheKey = getParsedCacheKey(message, accountLabel);
   const cached = cache.get(cacheKey);
 
@@ -639,7 +615,6 @@ function parseMessage(
   };
 
   cache.set(cacheKey, { data: parsed, timestamp: now });
-  cleanupParsedMessageCache(now, cache);
 
   return parsed;
 }
@@ -648,7 +623,7 @@ function refreshParsedMessage(
   message: Message,
   now: number,
   accountLabel: string,
-  cache: Map<string, { data: ParsedGiveawayData; timestamp: number }>
+  cache: LRUCache<string, { data: ParsedGiveawayData; timestamp: number }>
 ): ParsedGiveawayData {
   const cacheKey = getParsedCacheKey(message, accountLabel);
   cache.delete(cacheKey);
@@ -1372,7 +1347,7 @@ export class GiveawayManager extends EventEmitter {
   private selfUserId: string;
 
   // ─── INSTANCE-LEVEL CACHE (FIXED for multi-account) ───────────────────
-  private parsedMessageCache = new Map<string, { data: ParsedGiveawayData; timestamp: number }>();
+  private parsedMessageCache = new LRUCache<string, { data: ParsedGiveawayData; timestamp: number }>(MAX_PARSED_CACHE_SIZE);
 
   private processingMessages = new Set<string>();
 
@@ -1388,6 +1363,7 @@ export class GiveawayManager extends EventEmitter {
   private reverseWatchlistIndex: Map<string, string[]> = new Map();
   private watchlistAhoCorasick: AhoCorasick | null = null;
   private totalWatchlistItems = 0;
+  private watchlistRefreshPromise: Promise<void> | null = null;
 
   private pendingInvites = new Map<string, Promise<string>>();
 
@@ -1731,9 +1707,15 @@ export class GiveawayManager extends EventEmitter {
 
           const existing = await getGiveaway(message.id, message.channel.id);
           if (existing) {
-            await updateLastSeen(message.id, message.channel.id);
+            // Existing giveaways are cheap to handle and never enter the expensive
+            // notification path again. Keep this path isolated from new detections.
             if (existing.status === 'active' && isEndedGiveaway(parsed)) {
-              await markEnded(message.id, message.channel.id);
+              await Promise.all([
+                updateLastSeen(message.id, message.channel.id),
+                markEnded(message.id, message.channel.id),
+              ]);
+            } else {
+              void updateLastSeen(message.id, message.channel.id).catch(() => undefined);
             }
             return;
           }
@@ -1762,12 +1744,17 @@ export class GiveawayManager extends EventEmitter {
             guildIcon, guildBanner, memberCount,
           };
 
-          const savePromise = insertGiveaway(data);
-          const invitePromise = this.fetchInviteForGuild(guild.id);
-          const watchlistPromise = this.checkWatchlistMatches(parsed, message, invitePromise, processingTime);
-
-          const [inserted, inviteUrl] = await Promise.all([savePromise, invitePromise]);
+          // Critical path: persistence + invite resolution only. Watchlist matching
+          // and DMs happen completely off-path so a large watchlist cannot delay
+          // subsequent giveaway detection.
+          const [inserted, inviteUrl] = await Promise.all([
+            insertGiveaway(data),
+            this.fetchInviteForGuild(guild.id),
+          ]);
           if (!inserted) return;
+
+          // Fire-and-forget. The helper has its own error boundary.
+          void this.checkWatchlistMatches(parsed, message, Promise.resolve(inviteUrl), processingTime);
 
           const fullData: GiveawayData = {
             ...data, id: undefined, status: 'active',
@@ -1795,7 +1782,6 @@ export class GiveawayManager extends EventEmitter {
             detection.signals.join(', ')
           );
 
-          await watchlistPromise;
           return;
         }
 
@@ -1962,32 +1948,56 @@ export class GiveawayManager extends EventEmitter {
       };
     }
 
-    try {
-      const watchlists = await getAllWatchlists();
-      const data = new Map<string, string[]>();
-      let totalItems = 0;
-
-      for (const wl of watchlists) {
-        if (wl.items?.length) {
-          data.set(wl.userId, wl.items.map(i => i.toLowerCase()));
-          totalItems += wl.items.length;
-        }
-      }
-
-      this.totalWatchlistItems = totalItems;
-      this.watchlistCacheExpiry = now + WATCHLIST_CACHE_TTL;
-      this.reverseWatchlistIndex = this.buildReverseIndex(data);
-      this.watchlistAhoCorasick = totalItems >= AHOCORASICK_THRESHOLD ? this.buildAhoCorasick(data) : null;
-
-    } catch (err) {
-      this.log.error('Watchlist refresh error', { error: formatError(err) });
+    // Coalesce concurrent cache misses. A burst of giveaways should result in
+    // ONE database read + ONE Aho-Corasick rebuild, not N identical rebuilds.
+    if (!this.watchlistRefreshPromise) {
+      this.watchlistRefreshPromise = this.refreshWatchlistData(now)
+        .finally(() => {
+          this.watchlistRefreshPromise = null;
+        });
     }
+
+    await this.watchlistRefreshPromise;
 
     return {
       reverseIndex: this.reverseWatchlistIndex,
       ahoCorasick: this.watchlistAhoCorasick,
       totalItems: this.totalWatchlistItems,
     };
+  }
+
+  private async refreshWatchlistData(now: number): Promise<void> {
+    try {
+      const watchlists = await getAllWatchlists();
+      const data = new Map<string, string[]>();
+      let totalItems = 0;
+
+      for (const wl of watchlists) {
+        if (!wl.items?.length) continue;
+        const normalized = wl.items
+          .map(item => item.trim().toLowerCase())
+          .filter(Boolean);
+        if (!normalized.length) continue;
+        data.set(wl.userId, normalized);
+        totalItems += normalized.length;
+      }
+
+      const reverseIndex = this.buildReverseIndex(data);
+      const ahoCorasick = totalItems >= AHOCORASICK_THRESHOLD
+        ? this.buildAhoCorasick(data)
+        : null;
+
+      // Publish the whole cache atomically after all expensive work succeeds.
+      this.reverseWatchlistIndex = reverseIndex;
+      this.watchlistAhoCorasick = ahoCorasick;
+      this.totalWatchlistItems = totalItems;
+      this.watchlistCacheExpiry = Date.now() + WATCHLIST_CACHE_TTL;
+    } catch (err) {
+      this.log.error('Watchlist refresh error', { error: formatError(err) });
+      // Keep the last known-good index instead of destroying it during a transient
+      // database failure. Retry sooner than the normal TTL.
+      this.watchlistCacheExpiry = Date.now() + 5000;
+    }
   }
 
   private buildReverseIndex(data: Map<string, string[]>): Map<string, string[]> {
@@ -2427,6 +2437,7 @@ export class GiveawayManager extends EventEmitter {
     this.processingMessages.clear();
     this.pendingStartupMessages.clear();
     this.pendingInvites.clear();
+    this.watchlistRefreshPromise = null;
     this.scrimHistory.clear();
     this.guildStats.clear();
     this.parsedMessageCache.clear();
