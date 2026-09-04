@@ -17,6 +17,15 @@ import {
   ActivityType,
   Collection,
   Invite,
+  ContainerBuilder,
+  TextDisplayBuilder,
+  SectionBuilder,
+  ThumbnailBuilder,
+  MediaGalleryBuilder,
+  MessageFlags,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
 } from "discord.js";
 import { CONFIG } from "./config.js";
 import { logger } from "./logger.js";
@@ -378,6 +387,130 @@ async function deferReply(
     await interaction.deferReply({ ephemeral });
   }
 }
+
+function addV2Text(container: ContainerBuilder, text: string): void {
+  if (!text) return;
+  const limit = 3800;
+  for (let i = 0; i < text.length; i += limit) {
+    container.addTextDisplayComponents(
+      new TextDisplayBuilder().setContent(text.slice(i, i + limit))
+    );
+  }
+}
+
+function createV2Container(
+  title?: string,
+  body?: string,
+  accentColor = 0x5865f2
+): ContainerBuilder {
+  const container = new ContainerBuilder().setAccentColor(accentColor);
+  if (title) {
+    addV2Text(container, `# ${truncate(title, 256)}`);
+  }
+  if (body) {
+    addV2Text(container, body);
+  }
+  return container;
+}
+
+function embedToV2Container(embed: EmbedBuilder): ContainerBuilder {
+  const data = embed.toJSON();
+  const accent = typeof data.color === "number" ? data.color : 0x5865f2;
+  const container = new ContainerBuilder().setAccentColor(accent);
+
+  if (data.author?.name) {
+    addV2Text(container, `-# ${truncate(data.author.name, 256)}`);
+  }
+  if (data.title) {
+    addV2Text(container, `# ${truncate(data.title, 256)}`);
+  }
+  if (data.description) {
+    addV2Text(container, data.description);
+  }
+  for (const field of data.fields ?? []) {
+    addV2Text(container, `**${truncate(field.name, 256)}**\n${field.value}`);
+  }
+  if (data.thumbnail?.url || data.image?.url) {
+    const url = data.image?.url ?? data.thumbnail?.url;
+    if (url) {
+      container.addMediaGalleryComponents(
+        new MediaGalleryBuilder().addItems({
+          media: { url },
+          description: data.title ? truncate(data.title, 200) : "Image",
+        })
+      );
+    }
+  }
+  if (data.footer?.text) {
+    addV2Text(container, `-# ${truncate(data.footer.text, 2048)}`);
+  }
+  return container;
+}
+
+function v2ReplyPayload(
+  container: ContainerBuilder,
+  ephemeral = false
+) {
+  return {
+    components: [container],
+    flags: ephemeral
+      ? MessageFlags.IsComponentsV2 | MessageFlags.Ephemeral
+      : MessageFlags.IsComponentsV2,
+  };
+}
+
+function v2EditPayload(container: ContainerBuilder) {
+  return {
+    components: [container],
+    flags: MessageFlags.IsComponentsV2,
+  };
+}
+
+async function replyV2Text(
+  interaction: ChatInputCommandInteraction<CacheType>,
+  title: string,
+  body: string,
+  ephemeral = true,
+  accentColor = 0x5865f2
+) {
+  return interaction.reply(
+    v2ReplyPayload(createV2Container(title, body, accentColor), ephemeral)
+  );
+}
+
+async function editV2Text(
+  interaction: ChatInputCommandInteraction<CacheType>,
+  title: string,
+  body: string,
+  accentColor = 0x5865f2
+) {
+  return interaction.editReply(
+    v2EditPayload(createV2Container(title, body, accentColor))
+  );
+}
+
+async function editV2Embed(
+  interaction: ChatInputCommandInteraction<CacheType>,
+  embed: EmbedBuilder,
+  buttons?: ActionRowBuilder<ButtonBuilder>
+) {
+  const container = embedToV2Container(embed);
+  if (buttons) container.addActionRowComponents(buttons);
+  return interaction.editReply(v2EditPayload(container));
+}
+
+interface GiveawayPageState {
+  id: string;
+  userId: string;
+  mode: "active" | "recent";
+  query: string;
+  page: number;
+  createdAt: number;
+}
+
+function giveawayPageId(): string {
+  return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 9)}`;
+}
 function isAdmin(userId: string): boolean {
   return CONFIG.adminUserIds.includes(userId);
 }
@@ -388,10 +521,7 @@ async function requireAdmin(
   interaction: ChatInputCommandInteraction<CacheType>
 ): Promise<boolean> {
   if (!isAdmin(interaction.user.id)) {
-    await interaction.reply({
-      content: "You do not have permission to use this command.",
-      ephemeral: true,
-    });
+    await replyV2Text(interaction, "Access denied", "You do not have permission to use this command.");
     return false;
   }
   return true;
@@ -400,10 +530,7 @@ async function requireOwner(
   interaction: ChatInputCommandInteraction<CacheType>
 ): Promise<boolean> {
   if (!isOwner(interaction.user.id)) {
-    await interaction.reply({
-      content: "You do not have permission to use this command.",
-      ephemeral: true,
-    });
+    await replyV2Text(interaction, "Access denied", "You do not have permission to use this command.");
     return false;
   }
   return true;
@@ -745,7 +872,7 @@ function createPaginationRow(
   return new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
       .setCustomId(`vrfs_page:${id}:prev`)
-      .setLabel("Previous")
+      .setLabel("⬅️")
       .setStyle(ButtonStyle.Secondary)
       .setDisabled(page <= 0),
     new ButtonBuilder()
@@ -755,14 +882,14 @@ function createPaginationRow(
       .setDisabled(true),
     new ButtonBuilder()
       .setCustomId(`vrfs_page:${id}:next`)
-      .setLabel("Next")
+      .setLabel("➡️")
       .setStyle(ButtonStyle.Secondary)
       .setDisabled(page >= totalPages - 1)
   );
 }
 function createCatalogPage(
   session: VRFSPage
-): { embeds: EmbedBuilder[]; components: ActionRowBuilder<ButtonBuilder>[] } {
+) {
   const result = paginate(
     session.items as VRFSItem[],
     session.page,
@@ -785,17 +912,17 @@ function createCatalogPage(
     value: truncate(lines.join("\n\n") || "No items found.", 4096),
     inline: false,
   });
-  return {
-    embeds: [embed],
-    components:
-      result.totalPages > 1
-        ? [createPaginationRow(session.id, result.page, result.totalPages)]
-        : [],
-  };
+  const container = embedToV2Container(embed);
+  if (result.totalPages > 1) {
+    container.addActionRowComponents(
+      createPaginationRow(session.id, result.page, result.totalPages)
+    );
+  }
+  return { components: [container], flags: MessageFlags.IsComponentsV2 };
 }
 function createMarketplacePage(
   session: VRFSPage
-): { embeds: EmbedBuilder[]; components: ActionRowBuilder<ButtonBuilder>[] } {
+) {
   const result = paginate(
     session.items as VRFSMarketplaceItem[],
     session.page,
@@ -820,17 +947,17 @@ function createMarketplacePage(
     value: truncate(lines.join("\n\n") || "No items found.", 4096),
     inline: false,
   });
-  return {
-    embeds: [embed],
-    components:
-      result.totalPages > 1
-        ? [createPaginationRow(session.id, result.page, result.totalPages)]
-        : [],
-  };
+  const container = embedToV2Container(embed);
+  if (result.totalPages > 1) {
+    container.addActionRowComponents(
+      createPaginationRow(session.id, result.page, result.totalPages)
+    );
+  }
+  return { components: [container], flags: MessageFlags.IsComponentsV2 };
 }
 function createLockerPage(
   session: VRFSPage
-): { embeds: EmbedBuilder[]; components: ActionRowBuilder<ButtonBuilder>[] } {
+) {
   const result = paginate(
     session.items as VRFSItem[],
     session.page,
@@ -857,13 +984,13 @@ function createLockerPage(
     ? getCatalogImage(result.items[0])
     : null;
   if (image) embed.setImage(image);
-  return {
-    embeds: [embed],
-    components:
-      result.totalPages > 1
-        ? [createPaginationRow(session.id, result.page, result.totalPages)]
-        : [],
-  };
+  const container = embedToV2Container(embed);
+  if (result.totalPages > 1) {
+    container.addActionRowComponents(
+      createPaginationRow(session.id, result.page, result.totalPages)
+    );
+  }
+  return { components: [container], flags: MessageFlags.IsComponentsV2 };
 }
 export class BotManager {
   private client: Client;
@@ -873,6 +1000,7 @@ export class BotManager {
   private verificationInterval: NodeJS.Timeout | null = null;
   private vrfsCleanupInterval: NodeJS.Timeout | null = null;
   private vrfsPages = new Map<string, VRFSPage>();
+  private giveawayPages = new Map<string, GiveawayPageState>();
   public metrics = new MetricsCollector();
   public notifications: NotificationService;
   private commands = new Map<
@@ -981,10 +1109,7 @@ export class BotManager {
             )
           ) {
             if (!isOwner(interaction.user.id)) {
-              await interaction.reply({
-                content: "You do not have permission to use this.",
-                ephemeral: true,
-              });
+              await replyV2Text(interaction as any, "Access denied", "You do not have permission to use this.");
               return;
             }
             const panel = new AdminPanel();
@@ -1005,6 +1130,10 @@ export class BotManager {
             await panel.handleInteraction(interaction);
             return;
           }
+          if (interaction.customId.startsWith("giveaway_page:")) {
+            await this.handleGiveawayPageButton(interaction);
+            return;
+          }
           if (interaction.customId.startsWith("vrfs_page:")) {
             await this.handleVRFSPageButton(interaction);
             return;
@@ -1012,6 +1141,10 @@ export class BotManager {
           return;
         }
         if (interaction.isModalSubmit()) {
+          if (interaction.customId.startsWith("giveaway_search_modal:")) {
+            await this.handleGiveawaySearchModal(interaction);
+            return;
+          }
           if (interaction.customId === "license_activate_modal") {
             const channel = interaction.channel as TextChannel;
             const panel = new KeyPanel(channel);
@@ -1035,10 +1168,7 @@ export class BotManager {
         if (!interaction.isChatInputCommand()) return;
         const handler = this.commands.get(interaction.commandName);
         if (!handler) {
-          await interaction.reply({
-            content: "Unknown command.",
-            ephemeral: true,
-          });
+          await replyV2Text(interaction, "Unknown command", "That command is not registered.");
           return;
         }
         try {
@@ -1047,14 +1177,10 @@ export class BotManager {
           logger.error(`Command error: ${interaction.commandName}`, {
             error: formatError(err),
           });
-          const payload = {
-            content: "Something went wrong while processing that request.",
-            ephemeral: true,
-          };
           if (interaction.replied || interaction.deferred) {
-            await interaction.editReply(payload).catch(() => {});
+            await editV2Text(interaction, "Request failed", "Something went wrong while processing that request.").catch(() => {});
           } else {
-            await interaction.reply(payload).catch(() => {});
+            await replyV2Text(interaction, "Request failed", "Something went wrong while processing that request.").catch(() => {});
           }
         }
       }
@@ -1143,27 +1269,11 @@ export class BotManager {
       );
       if (oldPanel) await oldPanel.delete().catch(() => {});
     } catch {}
-    const embed = new EmbedBuilder()
-      .setColor(0x5865f2)
-      .setTitle("Notifications")
-      .setDescription("Manage which notifications you receive.")
-      .addFields(
-        {
-          name: "Giveaways",
-          value: "Receive notifications for new giveaways.",
-          inline: false,
-        },
-        {
-          name: "Scrims",
-          value: "Receive notifications for scrim announcements.",
-          inline: false,
-        },
-        {
-          name: "Events",
-          value: "Receive notifications for event announcements.",
-          inline: false,
-        }
-      );
+    const container = createV2Container(
+      "Notifications",
+      "Manage which notifications you receive.\n\n**Giveaways**\nReceive notifications for new giveaways.\n\n**Scrims**\nReceive notifications for scrim announcements.\n\n**Events**\nReceive notifications for event announcements.",
+      0x5865f2
+    );
     const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder()
         .setCustomId("toggle_giveaway")
@@ -1178,9 +1288,10 @@ export class BotManager {
         .setLabel("Events")
         .setStyle(ButtonStyle.Primary)
     );
+    container.addActionRowComponents(row);
     await channel.send({
-      embeds: [embed],
-      components: [row],
+      components: [container],
+      flags: MessageFlags.IsComponentsV2,
     });
     logger.info("Notification panel sent", {
       channelId: panelChannelId,
@@ -1610,10 +1721,7 @@ export class BotManager {
   ) {
     const item = interaction.options.getString("item", true).trim().toLowerCase();
     if (item.length < 2 || item.length > 50) {
-      await interaction.reply({
-        content: "Item must be between 2 and 50 characters.",
-        ephemeral: true,
-      });
+      await replyV2Text(interaction, "Updated", "Item must be between 2 and 50 characters.");
       return;
     }
     await addItem(interaction.user.id, item);
@@ -1631,10 +1739,7 @@ export class BotManager {
     const item = interaction.options.getString("item", true).trim().toLowerCase();
     const removed = await removeItem(interaction.user.id, item);
     if (!removed) {
-      await interaction.reply({
-        content: `**${item}** is not in your tracked items.`,
-        ephemeral: true,
-      });
+      await replyV2Text(interaction, "Updated", `**${item}** is not in your tracked items.`);
       return;
     }
     const items = await getItems(interaction.user.id);
@@ -1650,11 +1755,7 @@ export class BotManager {
   ) {
     const items = await getItems(interaction.user.id);
     if (items.length === 0) {
-      await interaction.reply({
-        content:
-          "You are not tracking any giveaway items. Use `/giveawaytrack add` to start.",
-        ephemeral: true,
-      });
+      await replyV2Text(interaction, "Updated", "You are not tracking any giveaway items. Use `/giveawaytrack add` to start.");
       return;
     }
     await interaction.reply({
@@ -1669,19 +1770,13 @@ export class BotManager {
   ) {
     const items = await getItems(interaction.user.id);
     if (items.length === 0) {
-      await interaction.reply({
-        content: "Your tracked item list is already empty.",
-        ephemeral: true,
-      });
+      await replyV2Text(interaction, "Updated", "Your tracked item list is already empty.");
       return;
     }
     await clearItems(interaction.user.id);
-    await interaction.reply({
-      content: `Cleared ${items.length} tracked item${
+    await replyV2Text(interaction, "Updated", `Cleared ${items.length} tracked item${
         items.length === 1 ? "" : "s"
-      }.`,
-      ephemeral: true,
-    });
+      }.`);
   }
   private async eventTrackCommand(
     interaction: ChatInputCommandInteraction<CacheType>
@@ -1712,11 +1807,7 @@ export class BotManager {
     ];
     const matchedFilter = validFilters.find((f) => filter.includes(f));
     if (!matchedFilter && filter.length < 2) {
-      await interaction.reply({
-        content:
-          "Invalid filter. Supported filters include scrim, squid, squid_game, gagaball, 1v1, 2v2, 3v3, 4v4, 5v5, vrll, vrel and vucl.",
-        ephemeral: true,
-      });
+      await replyV2Text(interaction, "Updated", "Invalid filter. Supported filters include scrim, squid, squid_game, gagaball, 1v1, 2v2, 3v3, 4v4, 5v5, vrll, vrel and vucl.");
       return;
     }
     const eventItem = `event:${filter}`;
@@ -1737,10 +1828,7 @@ export class BotManager {
     const eventItem = `event:${filter}`;
     const removed = await removeItem(interaction.user.id, eventItem);
     if (!removed) {
-      await interaction.reply({
-        content: `**${filter}** is not in your event filters.`,
-        ephemeral: true,
-      });
+      await replyV2Text(interaction, "Updated", `**${filter}** is not in your event filters.`);
       return;
     }
     const items = await getItems(interaction.user.id);
@@ -1758,11 +1846,7 @@ export class BotManager {
     const items = await getItems(interaction.user.id);
     const eventItems = items.filter((i) => i.startsWith("event:"));
     if (eventItems.length === 0) {
-      await interaction.reply({
-        content:
-          "You are not tracking any event filters. Use `/eventtrack add` to start.",
-        ephemeral: true,
-      });
+      await replyV2Text(interaction, "Updated", "You are not tracking any event filters. Use `/eventtrack add` to start.");
       return;
     }
     await interaction.reply({
@@ -1778,21 +1862,15 @@ export class BotManager {
     const items = await getItems(interaction.user.id);
     const eventItems = items.filter((i) => i.startsWith("event:"));
     if (eventItems.length === 0) {
-      await interaction.reply({
-        content: "Your event filter list is already empty.",
-        ephemeral: true,
-      });
+      await replyV2Text(interaction, "Updated", "Your event filter list is already empty.");
       return;
     }
     for (const item of eventItems) {
       await removeItem(interaction.user.id, item);
     }
-    await interaction.reply({
-      content: `Cleared ${eventItems.length} event filter${
+    await replyV2Text(interaction, "Updated", `Cleared ${eventItems.length} event filter${
         eventItems.length === 1 ? "" : "s"
-      }.`,
-      ephemeral: true,
-    });
+      }.`);
   }
   private async licenseAdminCommand(
     interaction: ChatInputCommandInteraction<CacheType>
@@ -1819,9 +1897,7 @@ export class BotManager {
     try {
       const hasPremium = await isPremiumUser(user.id, guildId);
       if (!hasPremium) {
-        await interaction.editReply({
-          content: `<@${user.id}> does not have premium access.`,
-        });
+        await editV2Text(interaction, "Premium access", `<@${user.id}> does not have premium access.`);
         return;
       }
       const premiumUser = await getPremiumUser(user.id, guildId);
@@ -1848,18 +1924,14 @@ export class BotManager {
         guildId,
         source,
       });
-      await interaction.editReply({
-        content: `Premium access has been revoked from <@${user.id}>.`,
-      });
+      await editV2Text(interaction, "Premium revoked", `Premium access has been revoked from <@${user.id}>.`);
     } catch (error) {
       logger.error("Revoke command failed", {
         adminId: interaction.user.id,
         userId: user.id,
         error: String(error),
       });
-      await interaction.editReply({
-        content: "Failed to revoke premium access.",
-      });
+      await editV2Text(interaction, "Revoke failed", "Failed to revoke premium access.", 0xe74c3c);
     }
   }
   private async statsCommand(
@@ -1872,111 +1944,55 @@ export class BotManager {
     try {
       scrimStats = await getScrimStats();
     } catch {}
-    const embed = new EmbedBuilder()
-      .setColor(0x00aaff)
-      .setTitle("Tracker Stats")
-      .addFields(
-        {
-          name: "Total Giveaways Tracked",
-          value: String(totalEver),
-          inline: true,
-        },
-        {
-          name: "Active Giveaways",
-          value: String(stats.activeGiveaways),
-          inline: true,
-        },
-        {
-          name: "Servers",
-          value: String(stats.serversWithGiveaways),
-          inline: true,
-        },
-        {
-          name: "Last Detection",
-          value: stats.lastDetected
-            ? formatTimestamp(stats.lastDetected)
-            : "Never",
-          inline: false,
-        }
-      );
+
+    const sections = [
+      `**Total Giveaways Tracked:** ${totalEver}`,
+      `**Active Giveaways:** ${stats.activeGiveaways}`,
+      `**Servers:** ${stats.serversWithGiveaways}`,
+      `**Last Detection:** ${stats.lastDetected ? formatTimestamp(stats.lastDetected) : "Never"}`,
+    ];
     if (scrimStats) {
-      embed.addFields(
-        {
-          name: "Total Events",
-          value: String(scrimStats.total),
-          inline: true,
-        },
-        {
-          name: "Active Events",
-          value: String(scrimStats.active),
-          inline: true,
-        },
-        {
-          name: "Scrims",
-          value: String(scrimStats.byType.scrim),
-          inline: true,
-        },
-        {
-          name: "Squid Games",
-          value: String(scrimStats.byType.squid_game),
-          inline: true,
-        },
-        {
-          name: "Gagaballs",
-          value: String(scrimStats.byType.gagaball),
-          inline: true,
-        }
+      sections.push(
+        `**Total Events:** ${scrimStats.total}`,
+        `**Active Events:** ${scrimStats.active}`,
+        `**Scrims:** ${scrimStats.byType.scrim}`,
+        `**Squid Games:** ${scrimStats.byType.squid_game}`,
+        `**Gagaballs:** ${scrimStats.byType.gagaball}`
       );
     }
-    await interaction.editReply({ embeds: [embed] });
+    await interaction.editReply(
+      v2EditPayload(createV2Container("Tracker Stats", sections.join("\n"), 0x00aaff))
+    );
   }
   private async activeCommand(
     interaction: ChatInputCommandInteraction<CacheType>
   ) {
     await deferReply(interaction, false);
-    const active = await getActiveGiveaways(10);
-    if (active.length === 0) {
-      await interaction.editReply({ content: "Nothing is active right now." });
-      return;
-    }
-    const embed = new EmbedBuilder()
-      .setColor(0xffd700)
-      .setTitle(`${active.length} Active Giveaways`);
-    for (const g of active.slice(0, 10)) {
-      const ends = g.endsAt
-        ? `<t:${Math.floor(g.endsAt / 1000)}:R>`
-        : "Unknown";
-      embed.addFields({
-        name: truncate(g.prize, 50),
-        value: `${g.guildName} · #${g.channelName}\nEnds: ${ends}`,
-        inline: false,
-      });
-    }
-    await interaction.editReply({ embeds: [embed] });
+    const id = giveawayPageId();
+    this.giveawayPages.set(id, {
+      id,
+      userId: interaction.user.id,
+      mode: "active",
+      query: "",
+      page: 0,
+      createdAt: Date.now(),
+    });
+    await this.renderGiveawayPage(interaction, id);
   }
   private async recentCommand(
     interaction: ChatInputCommandInteraction<CacheType>
   ) {
     await deferReply(interaction, false);
-    const recent = await getAllGiveaways(10);
-    if (recent.length === 0) {
-      await interaction.editReply({ content: "Nothing has been detected yet." });
-      return;
-    }
-    const embed = new EmbedBuilder()
-      .setColor(0x5865f2)
-      .setTitle("Recent Giveaways");
-    for (const g of recent) {
-      embed.addFields({
-        name: `${g.status === "active" ? "[Active]" : "[Ended]"} ${truncate(
-          g.prize,
-          40
-        )}`,
-        value: `${g.guildName}\n${formatTimestamp(g.detectedAt)}`,
-        inline: false,
-      });
-    }
-    await interaction.editReply({ embeds: [embed] });
+    const id = giveawayPageId();
+    this.giveawayPages.set(id, {
+      id,
+      userId: interaction.user.id,
+      mode: "recent",
+      query: "",
+      page: 0,
+      createdAt: Date.now(),
+    });
+    await this.renderGiveawayPage(interaction, id);
   }
   private async setchannelCommand(
     interaction: ChatInputCommandInteraction<CacheType>
@@ -1988,17 +2004,11 @@ export class BotManager {
         channel.type
       )
     ) {
-      await interaction.reply({
-        content: "Choose a text channel.",
-        ephemeral: true,
-      });
+      await replyV2Text(interaction, "Invalid channel", "Choose a text channel.");
       return;
     }
     (CONFIG as any).trackerChannelId = channel.id;
-    await interaction.reply({
-      content: `Notification channel set to ${channel}.`,
-      ephemeral: true,
-    });
+    await replyV2Text(interaction, "Notification channel updated", `Notification channel set to ${channel}.`);
   }
   private async resetCommand(
     interaction: ChatInputCommandInteraction<CacheType>
@@ -2006,7 +2016,7 @@ export class BotManager {
     if (!(await requireAdmin(interaction))) return;
     await deferReply(interaction, true);
     await resetDatabase();
-    await interaction.editReply({ content: "Database reset complete." });
+    await editV2Text(interaction, "Database reset", "Database reset complete.");
   }
   private async statusCommand(
     interaction: ChatInputCommandInteraction<CacheType>
@@ -2040,7 +2050,7 @@ export class BotManager {
           inline: false,
         }
       );
-    await interaction.editReply({ embeds: [embed] });
+    await editV2Embed(interaction, embed);
   }
   private async metricsCommand(
     interaction: ChatInputCommandInteraction<CacheType>
@@ -2083,7 +2093,7 @@ export class BotManager {
           inline: true,
         }
       );
-    await interaction.editReply({ embeds: [embed] });
+    await editV2Embed(interaction, embed);
   }
   private async helpCommand(
     interaction: ChatInputCommandInteraction<CacheType>
@@ -2140,7 +2150,7 @@ export class BotManager {
           inline: false,
         }
       );
-    await interaction.editReply({ embeds: [embed] });
+    await editV2Embed(interaction, embed);
   }
   private async purgeCommand(
     interaction: ChatInputCommandInteraction<CacheType>
@@ -2157,19 +2167,17 @@ export class BotManager {
       );
       const toDelete = botMessages.first(amount);
       if (toDelete.length === 0) {
-        await interaction.editReply({ content: "Nothing to delete." });
+        await editV2Text(interaction, "Purge", "Nothing to delete.");
         return;
       }
       await channel.bulkDelete(toDelete, true);
-      await interaction.editReply({
-        content: `Deleted ${toDelete.length} message${
-          toDelete.length === 1 ? "" : "s"
-        }.`,
-      });
+      await editV2Text(
+        interaction,
+        "Purge complete",
+        `Deleted ${toDelete.length} message${toDelete.length === 1 ? "" : "s"}.`
+      );
     } catch {
-      await interaction.editReply({
-        content: "Failed to delete messages.",
-      });
+      await editV2Text(interaction, "Purge failed", "Failed to delete messages.");
     }
   }
   private async sendLicensePanel(): Promise<void> {
@@ -2354,10 +2362,152 @@ export class BotManager {
       await this.updatePresence();
     }
   }
+  private createGiveawayPageButtons(state: GiveawayPageState, totalPages: number): ActionRowBuilder<ButtonBuilder> {
+    return new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`giveaway_page:${state.id}:prev`)
+        .setLabel("⬅️")
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(state.page <= 0),
+      new ButtonBuilder()
+        .setCustomId(`giveaway_page:${state.id}:current`)
+        .setLabel(`${state.page + 1} / ${totalPages}`)
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(true),
+      new ButtonBuilder()
+        .setCustomId(`giveaway_page:${state.id}:next`)
+        .setLabel("➡️")
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(state.page >= totalPages - 1),
+      new ButtonBuilder()
+        .setCustomId(`giveaway_page:${state.id}:search`)
+        .setLabel("Search")
+        .setStyle(ButtonStyle.Primary)
+    );
+  }
+
+  private async renderGiveawayPage(
+    interaction: ChatInputCommandInteraction<CacheType> | any,
+    pageId: string
+  ): Promise<void> {
+    const state = this.giveawayPages.get(pageId);
+    if (!state) {
+      const container = createV2Container("Results expired", "Run the command again.", 0xe74c3c);
+      if (interaction.isChatInputCommand?.() && interaction.deferred) {
+        await interaction.editReply(v2EditPayload(container));
+      } else if (interaction.deferred || interaction.replied) {
+        await interaction.editReply(v2EditPayload(container));
+      } else {
+        await interaction.reply(v2ReplyPayload(container, true));
+      }
+      return;
+    }
+
+    const raw = state.mode === "active" ? await getActiveGiveaways(100) : await getAllGiveaways(100);
+    const query = state.query.trim().toLowerCase();
+    const filtered = query
+      ? raw.filter((g: any) =>
+          [g.prize, g.guildName, g.channelName]
+            .filter(Boolean)
+            .some((value) => String(value).toLowerCase().includes(query))
+        )
+      : raw;
+
+    const pageSize = 5;
+    const totalPages = Math.max(1, Math.ceil(filtered.length / pageSize));
+    state.page = Math.max(0, Math.min(state.page, totalPages - 1));
+    const start = state.page * pageSize;
+    const pageItems = filtered.slice(start, start + pageSize);
+
+    const title = state.mode === "active" ? "Active Giveaways" : "Recent Giveaways";
+    const header = query
+      ? `${filtered.length.toLocaleString()} result${filtered.length === 1 ? "" : "s"} matching **${truncate(state.query, 80)}**`
+      : `${filtered.length.toLocaleString()} result${filtered.length === 1 ? "" : "s"}`;
+
+    const lines = pageItems.map((g: any, index: number) => {
+      const position = start + index + 1;
+      const ends = g.endsAt ? `<t:${Math.floor(g.endsAt / 1000)}:R>` : "Unknown";
+      const jump = g.guildId && g.channelId && g.messageId
+        ? `\n[Open Giveaway](https://discord.com/channels/${g.guildId}/${g.channelId}/${g.messageId})`
+        : "";
+      const status = g.status === "active" ? "Active" : "Ended";
+      return `### ${position}. ${truncate(String(g.prize || "Unknown Prize"), 90)}\n**Server:** ${g.guildName || "Unknown"}\n**Channel:** #${g.channelName || "unknown"}\n**Status:** ${status}${state.mode === "active" ? `\n**Ends:** ${ends}` : `\n**Detected:** ${formatTimestamp(g.detectedAt)}`}${jump}`;
+    });
+
+    const body = `${header}\n\n${lines.join("\n\n") || "No giveaways matched your search."}`;
+    const container = createV2Container(title, body, state.mode === "active" ? 0xffd700 : 0x5865f2);
+    container.addActionRowComponents(this.createGiveawayPageButtons(state, totalPages));
+
+    const payload = v2EditPayload(container);
+    if (interaction.deferred || interaction.replied) {
+      await interaction.editReply(payload);
+    } else {
+      await interaction.reply(v2ReplyPayload(container, true));
+    }
+  }
+
+  private async handleGiveawayPageButton(interaction: ButtonInteraction): Promise<void> {
+    const parts = interaction.customId.split(":");
+    if (parts.length !== 3) return;
+    const [, pageId, action] = parts;
+    const state = this.giveawayPages.get(pageId);
+    if (!state) {
+      await replyV2Text(interaction as any, "Results expired", "Run the command again.");
+      return;
+    }
+    if (state.userId !== interaction.user.id) {
+      await replyV2Text(interaction as any, "Access denied", "Only the person who requested these results can navigate them.");
+      return;
+    }
+    if (action === "search") {
+      const modal = new ModalBuilder()
+        .setCustomId(`giveaway_search_modal:${pageId}`)
+        .setTitle(`Search ${state.mode === "active" ? "Active" : "Recent"} Giveaways`);
+      const input = new TextInputBuilder()
+        .setCustomId("query")
+        .setLabel("Search prize, server, or channel")
+        .setStyle(TextInputStyle.Short)
+        .setPlaceholder("Example: Nitro, VRFS, giveaways")
+        .setRequired(false)
+        .setMaxLength(100);
+      modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
+      await interaction.showModal(modal);
+      return;
+    }
+    if (action === "current") return;
+    state.page += action === "next" ? 1 : -1;
+    state.page = Math.max(0, state.page);
+    await interaction.deferUpdate();
+    await this.renderGiveawayPage(interaction, pageId);
+  }
+
+  private async handleGiveawaySearchModal(interaction: any): Promise<void> {
+    const parts = String(interaction.customId).split(":");
+    const pageId = parts[1];
+    const state = this.giveawayPages.get(pageId);
+    if (!state) {
+      await replyV2Text(interaction as any, "Search expired", "Run the command again.");
+      return;
+    }
+    if (state.userId !== interaction.user.id) {
+      await replyV2Text(interaction as any, "Access denied", "Only the person who requested these results can search them.");
+      return;
+    }
+    state.query = interaction.fields.getTextInputValue("query").trim();
+    state.page = 0;
+    const searchId = giveawayPageId();
+    const nextState = { ...state, id: searchId, createdAt: Date.now() };
+    this.giveawayPages.set(searchId, nextState);
+    await this.renderGiveawayPage(interaction, searchId);
+  }
+
   private cleanupVRFSPages(): void {
     const cutoff = Date.now() - 10 * 60 * 1000;
     for (const [id, page] of this.vrfsPages) {
       if (page.createdAt < cutoff) this.vrfsPages.delete(id);
+    }
+    for (const [id, page] of this.giveawayPages) {
+      if (page.createdAt < cutoff) this.giveawayPages.delete(id);
     }
   }
   private createVRFSPage(
@@ -2469,15 +2619,13 @@ export class BotManager {
       const profile = player.profile;
       const outfits = player.outfits ?? [];
       const embed = createPlayerEmbed(id, username, profile, outfits);
-      await interaction.editReply({ embeds: [embed] });
+      await editV2Embed(interaction, embed);
     } catch (error) {
       logger.warn("Player lookup failed", {
         id,
         error: formatError(error),
       });
-      await interaction.editReply({
-        content: "That player could not be found.",
-      });
+      await editV2Text(interaction, "Player lookup", "That player could not be found.", 0xe74c3c);
     }
   }
   private async vrfsLockerCommand(
@@ -2489,15 +2637,15 @@ export class BotManager {
     try {
       const catalog = await getCatalog();
       if (!query) {
-        await interaction.editReply({
-          embeds: [
-            createEmbed(
+        await interaction.editReply(
+          v2EditPayload(
+            createV2Container(
               "Locker",
-              0x5865f2,
-              `Checking the collection for ID \`${id}\`.\n\nScanning ${catalog.length.toLocaleString()} items.`
-            ),
-          ],
-        });
+              `Checking the collection for ID \`${id}\`.\n\nScanning ${catalog.length.toLocaleString()} items.`,
+              0x5865f2
+            )
+          )
+        );
         const ownership = await checkOwnership(id, catalog.map(getSku), {
           batchSize: 250,
           minBatchSize: 5,
@@ -2522,18 +2670,33 @@ export class BotManager {
           `ID \`${id}\` · ${ownedItems.length.toLocaleString()} owned items`,
           10
         );
-        const page = createLockerPage(session);
-        await interaction.editReply({
-          embeds: [summary, ...page.embeds],
-          components: page.components,
+        const summaryContainer = embedToV2Container(summary);
+        const lockerResult = paginate(ownedItems, session.page, session.pageSize);
+        const lockerLines = lockerResult.items.map((item: VRFSItem, index: number) => {
+          const position = lockerResult.page * session.pageSize + index + 1;
+          return `**${position}. ${truncate(getItemName(item), 80)}**\n\`${truncate(
+            getSku(item),
+            100
+          )}\` · ${getSection(item)} · ${formatItemPrice(item)}`;
         });
+        addV2Text(
+          summaryContainer,
+          `### Owned Items\n${truncate(
+            lockerLines.join("\n\n") || "No owned items.",
+            4096
+          )}`
+        );
+        if (lockerResult.totalPages > 1) {
+          summaryContainer.addActionRowComponents(
+            createPaginationRow(session.id, lockerResult.page, lockerResult.totalPages)
+          );
+        }
+        await interaction.editReply(v2EditPayload(summaryContainer));
         return;
       }
       const matches = await searchCatalog(query, 25);
       if (!matches.length) {
-        await interaction.editReply({
-          content: `No items matched **${truncate(query, 100)}**.`,
-        });
+        await editV2Text(interaction, "Item search", `No items matched **${truncate(query, 100)}**.`, 0xe74c3c);
         return;
       }
       if (matches.length === 1) {
@@ -2554,7 +2717,7 @@ export class BotManager {
               : "Could not be confirmed",
           inline: false,
         });
-        await interaction.editReply({ embeds: [embed] });
+        await editV2Embed(interaction, embed);
         return;
       }
       const session = this.createVRFSPage(
@@ -2572,9 +2735,7 @@ export class BotManager {
         id,
         error: formatError(error),
       });
-      await interaction.editReply({
-        content: "The locker could not be loaded right now.",
-      });
+      await editV2Text(interaction, "Locker lookup", "The locker could not be loaded right now.", 0xe74c3c);
     }
   }
   private async vrfsItemCommand(
@@ -2586,20 +2747,20 @@ export class BotManager {
       const item = await getCatalogItem(query);
       if (item) {
         await interaction.editReply({
-          embeds: [createItemEmbed(item)],
+          components: [embedToV2Container(createItemEmbed(item))],
+          flags: MessageFlags.IsComponentsV2,
         });
         return;
       }
       const results = await searchCatalog(query, 50);
       if (!results.length) {
-        await interaction.editReply({
-          content: `No items matched **${truncate(query, 100)}**.`,
-        });
+        await editV2Text(interaction, "Item search", `No items matched **${truncate(query, 100)}**.`, 0xe74c3c);
         return;
       }
       if (results.length === 1) {
         await interaction.editReply({
-          embeds: [createItemEmbed(results[0])],
+          components: [embedToV2Container(createItemEmbed(results[0]))],
+          flags: MessageFlags.IsComponentsV2,
         });
         return;
       }
@@ -2617,9 +2778,7 @@ export class BotManager {
         query,
         error: formatError(error),
       });
-      await interaction.editReply({
-        content: "The item catalogue could not be loaded right now.",
-      });
+      await editV2Text(interaction, "Item catalogue", "The item catalogue could not be loaded right now.", 0xe74c3c);
     }
   }
   private async vrfsMarketCommand(
@@ -2631,23 +2790,20 @@ export class BotManager {
       const item = await getMarketplaceItem(query);
       if (item) {
         await interaction.editReply({
-          embeds: [createMarketplaceEmbed(item)],
+          components: [embedToV2Container(createMarketplaceEmbed(item))],
+          flags: MessageFlags.IsComponentsV2,
         });
         return;
       }
       const results = await searchMarketplace(query, 50);
       if (!results.length) {
-        await interaction.editReply({
-          content: `No marketplace items matched **${truncate(
-            query,
-            100
-          )}**.`,
-        });
+        await editV2Text(interaction, "Marketplace search", `No marketplace items matched **${truncate(query, 100)}**.`, 0xe74c3c);
         return;
       }
       if (results.length === 1) {
         await interaction.editReply({
-          embeds: [createMarketplaceEmbed(results[0])],
+          components: [embedToV2Container(createMarketplaceEmbed(results[0]))],
+          flags: MessageFlags.IsComponentsV2,
         });
         return;
       }
@@ -2665,9 +2821,7 @@ export class BotManager {
         query,
         error: formatError(error),
       });
-      await interaction.editReply({
-        content: "The marketplace could not be loaded right now.",
-      });
+      await editV2Text(interaction, "Marketplace", "The marketplace could not be loaded right now.", 0xe74c3c);
     }
   }
   private async vrfsCreatorCommand(
@@ -2681,9 +2835,7 @@ export class BotManager {
         getMarketplaceCreatorName(item).toLowerCase().includes(name)
       );
       if (!matches.length) {
-        await interaction.editReply({
-          content: `No creator matched **${truncate(name, 100)}**.`,
-        });
+        await editV2Text(interaction, "Creator search", `No creator matched **${truncate(name, 100)}**.`, 0xe74c3c);
         return;
       }
       const creator = getMarketplaceCreatorName(matches[0]);
@@ -2744,15 +2896,13 @@ export class BotManager {
       });
       const image = getMarketplaceImage(matches[0]);
       if (image) embed.setImage(image);
-      await interaction.editReply({ embeds: [embed] });
+      await editV2Embed(interaction, embed);
     } catch (error) {
       logger.warn("Creator lookup failed", {
         name,
         error: formatError(error),
       });
-      await interaction.editReply({
-        content: "The creator information could not be loaded right now.",
-      });
+      await editV2Text(interaction, "Creator lookup", "The creator information could not be loaded right now.", 0xe74c3c);
     }
   }
   private async vrfsStatsCommand(
@@ -2824,14 +2974,12 @@ export class BotManager {
           inline: true,
         }
       );
-      await interaction.editReply({ embeds: [embed] });
+      await editV2Embed(interaction, embed);
     } catch (error) {
       logger.warn("VRFS stats failed", {
         error: formatError(error),
       });
-      await interaction.editReply({
-        content: "The statistics could not be loaded right now.",
-      });
+      await editV2Text(interaction, "Statistics", "The statistics could not be loaded right now.", 0xe74c3c);
     }
   }
   private async vrfsStatusCommand(
@@ -2865,7 +3013,7 @@ export class BotManager {
           inline: true,
         }
       );
-      await interaction.editReply({ embeds: [embed] });
+      await editV2Embed(interaction, embed);
     } catch (error) {
       logger.warn("VRFS status failed", {
         error: formatError(error),
@@ -2880,7 +3028,7 @@ export class BotManager {
         value: "Unavailable",
         inline: true,
       });
-      await interaction.editReply({ embeds: [embed] });
+      await editV2Embed(interaction, embed);
     }
   }
   private async registerCommands(): Promise<void> {
