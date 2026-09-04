@@ -2973,7 +2973,7 @@ export class AutoJoinManager extends EventEmitter {
   // -------------------------------------------------------------------------
 
   private async handleWin(message: Message, userId: string): Promise<void> {
-    if (!message.guild || !message.author?.bot) return;
+    if (!message.guild || !message.author?.bot || message.author.id !== GIVEAWAY_BOT_ID) return;
 
     const myId = message.client.user?.id;
     if (!myId) return;
@@ -3011,6 +3011,7 @@ export class AutoJoinManager extends EventEmitter {
 
   private async handleDmWin(message: Message, userId: string): Promise<void> {
     if (message.guild) return;
+    if (!message.author?.bot || message.author.id !== GIVEAWAY_BOT_ID) return;
 
     const allText = this.extractAllText(message);
     if (!WIN_PATTERNS.some(re => re.test(allText))) return;
