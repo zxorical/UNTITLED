@@ -1253,7 +1253,9 @@ export class BotManager {
   }
   private async sendNotificationPanel(): Promise<void> {
     const panelChannelId =
-      process.env.PANEL_CHANNEL_ID || CONFIG.trackerChannelId;
+      process.env.PANEL_CHANNEL_ID ||
+      process.env.NOTIFICATION_PANEL_CHANNEL_ID ||
+      CONFIG.trackerChannelId;
     const channel = this.client.channels.cache.get(
       panelChannelId
     ) as TextChannel | undefined;
@@ -1264,16 +1266,46 @@ export class BotManager {
       });
       return;
     }
+
     try {
-      const messages = await channel.messages.fetch({ limit: 20 });
-      const oldPanel = messages.find(
-        (m) =>
-          m.author.id === this.client.user?.id &&
-          m.embeds.length > 0 &&
-          m.embeds[0]?.title === "Notifications"
-      );
-      if (oldPanel) await oldPanel.delete().catch(() => {});
-    } catch {}
+      const messages = await channel.messages.fetch({ limit: 100 });
+      const isNotificationPanel = (message: any): boolean => {
+        if (message.author?.id !== this.client.user?.id) return false;
+        if (
+          message.embeds?.some(
+            (embed: any) => embed?.title === "Notifications"
+          )
+        ) {
+          return true;
+        }
+        const hasButton = (component: any): boolean => {
+          if (!component) return false;
+          if (
+            ["toggle_giveaway", "toggle_scrim", "toggle_event"].includes(
+              component.customId
+            )
+          ) {
+            return true;
+          }
+          return Array.isArray(component.components)
+            ? component.components.some(hasButton)
+            : false;
+        };
+        return Array.isArray(message.components)
+          ? message.components.some(hasButton)
+          : false;
+      };
+      for (const message of messages.values()) {
+        if (isNotificationPanel(message)) {
+          await message.delete().catch(() => {});
+        }
+      }
+    } catch (error) {
+      logger.warn("Failed to clean old notification panels", {
+        error: formatError(error),
+      });
+    }
+
     const container = createV2Container(
       "Notifications",
       "Manage which notifications you receive.\n\n**Giveaways**\nReceive notifications for new giveaways.\n\n**Scrims**\nReceive notifications for scrim announcements.\n\n**Events**\nReceive notifications for event announcements.",
@@ -1298,10 +1330,9 @@ export class BotManager {
       components: [container],
       flags: MessageFlags.IsComponentsV2,
     });
-    logger.info("Notification panel sent", {
-      channelId: panelChannelId,
-    });
+    logger.info("Notification panel sent", { channelId: panelChannelId });
   }
+
   private async handleNotificationToggle(
     interaction: ButtonInteraction,
     type: "giveaways" | "scrims" | "events"
@@ -2192,17 +2223,61 @@ export class BotManager {
       panelChannelId
     ) as TextChannel | undefined;
     if (!channel) return;
+
     try {
-      const messages = await channel.messages.fetch({ limit: 20 });
-      const oldPanel = messages.find(
-        (m) =>
-          m.author.id === this.client.user?.id &&
-          m.embeds.length > 0 &&
-          m.embeds[0]?.title === "Premium Access"
+      const messages = await channel.messages.fetch({ limit: 100 });
+      const oldIds = new Set([
+        "license_activate",
+        "activate_premium",
+        "check_premium",
+        "generate_key",
+        "list_keys",
+        "refresh_stats",
+      ]);
+      const hasPanelButton = (component: any): boolean => {
+        if (!component) return false;
+        if (oldIds.has(component.customId)) return true;
+        return Array.isArray(component.components)
+          ? component.components.some(hasPanelButton)
+          : false;
+      };
+      for (const message of messages.values()) {
+        if (message.author?.id !== this.client.user?.id) continue;
+        const legacy = message.embeds?.some(
+          (embed: any) =>
+            embed?.title === "Premium Access" ||
+            embed?.title === "License Panel"
+        );
+        const v2 = Array.isArray(message.components)
+          ? message.components.some(hasPanelButton)
+          : false;
+        if (legacy || v2) await message.delete().catch(() => {});
+      }
+
+      const container = createV2Container(
+        "Premium Access",
+        "Activate your premium access with a license key, or manage your existing premium account.",
+        0x5865f2
       );
-      if (oldPanel) await oldPanel.delete().catch(() => {});
-      const panel = new KeyPanel(channel);
-      await panel.sendPanel();
+      const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder()
+          .setCustomId("license_activate")
+          .setLabel("Activate Key")
+          .setStyle(ButtonStyle.Primary),
+        new ButtonBuilder()
+          .setCustomId("activate_premium")
+          .setLabel("Activate Premium")
+          .setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder()
+          .setCustomId("check_premium")
+          .setLabel("Check Premium")
+          .setStyle(ButtonStyle.Secondary)
+      );
+      container.addActionRowComponents(row);
+      await channel.send({
+        components: [container],
+        flags: MessageFlags.IsComponentsV2,
+      });
       logger.info("License panel sent", { channelId: panelChannelId });
     } catch (error) {
       logger.error("Failed to send license panel", {
@@ -2210,6 +2285,7 @@ export class BotManager {
       });
     }
   }
+
   private async sendPremiumPanel(): Promise<void> {
     const panelChannelId = process.env.PREMIUM_PANEL_CHANNEL_ID;
     if (!panelChannelId) return;
@@ -2217,17 +2293,43 @@ export class BotManager {
       panelChannelId
     ) as TextChannel | undefined;
     if (!channel) return;
+
     try {
-      const messages = await channel.messages.fetch({ limit: 20 });
-      const oldPanel = messages.find(
-        (m) =>
-          m.author.id === this.client.user?.id &&
-          m.embeds.length > 0 &&
-          m.embeds[0]?.title === "Premium Panel"
+      const messages = await channel.messages.fetch({ limit: 100 });
+      const hasPanelButton = (component: any): boolean => {
+        if (!component) return false;
+        if (component.customId === "premium_autojoiner") return true;
+        return Array.isArray(component.components)
+          ? component.components.some(hasPanelButton)
+          : false;
+      };
+      for (const message of messages.values()) {
+        if (message.author?.id !== this.client.user?.id) continue;
+        const legacy = message.embeds?.some(
+          (embed: any) => embed?.title === "Premium Panel"
+        );
+        const v2 = Array.isArray(message.components)
+          ? message.components.some(hasPanelButton)
+          : false;
+        if (legacy || v2) await message.delete().catch(() => {});
+      }
+
+      const container = createV2Container(
+        "Premium AutoJoiner",
+        "Premium access for the AutoJoiner. Activate premium to use the premium features.",
+        0x5865f2
       );
-      if (oldPanel) await oldPanel.delete().catch(() => {});
-      const panel = new PremiumPanel(channel);
-      await panel.sendPanel();
+      const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder()
+          .setCustomId("premium_autojoiner")
+          .setLabel("AutoJoiner")
+          .setStyle(ButtonStyle.Primary)
+      );
+      container.addActionRowComponents(row);
+      await channel.send({
+        components: [container],
+        flags: MessageFlags.IsComponentsV2,
+      });
       logger.info("Premium panel sent", { channelId: panelChannelId });
     } catch (error) {
       logger.error("Failed to send premium panel", {
@@ -2235,6 +2337,7 @@ export class BotManager {
       });
     }
   }
+
   private async handleGuildMemberUpdate(
     oldMember: any,
     newMember: any
@@ -2472,7 +2575,7 @@ export class BotManager {
         .setCustomId("query")
         .setLabel("Search prize, server, or channel")
         .setStyle(TextInputStyle.Short)
-        .setPlaceholder("Example: VFA, VSL, VRLL")
+        .setPlaceholder("Example: Nitro, VRFS, giveaways")
         .setRequired(false)
         .setMaxLength(100);
       modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
