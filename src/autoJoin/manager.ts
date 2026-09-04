@@ -330,6 +330,8 @@ const PATTERNS = {
 // ---------------------------------------------------------------------------
 const ENTRY_TTL_MS = 5 * 60 * 1000;
 const WIN_DEDUP_TTL_MS = 5 * 60 * 1000;
+const WIN_INVITE_CACHE_TTL_MS = 30 * 60 * 1000;
+const WIN_INVITE_CACHE_MAX_SIZE = 250;
 const COMPONENT_RETRY_DELAY_MS = 75;
 const COMPONENT_RETRY_ATTEMPTS = 2;
 const SESSION_REFRESH_INTERVAL_MS = 2 * 60 * 1000;
@@ -1141,6 +1143,8 @@ export class AutoJoinManager extends EventEmitter {
   private processedMessages: LRUCache<string, number>;
   private processingCache: LRUCache<string, number>;
   private recentWins: LRUCache<string, number>;
+  private winInviteCache: LRUCache<string, string>;
+  private pendingWinInvites: Map<string, Promise<string | null>> = new Map();
   private noResponseCooldown: LRUCache<string, number>;
   private crosspostCache: LRUCache<string, string>;
   private messageCache: LRUCache<string, CachedMessageData>;
@@ -1208,6 +1212,7 @@ export class AutoJoinManager extends EventEmitter {
     this.processedMessages = new LRUCache<string, number>(CACHE_PROCESSED_MESSAGES, 180000);
     this.processingCache = new LRUCache<string, number>(CACHE_MAX_PROCESSING, PROCESSING_CACHE_TTL_MS);
     this.recentWins = new LRUCache<string, number>(CACHE_MAX_WINS, WIN_DEDUP_TTL_MS);
+    this.winInviteCache = new LRUCache<string, string>(WIN_INVITE_CACHE_MAX_SIZE, WIN_INVITE_CACHE_TTL_MS);
     this.noResponseCooldown = new LRUCache<string, number>(CACHE_MAX_COOLDOWN, NO_RESPONSE_COOLDOWN_MS + 10000);
     this.crosspostCache = new LRUCache<string, string>(CACHE_CROSSPOST, 30 * 60 * 1000);
     this.messageCache = new LRUCache<string, CachedMessageData>(CACHE_MESSAGES, 30000);
@@ -3040,7 +3045,7 @@ export class AutoJoinManager extends EventEmitter {
 
   private async sendWinWebhook(message: Message, prize: string, sourceName: string, userId: string): Promise<void> {
     const session = this.findSessionByUserId(userId);
-    const guildId = session?.guildId || '';
+    const guildId = session?.guildId || message.guild?.id || '';
 
     let url: string | null = null;
     try {
@@ -3053,16 +3058,180 @@ export class AutoJoinManager extends EventEmitter {
     const premiumUserId = userId;
     const safePrize = this.cleanWinPrize(prize);
     const article = this.getIndefiniteArticle(safePrize);
-    const content = `<@${premiumUserId}> Won ${article} **${safePrize}** !!`;
+
+    const messageLink = message.guild
+      ? `https://discord.com/channels/${message.guild.id}/${message.channel.id}/${message.id}`
+      : null;
+
+    let inviteLink: string | null = null;
+    if (message.guild) {
+      inviteLink = await this.getWinInvite(
+        message.guild.id,
+        message.channel.id,
+        session?.client || (message as any).client,
+      );
+    }
+
+    const guildName = message.guild?.name || sourceName;
+    const channelName = message.guild
+      ? `#${(message.channel as { name?: string }).name ?? message.channel.id}`
+      : null;
+
+    const components: any[] = [
+      {
+        type: 17,
+        accent_color: 0x5865F2,
+        components: [
+          {
+            type: 10,
+            content: '# AutoJoin WIN',
+          },
+          {
+            type: 14,
+            divider: true,
+            spacing: 1,
+          },
+          {
+            type: 10,
+            content: `<@${premiumUserId}> won ${article} **${safePrize}**`,
+          },
+          {
+            type: 10,
+            content: [
+              `**Server:** ${guildName}`,
+              channelName ? `**Channel:** ${channelName}` : null,
+            ].filter(Boolean).join('\n'),
+          },
+        ],
+      },
+    ];
+
+    const linkButtons: any[] = [];
+    if (messageLink) {
+      linkButtons.push({
+        type: 2,
+        style: 5,
+        label: 'Jump to Giveaway',
+        url: messageLink,
+      });
+    }
+    if (inviteLink) {
+      linkButtons.push({
+        type: 2,
+        style: 5,
+        label: 'Join Server',
+        url: inviteLink,
+      });
+    }
+
+    if (linkButtons.length > 0) {
+      components[0].components.push({
+        type: 14,
+        divider: true,
+        spacing: 1,
+      });
+      components[0].components.push({
+        type: 1,
+        components: linkButtons,
+      });
+    }
+
     try {
       await this.http.post(url, {
-        content,
+        flags: 32768,
+        components,
         allowed_mentions: { users: [premiumUserId] },
-        username: '🎉 AutoJoin WIN',
+        username: 'AutoJoin WIN',
       }, { timeout: 8000 });
     } catch (error) {
       this.asyncLogger.warn('Win webhook failed', { userId, error: formatError(error) });
     }
+  }
+
+  private async getWinInvite(
+    guildId: string,
+    preferredChannelId?: string,
+    client?: Client,
+  ): Promise<string | null> {
+    const cached = this.winInviteCache.get(guildId);
+    if (cached) return cached;
+
+    const pending = this.pendingWinInvites.get(guildId);
+    if (pending) return pending;
+
+    const promise = this.resolveWinInvite(guildId, preferredChannelId, client);
+    this.pendingWinInvites.set(guildId, promise);
+
+    try {
+      return await promise;
+    } finally {
+      this.pendingWinInvites.delete(guildId);
+    }
+  }
+
+  private async resolveWinInvite(
+    guildId: string,
+    preferredChannelId?: string,
+    client?: Client,
+  ): Promise<string | null> {
+    try {
+      const guild = client?.guilds.cache.get(guildId);
+      if (!guild) return null;
+
+      try {
+        const vanity = (guild as any).vanityURLCode as string | null | undefined;
+        if (vanity) {
+          const url = `https://discord.gg/${vanity}`;
+          this.winInviteCache.set(guildId, url);
+          return url;
+        }
+      } catch {}
+
+      try {
+        const invites = await guild.invites.fetch();
+        if (invites?.size) {
+          const best =
+            invites.find(inv => inv.maxAge === 0 && inv.maxUses === 0) ??
+            invites.find(inv => inv.maxAge === 0) ??
+            invites.first();
+          if (best?.url) {
+            this.winInviteCache.set(guildId, best.url);
+            return best.url;
+          }
+        }
+      } catch {}
+
+      const channels = Array.from(guild.channels.cache.values())
+        .filter((channel): channel is TextChannel => channel.type === 'GUILD_TEXT');
+
+      channels.sort((a, b) => {
+        if (preferredChannelId === a.id) return -1;
+        if (preferredChannelId === b.id) return 1;
+        return 0;
+      });
+
+      for (const channel of channels) {
+        try {
+          const invite = await channel.createInvite({
+            maxAge: 0,
+            maxUses: 0,
+            reason: 'AutoJoin win notifier',
+            temporary: false,
+          });
+          if (invite?.url) {
+            this.winInviteCache.set(guildId, invite.url);
+            return invite.url;
+          }
+        } catch {}
+      }
+    } catch (error) {
+      this.asyncLogger.debug('Failed to resolve win invite', {
+        guildId,
+        error: formatError(error),
+      });
+    }
+
+    return null;
   }
 
   // -------------------------------------------------------------------------
@@ -3376,7 +3545,16 @@ export class AutoJoinManager extends EventEmitter {
     return this.extractPrize(message);
   }
   private cleanWinPrize(value: string): string {
-    return this.cleanText(value.replace(/^[:\-–—|\s]+|[:\-–—|\s]+$/g, '').replace(/^(?:the\s+)?(?:giveaway|prize)\s*[:\-–—]?\s*/i, '').trim()) || 'Unknown Prize';
+    const cleaned = value
+      .replace(/\[([^\]]+)\]\(https?:\/\/[^\s)]+\)/gi, '$1')
+      .replace(/https?:\/\/[^\s)]+/gi, '')
+      .replace(/\*\*|__|~~|`/g, '')
+      .replace(/^[:\-–—|\s]+|[:\-–—|\s]+$/g, '')
+      .replace(/^(?:the\s+)?(?:giveaway|prize)\s*[:\-–—]?\s*/i, '')
+      .replace(/\s{2,}/g, ' ')
+      .trim();
+
+    return this.cleanText(cleaned) || 'Unknown Prize';
   }
   private getIndefiniteArticle(prize: string): 'a' | 'an' {
     const word = prize.trim().split(/\s+/)[0] ?? '';
