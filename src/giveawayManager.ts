@@ -130,10 +130,11 @@ const MAX_FAILED_INVITE_CACHE = 100;
 const WATCHLIST_CACHE_TTL = 60_000;
 const INVITE_CACHE_TTL = 30 * 60 * 1000;
 const FAILED_INVITE_RETRY_MS = 15 * 60 * 1000;
-const INVITE_MAX_ATTEMPTS = 4;
+const INVITE_MAX_ATTEMPTS = 20;
 const INVITE_WARMUP_CONCURRENCY = 3;
 const INVITE_ATTEMPT_TIMEOUT_MS = 2500;
-const INVITE_RETRY_DELAYS_MS = [250, 500, 1000];
+const INVITE_RETRY_DELAYS_MS = [250, 500, 1000, 1500, 2000, 3000, 5000];
+const INVITE_PASSIVE_RETRY_CYCLE_MS = 5 * 60 * 1000;
 const AHOCORASICK_THRESHOLD = 100;
 
 // Memory safety limits
@@ -2223,9 +2224,17 @@ export class GiveawayManager extends EventEmitter {
       }
 
       this.log.warn(
-        `Invite warmup exhausted ${INVITE_MAX_ATTEMPTS} attempts for guild ${guildId}; channel links will be used until the next warmup cycle`,
+        `Invite warmup exhausted ${INVITE_MAX_ATTEMPTS} attempts for guild ${guildId}; scheduling another passive cycle`,
         { component: 'GiveawayManager', account: this.accountLabel },
       );
+
+      // Do not give up permanently. Discord permissions/cache state can change
+      // later (or a transient API problem can clear). Requeue this guild for a
+      // fresh passive cycle without involving the message detection path.
+      setTimeout(() => {
+        if (this.destroyed) return;
+        this.enqueueInviteWarmup(guildId);
+      }, INVITE_PASSIVE_RETRY_CYCLE_MS).unref?.();
     } finally {
       const current = this.inviteRetryState.get(guildId);
       if (current === state) this.inviteRetryState.delete(guildId);
