@@ -3135,9 +3135,19 @@ export class AutoJoinManager extends EventEmitter {
         components,
         allowed_mentions: { users: [premiumUserId] },
         username: 'AutoJoin WIN',
-      }, { timeout: 8000 });
-    } catch (error) {
-      this.asyncLogger.warn('Win webhook failed', { userId, error: formatError(error) });
+      }, {
+        timeout: 8000,
+        params: {
+          with_components: true,
+        },
+      });
+    } catch (error: any) {
+      this.asyncLogger.warn('Win webhook failed', {
+        userId,
+        status: error?.response?.status,
+        response: error?.response?.data,
+        error: formatError(error),
+      });
     }
   }
 
