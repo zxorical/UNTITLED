@@ -344,8 +344,8 @@ const RECONNECT_GRACE_MS = 15000;
 const RECONNECT_COOLDOWN_MS = 30000;
 const LOGIN_TIMEOUT_MS = 30000;
 const READY_TIMEOUT_MS = 15000;
-const INTERACTION_RETRY_ATTEMPTS = 3;
-const INTERACTION_RETRY_DELAY_MS = 250;
+const INTERACTION_RETRY_ATTEMPTS = 2;
+const INTERACTION_RETRY_DELAY_MS = 150;
 const NO_RESPONSE_COOLDOWN_MS = 2500;
 const BATCH_DB_WRITE_INTERVAL_MS = 2000;
 const ARCHIVE_AGE_MS = 24 * 60 * 60 * 1000;
@@ -394,8 +394,8 @@ const MAX_RETRY_DELAY_MS = 60000;
 const TOKEN_REACTIVATION_THRESHOLD_MS = 60 * 1000;
 const HEALTH_CHECK_INTERVAL_MS = 15000;
 
-const MAX_CONCURRENT_ENTRIES_PER_ACCOUNT = 5;
-const DETECTION_CONCURRENCY_PER_SESSION = 6;
+const MAX_CONCURRENT_ENTRIES_PER_ACCOUNT = 2;
+const DETECTION_CONCURRENCY_PER_SESSION = 3;
 const MAX_INGEST_QUEUE_SIZE = 5000;
 const INGEST_OPERATION_TIMEOUT_MS = 15000;
 const ENTRY_OPERATION_TIMEOUT_MS = 20000;
@@ -1197,6 +1197,7 @@ export class AutoJoinManager extends EventEmitter {
   // Retry scheduler
   private retryScheduled: Map<string, NodeJS.Timeout> = new Map();
   private tokenFailureTracker: Map<string, { failures: number; lastAttempt: number }> = new Map();
+  private cleanupScheduled: Set<string> = new Set();
 
   // HTTP client and agents
   private httpAgent: http.Agent;
@@ -2083,11 +2084,11 @@ export class AutoJoinManager extends EventEmitter {
             });
 
             session.lastPipelineActivityAt = Date.now();
-            await this.withTimeout(
-              this.handleMessage(item.message, session),
-              INGEST_OPERATION_TIMEOUT_MS,
-              `message processing ${item.message.id}`,
-            );
+            // Do not wrap this in Promise.race/withTimeout: that would free the
+            // worker slot while handleMessage continues running in the background,
+            // creating duplicate concurrent work during bursts. handleMessage is
+            // intentionally non-blocking for database bookkeeping now.
+            await this.handleMessage(item.message, session);
             session.lastPipelineActivityAt = Date.now();
           } catch (error) {
             this.asyncLogger.error('Incoming giveaway processing error', {
@@ -2220,12 +2221,15 @@ export class AutoJoinManager extends EventEmitter {
         detectionReasons: ['binary_detection_with_button'],
       };
 
-      await this.withTimeout(
-        saveAutoJoinEntry(entryData as Omit<AutoJoinEntry, '_id'>),
-        15000,
-        `save entry ${entryId}`,
-      );
-      this.metrics.dbQueries++;
+      void saveAutoJoinEntry(entryData as Omit<AutoJoinEntry, '_id'>)
+        .then(() => { this.metrics.dbQueries++; })
+        .catch(error => {
+          this.asyncLogger.warn('AutoJoin: Background entry save failed', {
+            userId: session.userId,
+            entryId,
+            error: formatError(error),
+          });
+        });
 
       this.asyncLogger.info('🎯 AutoJoin: Giveaway detected', {
         correlationId,
@@ -2246,18 +2250,10 @@ export class AutoJoinManager extends EventEmitter {
       });
     } finally {
       this.processingCache.delete(entryId);
-      try {
-        await this.withTimeout(
-          cleanupAutoJoinEntries(session.userId),
-          10000,
-          `cleanup ${session.userId}`,
-        );
-      } catch (cleanupError) {
-        this.asyncLogger.warn('AutoJoin cleanup timed out', {
-          userId: session.userId,
-          error: formatError(cleanupError),
-        });
-      }
+      this.scheduleCleanup(session.userId);
+      // Keep freshly detected giveaway messages in the channel cache long enough
+      // for the entry worker to click them without forcing another REST fetch.
+      setTimeout(() => this.purgeMessageFromCache(message), 60000).unref?.();
     }
   }
 
@@ -2396,11 +2392,21 @@ export class AutoJoinManager extends EventEmitter {
     const enqueued = this.joinQueue.enqueue(queueItem);
 
     if (enqueued) {
-      await updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'queued', {});
+      void updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'queued', {})
+        .then(() => { this.metrics.dbQueries++; })
+        .catch(() => {});
 
+      // Start immediately. Database state is best-effort and must never block a
+      // giveaway that may only have seconds remaining.
       this.startQueueProcessor(session.userId);
     } else {
-      await this.enterGiveaway(entryId, session, entry);
+      void this.enterGiveaway(entryId, session, entry).catch(error => {
+        this.asyncLogger.warn('Direct giveaway entry failed', {
+          userId: session.userId,
+          messageId: entry.messageId,
+          error: formatError(error),
+        });
+      });
     }
   }
 
@@ -2483,20 +2489,19 @@ export class AutoJoinManager extends EventEmitter {
 
         let promise!: Promise<void>;
         session.lastPipelineActivityAt = Date.now();
-        promise = this.withTimeout(
-          this.enterGiveaway(entryId, session, entry),
-          ENTRY_OPERATION_TIMEOUT_MS,
-          `giveaway entry ${entry.messageId}`,
-        ).catch(error => {
-          this.asyncLogger.error('Giveaway entry worker timed out or failed', {
-            userId,
-            messageId: entry.messageId,
-            error: formatError(error),
+        const entryPromise = this.enterGiveaway(entryId, session, entry);
+        promise = entryPromise
+          .catch(error => {
+            this.asyncLogger.error('Giveaway entry worker failed', {
+              userId,
+              messageId: entry.messageId,
+              error: formatError(error),
+            });
+          })
+          .finally(() => {
+            activePromises.delete(promise);
+            session.lastPipelineActivityAt = Date.now();
           });
-        }).finally(() => {
-          activePromises.delete(promise);
-          session.lastPipelineActivityAt = Date.now();
-        });
         activePromises.add(promise);
 
         await delay(25);
@@ -2567,8 +2572,9 @@ export class AutoJoinManager extends EventEmitter {
 
     const correlationId = entry.correlationId || uuidv4();
 
-    await updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'attempting', {});
-    this.metrics.dbQueries++;
+    void updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'attempting', {})
+      .then(() => { this.metrics.dbQueries++; })
+      .catch(() => {});
 
     const maxAttempts = CONFIG.maxRetries + 1;
 
@@ -2577,8 +2583,11 @@ export class AutoJoinManager extends EventEmitter {
       this.metrics.totalEntriesAttempted++;
       
       if (attempt > 0) {
-        const backoffMs = exponentialBackoff(attempt - 1, CONFIG.retryDelayMs, 30000);
-        await delay(backoffMs);
+        const remainingMs = entry.endsAt ? Math.max(0, entry.endsAt - Date.now()) : Number.POSITIVE_INFINITY;
+        const configured = exponentialBackoff(attempt - 1, CONFIG.retryDelayMs, 5000);
+        const fastRetry = Math.min(configured, 750 * Math.pow(2, attempt - 1));
+        const backoffMs = Math.min(fastRetry, Math.max(0, remainingMs - 1500));
+        if (backoffMs > 0) await delay(backoffMs);
       }
 
       if (attempt === 2) {
@@ -2607,12 +2616,11 @@ export class AutoJoinManager extends EventEmitter {
         session.stats.lastEntryAt = Date.now();
         this.metrics.totalEntriesSucceeded++;
 
-        await updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'success', { 
+        void updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'success', {
           attempts: attemptNum,
-        });
-        this.metrics.dbQueries++;
-        await incrementTokenEntries(session.userId, session.guildId);
-        await updateTokenLastUsed(session.userId, session.guildId);
+        }).then(() => { this.metrics.dbQueries++; }).catch(() => {});
+        void incrementTokenEntries(session.userId, session.guildId).catch(() => {});
+        void updateTokenLastUsed(session.userId, session.guildId).catch(() => {});
 
         this.joinOutcomeBuffer.push({
           userId: session.userId,
@@ -2677,16 +2685,15 @@ export class AutoJoinManager extends EventEmitter {
 
         if (isNoResponse && attempt < maxAttempts - 1) {
           this.noResponseCooldown.set(session.userId, Date.now() + NO_RESPONSE_COOLDOWN_MS);
-          await delay(2000);
+          await delay(250);
           try { await this.refreshButtonData(entry as GiveawayEntry, session); } catch {}
           continue;
         }
 
-        await updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'attempting', { 
-          attempts: attemptNum, 
-          lastError: errorMsg 
-        });
-        this.metrics.dbQueries++;
+        void updateAutoJoinEntryStatus(session.userId, entry.messageId, entry.channelId, 'attempting', {
+          attempts: attemptNum,
+          lastError: errorMsg
+        }).then(() => { this.metrics.dbQueries++; }).catch(() => {});
         
         this.asyncLogger.warn(`AutoJoin: Attempt ${attemptNum}/${maxAttempts} failed`, {
           correlationId, userId: session.userId, entryId, error: errorMsg, worker: this.workerId,
@@ -2797,23 +2804,9 @@ export class AutoJoinManager extends EventEmitter {
   }
 
   private async clickButton(message: Message, button: GiveawayButton, session: UserSession): Promise<void> {
-    const selfbotMsg = message as Message & { clickButton?: (id: string) => Promise<unknown> };
-    
-    if (typeof selfbotMsg.clickButton === 'function') {
-      try {
-        await selfbotMsg.clickButton(button.customId);
-        return;
-      } catch (error) {
-        const errorMsg = formatError(error);
-        if (errorMsg.includes('No responsed from Application') || 
-            errorMsg.includes('No response from Application')) {
-          await this.postInteraction(message, button, session);
-          return;
-        }
-        throw error;
-      }
-    }
-
+    // Use the manager's controlled interaction path instead of the library's
+    // internal RequestHandler. The library path is what was producing repeated
+    // aborted /interactions requests under load.
     await this.postInteraction(message, button, session);
   }
 
@@ -2893,7 +2886,7 @@ export class AutoJoinManager extends EventEmitter {
               'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
               'X-Discord-Locale': 'en-US',
             },
-            timeout: 5000,
+            timeout: 2500,
           });
           
           this.metrics.apiCalls++;
@@ -3283,6 +3276,20 @@ export class AutoJoinManager extends EventEmitter {
     }
 
     this.accountStatsCache.set(userId, stats);
+  }
+
+  private scheduleCleanup(userId: string): void {
+    if (this.cleanupScheduled.has(userId)) return;
+    this.cleanupScheduled.add(userId);
+    const timeout = setTimeout(() => {
+      this.cleanupScheduled.delete(userId);
+      void cleanupAutoJoinEntries(userId).then(() => {
+        this.metrics.dbQueries++;
+      }).catch(error => {
+        this.asyncLogger.debug('AutoJoin cleanup failed', { userId, error: formatError(error) });
+      });
+    }, 30000);
+    timeout.unref?.();
   }
 
   private async withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
