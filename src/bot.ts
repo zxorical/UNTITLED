@@ -459,7 +459,12 @@ function v2ReplyPayload(
   };
 }
 
-function v2EditPayload(container: ContainerBuilder) {
+type V2Payload = {
+  components: ContainerBuilder[];
+  flags: MessageFlags.IsComponentsV2;
+};
+
+function v2EditPayload(container: ContainerBuilder): V2Payload {
   return {
     components: [container],
     flags: MessageFlags.IsComponentsV2,
@@ -889,7 +894,7 @@ function createPaginationRow(
 }
 function createCatalogPage(
   session: VRFSPage
-) {
+): V2Payload {
   const result = paginate(
     session.items as VRFSItem[],
     session.page,
@@ -922,7 +927,7 @@ function createCatalogPage(
 }
 function createMarketplacePage(
   session: VRFSPage
-) {
+): V2Payload {
   const result = paginate(
     session.items as VRFSMarketplaceItem[],
     session.page,
@@ -957,7 +962,7 @@ function createMarketplacePage(
 }
 function createLockerPage(
   session: VRFSPage
-) {
+): V2Payload {
   const result = paginate(
     session.items as VRFSItem[],
     session.page,
@@ -2493,10 +2498,15 @@ export class BotManager {
       await replyV2Text(interaction as any, "Access denied", "Only the person who requested these results can search them.");
       return;
     }
-    state.query = interaction.fields.getTextInputValue("query").trim();
-    state.page = 0;
+    const query = interaction.fields.getTextInputValue("query").trim();
     const searchId = giveawayPageId();
-    const nextState = { ...state, id: searchId, createdAt: Date.now() };
+    const nextState: GiveawayPageState = {
+      ...state,
+      id: searchId,
+      query,
+      page: 0,
+      createdAt: Date.now(),
+    };
     this.giveawayPages.set(searchId, nextState);
     await this.renderGiveawayPage(interaction, searchId);
   }
