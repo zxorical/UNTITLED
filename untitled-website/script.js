@@ -107,8 +107,6 @@ const buildNav = () => {
                                             : ""
                                     }
                                 </span>
-
-                                <span class="account-arrow">⌄</span>
                             </button>
 
                             <div class="account-menu">
