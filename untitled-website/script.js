@@ -3,9 +3,6 @@ const page = window.location.pathname.split("/").pop() || "index.html";
 const nav = document.getElementById("navbar");
 const footer = document.getElementById("footer");
 
-let currentUser = null;
-let authenticated = false;
-
 const escapeHtml = value => String(value)
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
@@ -13,99 +10,38 @@ const escapeHtml = value => String(value)
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#039;");
 
-const getUserAvatar = user => {
-    if (user?.id && user?.avatar) {
-        return `https://cdn.discordapp.com/avatars/${encodeURIComponent(user.id)}/${encodeURIComponent(user.avatar)}.png?size=128`;
-    }
-
-    return "https://cdn.discordapp.com/embed/avatars/0.png";
-};
-
-const getUsername = user => {
-    return user?.globalName || user?.username || "Account";
-};
-
-const getUserTag = user => {
-    return user?.username ? `@${user.username}` : "";
-};
-
-/*
- * Ask the backend whether the current browser session
- * is authenticated with Discord.
- *
- * IMPORTANT:
- * Authentication is determined by the HttpOnly session cookie.
- * sessionStorage is NOT used as authentication anymore.
- */
-const fetchCurrentUser = async () => {
+const getUser = () => {
     try {
-        const response = await fetch("/api/auth/me", {
-            method: "GET",
-            credentials: "include",
-            headers: {
-                Accept: "application/json"
-            },
-            cache: "no-store"
-        });
-
-        if (response.status === 401 || response.status === 403) {
-            currentUser = null;
-            authenticated = false;
-            return false;
-        }
-
-        if (!response.ok) {
-            currentUser = null;
-            authenticated = false;
-            return false;
-        }
-
-        const data = await response.json();
-
-        if (!data?.user) {
-            currentUser = null;
-            authenticated = false;
-            return false;
-        }
-
-        currentUser = data.user;
-        authenticated = true;
-
-        return true;
+        return JSON.parse(sessionStorage.getItem("untitled_user") || "null");
     } catch {
-        currentUser = null;
-        authenticated = false;
-        return false;
+        return null;
     }
 };
 
-const redirectToLogin = () => {
-    if (page === "login.html") {
-        return;
-    }
+const user = getUser();
 
-    window.location.replace("/login.html");
+const loggedIn =
+    sessionStorage.getItem("untitled_logged_in") === "true" &&
+    !!user;
+
+const avatar = user?.id && user?.avatar
+    ? `https://cdn.discordapp.com/avatars/${encodeURIComponent(user.id)}/${encodeURIComponent(user.avatar)}.png?size=128`
+    : "https://cdn.discordapp.com/embed/avatars/0.png";
+
+const username = user?.globalName || user?.username || "Account";
+const tag = user?.username ? `@${user.username}` : "";
+
+const setLoginState = value => {
+    sessionStorage.setItem(
+        "untitled_logged_in",
+        value ? "true" : "false"
+    );
 };
 
-const requireLogin = async () => {
-    /*
-     * login.html is ALWAYS allowed to load.
-     *
-     * This is important because otherwise an unauthenticated
-     * browser can get stuck redirecting to login.html repeatedly.
-     */
-    if (page === "login.html") {
-        return true;
+const goToLogin = () => {
+    if (page !== "login.html") {
+        window.location.href = "login.html";
     }
-
-    const loggedIn = await fetchCurrentUser();
-
-    if (!loggedIn) {
-        redirectToLogin();
-        return false;
-    }
-
-    return true;
 };
 
 const getPath = file => {
@@ -121,13 +57,9 @@ const link = (file, text) => {
 };
 
 const buildNav = () => {
-    if (!nav || page === "login.html") {
+    if (!nav) {
         return;
     }
-
-    const avatar = getUserAvatar(currentUser);
-    const username = getUsername(currentUser);
-    const tag = getUserTag(currentUser);
 
     nav.innerHTML = `
         <nav>
@@ -153,46 +85,71 @@ const buildNav = () => {
             </div>
 
             <div class="account">
-                <button
-                    class="account-button"
-                    type="button"
-                    aria-expanded="false"
-                >
-                    <img
-                        src="${escapeHtml(avatar)}"
-                        alt="${escapeHtml(username)}"
-                    >
+                ${
+                    loggedIn
+                        ? `
+                            <button
+                                class="account-button"
+                                type="button"
+                                aria-expanded="false"
+                            >
+                                <img
+                                    src="${escapeHtml(avatar)}"
+                                    alt="${escapeHtml(username)}"
+                                >
 
-                    <span class="account-details">
-                        <strong>${escapeHtml(username)}</strong>
-                        ${tag ? `<small>${escapeHtml(tag)}</small>` : ""}
-                    </span>
+                                <span class="account-details">
+                                    <strong>${escapeHtml(username)}</strong>
+                                    ${
+                                        tag
+                                            ? `<small>${escapeHtml(tag)}</small>`
+                                            : ""
+                                    }
+                                </span>
 
-                    <span class="account-arrow">⌄</span>
-                </button>
+                                <span class="account-arrow">⌄</span>
+                            </button>
 
-                <div class="account-menu">
-                    <div class="account-menu-user">
-                        <img
-                            src="${escapeHtml(avatar)}"
-                            alt="${escapeHtml(username)}"
-                        >
+                            <div class="account-menu">
+                                <div class="account-menu-user">
+                                    <img
+                                        src="${escapeHtml(avatar)}"
+                                        alt="${escapeHtml(username)}"
+                                    >
 
-                        <div>
-                            <strong>${escapeHtml(username)}</strong>
-                            ${tag ? `<span>${escapeHtml(tag)}</span>` : ""}
-                        </div>
-                    </div>
+                                    <div>
+                                        <strong>${escapeHtml(username)}</strong>
+                                        ${
+                                            tag
+                                                ? `<span>${escapeHtml(tag)}</span>`
+                                                : ""
+                                        }
+                                    </div>
+                                </div>
 
-                    <div class="account-menu-line"></div>
+                                <div class="account-menu-line"></div>
 
-                    <a href="account.html">Account</a>
-                    <a href="settings.html">Settings</a>
+                                <a href="account.html">Account</a>
+                                <a href="settings.html">Settings</a>
 
-                    <button type="button" data-logout>
-                        Logout
-                    </button>
-                </div>
+                                <button
+                                    type="button"
+                                    data-logout
+                                >
+                                    Logout
+                                </button>
+                            </div>
+                        `
+                        : `
+                            <button
+                                class="button primary nav-login"
+                                type="button"
+                                data-action="login"
+                            >
+                                Login
+                            </button>
+                        `
+                }
             </div>
         </nav>
     `;
@@ -212,7 +169,7 @@ const buildFooter = () => {
 };
 
 const setupNav = () => {
-    if (!nav || page === "login.html") {
+    if (!nav) {
         return;
     }
 
@@ -281,30 +238,6 @@ const setupNav = () => {
     }
 };
 
-const setupAccount = () => {
-    if (!authenticated || !nav) {
-        return;
-    }
-
-    const button = nav.querySelector(".account-button");
-    const menu = nav.querySelector(".account-menu");
-
-    if (!button || !menu) {
-        return;
-    }
-
-    button.addEventListener("click", event => {
-        event.stopPropagation();
-
-        const open = menu.classList.toggle("open");
-
-        button.setAttribute(
-            "aria-expanded",
-            String(open)
-        );
-    });
-};
-
 const setupLogin = () => {
     if (page !== "login.html") {
         return;
@@ -319,6 +252,14 @@ const setupLogin = () => {
     button.addEventListener("click", () => {
         window.location.href = "/api/auth/discord";
     });
+
+    const createAccount = document.getElementById("createAccount");
+
+    if (createAccount) {
+        createAccount.addEventListener("click", () => {
+            window.location.href = "/api/auth/discord";
+        });
+    }
 };
 
 const setupLogout = () => {
@@ -332,30 +273,62 @@ const setupLogout = () => {
                     credentials: "include",
                     headers: {
                         Accept: "application/json"
-                    },
-                    cache: "no-store"
+                    }
                 });
             } catch {
-                // Even if the request fails, return the user
-                // to the login page.
+                // Continue logout locally even if the request fails.
             }
 
-            currentUser = null;
-            authenticated = false;
+            setLoginState(false);
+            sessionStorage.removeItem("untitled_user");
 
-            window.location.replace("/login.html");
+            window.location.href = "login.html";
         });
     });
 };
 
+const loadUser = async () => {
+    try {
+        const response = await fetch("/api/auth/me", {
+            method: "GET",
+            credentials: "include",
+            headers: {
+                Accept: "application/json"
+            },
+            cache: "no-store"
+        });
+
+        if (response.status === 401 || response.status === 403) {
+            setLoginState(false);
+            sessionStorage.removeItem("untitled_user");
+            return;
+        }
+
+        if (!response.ok) {
+            return;
+        }
+
+        const data = await response.json();
+
+        if (!data?.user) {
+            return;
+        }
+
+        setLoginState(true);
+
+        sessionStorage.setItem(
+            "untitled_user",
+            JSON.stringify(data.user)
+        );
+    } catch {
+        // Website remains usable without authentication.
+    }
+};
+
 const setupProtectedUi = () => {
-    if (!authenticated || !currentUser) {
+    if (!loggedIn) {
         return;
     }
-
-    const avatar = getUserAvatar(currentUser);
-    const username = getUsername(currentUser);
-    const tag = getUserTag(currentUser);
 
     document.querySelectorAll("[data-user-name]").forEach(item => {
         item.textContent = username;
@@ -367,8 +340,8 @@ const setupProtectedUi = () => {
     });
 
     document.querySelectorAll("[data-user-id]").forEach(item => {
-        if (currentUser.id) {
-            item.textContent = currentUser.id;
+        if (user?.id) {
+            item.textContent = user.id;
         }
     });
 
@@ -380,7 +353,7 @@ const setupProtectedUi = () => {
 const setupLoginNotice = () => {
     const notice = document.querySelector("[data-login-required]");
 
-    if (!notice || authenticated) {
+    if (!notice || loggedIn) {
         return;
     }
 
@@ -423,7 +396,9 @@ const closeOnEscape = event => {
 
 const setupExternalLinks = () => {
     document
-        .querySelectorAll('a[href^="http://"], a[href^="https://"]')
+        .querySelectorAll(
+            'a[href^="http://"], a[href^="https://"]'
+        )
         .forEach(item => {
             const url = new URL(
                 item.href,
@@ -448,30 +423,22 @@ const setupButtons = () => {
             }
 
             if (action === "login") {
-                button.addEventListener("click", () => {
-                    window.location.replace("/login.html");
-                });
+                button.addEventListener("click", goToLogin);
             }
 
             if (action === "dashboard") {
-                button.addEventListener("click", async () => {
-                    /*
-                     * Don't trust sessionStorage.
-                     * Ask the backend.
-                     */
-                    const loggedIn = await fetchCurrentUser();
-
+                button.addEventListener("click", () => {
                     if (loggedIn) {
-                        window.location.href = "/dashboard.html";
+                        window.location.href = "dashboard.html";
                     } else {
-                        window.location.replace("/login.html");
+                        goToLogin();
                     }
                 });
             }
 
             if (action === "premium") {
                 button.addEventListener("click", () => {
-                    window.location.href = "/prices.html";
+                    window.location.href = "prices.html";
                 });
             }
         });
@@ -500,32 +467,6 @@ const checkPage = () => {
 };
 
 const start = async () => {
-    /*
-     * LOGIN PAGE:
-     *
-     * Do NOT perform authentication redirects here.
-     * Just show the login page.
-     */
-    if (page === "login.html") {
-        buildFooter();
-        setupLogin();
-        setupLoginNotice();
-        setupExternalLinks();
-        checkPage();
-        return;
-    }
-
-    /*
-     * PROTECTED PAGE:
-     *
-     * Verify the actual backend session once.
-     */
-    const allowed = await requireLogin();
-
-    if (!allowed) {
-        return;
-    }
-
     buildNav();
     buildFooter();
     setupNav();
@@ -538,6 +479,32 @@ const start = async () => {
     setupButtons();
     setActiveLinks();
     checkPage();
+
+    await loadUser();
+};
+
+const setupAccount = () => {
+    if (!loggedIn || !nav) {
+        return;
+    }
+
+    const button = nav.querySelector(".account-button");
+    const menu = nav.querySelector(".account-menu");
+
+    if (!button || !menu) {
+        return;
+    }
+
+    button.addEventListener("click", event => {
+        event.stopPropagation();
+
+        const open = menu.classList.toggle("open");
+
+        button.setAttribute(
+            "aria-expanded",
+            String(open)
+        );
+    });
 };
 
 document.addEventListener("keydown", closeOnEscape);
