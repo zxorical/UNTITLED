@@ -1624,7 +1624,7 @@ export class GiveawayManager extends EventEmitter {
       `[View Message](https://discord.com/channels/${guild.id}/${message.channel.id}/${message.id})`,
     ].filter(Boolean).join('\n');
 
-    const inviteUrl = this.getInviteUrlOrFallback(guild.id, message.channel.id);
+    const inviteUrl = await this.getInviteUrlOrFallback(guild.id, message.channel.id);
 
     try {
       const sent = await this.botManager.sendScrimNotification({
@@ -1800,15 +1800,15 @@ export class GiveawayManager extends EventEmitter {
 
           const savePromise = insertGiveaway(data);
 
-          // NEVER block giveaway notifications on invite generation.
-          // Use the already-cached invite instantly, otherwise use the channel
-          // link instantly and generate the invite in the background.
-          const inviteUrl = this.getInviteUrlOrFallback(guild.id, message.channel.id);
-          const watchlistPromise = this.checkWatchlistMatches(
-            parsed, message, inviteUrl, processingTime,
+          // Generate a real server invite before notifying. Cached/vanity invites
+          // return immediately; otherwise the preferred giveaway channel is tried
+          // first and Discord is queried/asked to create an invite.
+          const invitePromise = this.getInviteUrlOrFallback(guild.id, message.channel.id);
+          const watchlistPromise = invitePromise.then(inviteUrl =>
+            this.checkWatchlistMatches(parsed, message, inviteUrl, processingTime),
           );
 
-          const inserted = await savePromise;
+          const [inserted, inviteUrl] = await Promise.all([savePromise, invitePromise]);
           if (!inserted) return;
 
           const fullData: GiveawayData = {
@@ -2120,18 +2120,20 @@ export class GiveawayManager extends EventEmitter {
   //   6. The giveaway's own channel is tried first when available.
   // ═══════════════════════════════════════════════════════════════════════
 
-  private getInviteUrlOrFallback(guildId: string, preferredChannelId?: string): string {
+  private async getInviteUrlOrFallback(
+    guildId: string,
+    preferredChannelId?: string,
+  ): Promise<string> {
     const now = Date.now();
-    const cached = this.inviteCache.get(guildId);
 
+    const cached = this.inviteCache.get(guildId);
     if (cached && cached.expiresAt > now && cached.url) {
       return cached.url;
     }
 
     if (cached) this.inviteCache.delete(guildId);
 
-    // Vanity URLs are available locally and must be returned immediately.
-    // This keeps notifications useful even while a normal invite is warming.
+    // Vanity URLs are real Discord invite URLs and can be returned immediately.
     const guild = this.client.guilds.cache.get(guildId);
     const vanity = (guild as any)?.vanityURLCode as string | null | undefined;
     if (vanity) {
@@ -2140,10 +2142,55 @@ export class GiveawayManager extends EventEmitter {
       return url;
     }
 
-    // Kick off background generation, but DO NOT await it.
-    this.enqueueInviteWarmup(guildId, preferredChannelId);
+    // De-duplicate concurrent invite generation for the same guild.
+    const pending = this.pendingInvites.get(guildId);
+    if (pending) return pending;
 
-    return `https://discord.com/channels/${guildId}`;
+    const promise = (async (): Promise<string> => {
+      // Try immediately first so a giveaway notification gets a real invite in
+      // the same processing pass instead of a channel URL placeholder.
+      const immediate = await this.tryGenerateInviteOnce(guildId, preferredChannelId);
+      if (immediate) {
+        this.cacheInvite(guildId, immediate, Date.now());
+        return immediate;
+      }
+
+      // Transient Discord permission/cache/API failures are common. Retry a few
+      // times before giving up, while keeping the detection path bounded.
+      for (let attempt = 1; attempt < INVITE_MAX_ATTEMPTS; attempt++) {
+        const waitMs = INVITE_RETRY_DELAYS_MS[
+          Math.min(attempt - 1, INVITE_RETRY_DELAYS_MS.length - 1)
+        ];
+        await delay(waitMs);
+
+        const result = await this.tryGenerateInviteOnce(guildId, preferredChannelId);
+        if (result) {
+          this.cacheInvite(guildId, result, Date.now());
+          return result;
+        }
+      }
+
+      // Keep trying passively in the background, but do not silently downgrade
+      // the notification to a channel URL. The caller can distinguish this from
+      // a valid invite because it is an explicit unavailable marker.
+      this.log.warn(
+        `Could not generate a Discord invite for guild ${guildId} after ${INVITE_MAX_ATTEMPTS} attempts`,
+        { component: 'GiveawayManager', account: this.accountLabel },
+      );
+      this.enqueueInviteWarmup(guildId, preferredChannelId);
+
+      return 'INVITE_UNAVAILABLE';
+    })();
+
+    this.pendingInvites.set(guildId, promise);
+
+    try {
+      return await promise;
+    } finally {
+      if (this.pendingInvites.get(guildId) === promise) {
+        this.pendingInvites.delete(guildId);
+      }
+    }
   }
 
   private enqueueInviteWarmup(guildId: string, preferredChannelId?: string): void {
