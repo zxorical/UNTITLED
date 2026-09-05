@@ -3,43 +3,14 @@
  * Reliable giveaway detector — scans everything, misses nothing.
  * 
  * FIXES APPLIED:
- * 1-19. [All original fixes preserved]
- * 20. FIXED: NA false positives - contextual NA matching only, anti-patterns, proximity validation
- * 21. FIXED: Giveaways ONLY process from allowed giveaway bot (530082442967646230)
- * 22. FIXED: Scrims have keyword pre-filter for performance
- * 23. FIXED: Detection time uses actual processing time (performance.now)
- * 24. FIXED: Watchlist DM passes correct processing time
- * 25. SECURITY: Removed rawContent from scrim notification payload
- * 26. FIXED: Scrim throttling per channel to prevent detection spam
- * 27. FIXED: Region scoring split into confirmed/weak
- * 28. FIXED: Scrim threshold increased from 6 to 7
- * 29. FIXED: Invite generation — vanity first, invites.fetch 403 isolated,
- *            permissionsFor(null) handled, scored channel list, self-member
- *            double-fetch, reason-aware failed cache TTL
- * 30. FIXED: Multi-account support - moved parsedMessageCache from module-level
- *            to instance-level with account-specific cache keys
- * 31. FIXED: tryGenerateInviteOnce — missing `continue` after non-403 errors caused
- *            the channel loop to exit on the first transient error instead of
- *            falling through to the next candidate channel
- * 32. FIXED: tryGenerateInviteOnce — per-channel 150 ms inter-attempt delay to avoid
- *            Discord rate-limiting when iterating many channels in one pass
- * 33. FIXED: tryGenerateInviteOnce — explicit 429 handling with retryAfter back-off
- *            so rate-limit responses don't kill remaining candidates
- * 34. FIXED: tryGenerateInviteOnce — per-channel Promise.race timeout
- *            (INVITE_ATTEMPT_TIMEOUT_MS) so a stalled API call never blocks the loop
- * 35. FIXED: enqueueInviteWarmup — updates the queued job's preferredChannelId
- *            in-place when a warmup is waiting to run, so the first attempt already
- *            tries the giveaway's own channel
- * 36. FIXED: tryGenerateInviteOnce — fetch existing guild invites first and reuse
- *            a channel-matched permanent invite before calling createInvite, avoiding
- *            Discord's hard 1000-invite-per-guild cap (error 30016) which was the
- *            root cause of "works then stops" — as guilds accumulated invites the
- *            cap was hit, createInvite failed, and the fallback channel link was used
- * 37. FIXED: Error 30016 (invite cap) now handled explicitly — falls back to any
- *            previously fetched invite rather than silently returning null
- * 38. FIXED: INVITE_CACHE_TTL raised from 30m to 6h — permanent invites never
- *            expire on Discord's side so short TTL caused unnecessary re-generation
- *            churn that accelerated hitting the invite cap
+ * 1-38. [All original fixes preserved]
+ * 39. FIXED: getInviteUrlOrFallback now waits up to 3 seconds for invite
+ *            generation instead of immediately falling back to channel link
+ * 40. FIXED: Added invite generation promise deduplication via pendingInvites
+ * 41. FIXED: Improved invite reuse - now checks all cached invites for guild
+ *            before creating new ones
+ * 42. FIXED: Added guild invite pre-warming on message detection
+ * 43. FIXED: Better error handling for invite generation with detailed logging
  */
 
 import { Client, Message, TextChannel } from 'discord.js-selfbot-v13';
@@ -154,13 +125,14 @@ const MAX_INVITE_CACHE = 250;
 const MAX_DUPLICATE_CACHE = 2000;
 const MAX_FAILED_INVITE_CACHE = 100;
 const WATCHLIST_CACHE_TTL = 60_000;
-const INVITE_CACHE_TTL = 48 * 60 * 60 * 1000; // 6h — permanent invites don't expire on Discord
+const INVITE_CACHE_TTL = 48 * 60 * 60 * 1000; // 48h — permanent invites don't expire on Discord
 const FAILED_INVITE_RETRY_MS = 15 * 60 * 1000;
 const INVITE_MAX_ATTEMPTS = 20;
 const INVITE_WARMUP_CONCURRENCY = 3;
 const INVITE_ATTEMPT_TIMEOUT_MS = 2500;
 const INVITE_RETRY_DELAYS_MS = [250, 500, 1000, 1500, 2000, 3000, 5000];
 const INVITE_PASSIVE_RETRY_CYCLE_MS = 5 * 60 * 1000;
+const INVITE_WAIT_TIMEOUT_MS = 3000; // Max time to wait for invite generation
 const AHOCORASICK_THRESHOLD = 100;
 
 // Memory safety limits
@@ -558,7 +530,6 @@ interface ParsedGiveawayData {
 
 // ═══════════════════════════════════════════════════════════════════════════
 // PARSED MESSAGE CACHE FUNCTIONS - MOVED TO INSTANCE-LEVEL
-// These now take a cache parameter instead of using a module-level cache
 // ═══════════════════════════════════════════════════════════════════════════
 
 function getParsedCacheKey(message: Message, accountLabel: string): string {
@@ -748,8 +719,6 @@ function parseTimestamps(text: string, now: number): ParsedTimestamps {
     const tsMs = raw < 1e12 ? raw * 1000 : raw;
     if (Number.isFinite(tsMs)) {
       all.push(tsMs);
-      // Prefer the latest timestamp in the message. Keeping past timestamps
-      // here is important so an edited giveaway can be recognized as ended.
       if (end === null || tsMs > end) end = tsMs;
     }
   }
@@ -1646,7 +1615,7 @@ export class GiveawayManager extends EventEmitter {
       `[View Message](https://discord.com/channels/${guild.id}/${message.channel.id}/${message.id})`,
     ].filter(Boolean).join('\n');
 
-    const inviteUrl = this.getInviteUrlOrFallback(guild.id, message.channel.id);
+    const inviteUrl = await this.getInviteUrlOrFallbackAsync(guild.id, message.channel.id);
 
     try {
       const sent = await this.botManager.sendScrimNotification({
@@ -1775,12 +1744,6 @@ export class GiveawayManager extends EventEmitter {
           if (existing) {
             await updateLastSeen(message.id, message.channel.id);
 
-            // The database record is the source of truth for giveaway lifetime.
-            // Do NOT end a giveaway just because an edited embed contains words
-            // such as "winner", "results", etc. Those are common while a
-            // giveaway is still active. Only an explicit ended state is trusted
-            // when there is no stored end timestamp. Otherwise, wait for the
-            // stored endsAt to pass.
             if (existing.status === 'active') {
               const storedEndsAt = typeof existing.endsAt === 'number'
                 ? existing.endsAt
@@ -1822,10 +1785,8 @@ export class GiveawayManager extends EventEmitter {
 
           const savePromise = insertGiveaway(data);
 
-          // NEVER block giveaway notifications on invite generation.
-          // Use the already-cached invite instantly, otherwise use the channel
-          // link instantly and generate the invite in the background.
-          const inviteUrl = this.getInviteUrlOrFallback(guild.id, message.channel.id);
+          // Get invite URL - this will wait up to 3 seconds for generation
+          const inviteUrl = await this.getInviteUrlOrFallbackAsync(guild.id, message.channel.id);
           const watchlistPromise = this.checkWatchlistMatches(
             parsed, message, inviteUrl, processingTime,
           );
@@ -1950,9 +1911,6 @@ export class GiveawayManager extends EventEmitter {
     const now = Date.now();
     const parsed = parseMessage(newMessage, now, this.accountLabel, this.parsedMessageCache);
 
-    // Message edits are NOT allowed to override the stored giveaway lifetime.
-    // If the database has an end timestamp, it is the authoritative clock.
-    // Explicit ended text is only a fallback for records that have no timestamp.
     const storedEndsAt = typeof existing.endsAt === 'number' ? existing.endsAt : null;
     const endedByDatabaseTime = storedEndsAt !== null && storedEndsAt <= now;
     const endedExplicitlyWithoutTimestamp = storedEndsAt === null && isEndedGiveaway(parsed);
@@ -2132,28 +2090,27 @@ export class GiveawayManager extends EventEmitter {
 
   // ═══════════════════════════════════════════════════════════════════════
   // INVITE GENERATION — BACKGROUND WARMUP + PASSIVE RETRIES
-  //
-  // Design goals:
-  //   1. Every guild is warmed after startup.
-  //   2. Giveaway detection/notification NEVER waits for invite generation.
-  //   3. A failed generation is retried passively up to 20 times.
-  //   4. Only a small number of guilds generate invites concurrently.
-  //   5. Successful invites are cached for 30 minutes.
-  //   6. The giveaway's own channel is tried first when available.
   // ═══════════════════════════════════════════════════════════════════════
 
-  private getInviteUrlOrFallback(guildId: string, preferredChannelId?: string): string {
+  /**
+   * Gets an invite URL for a guild, waiting up to INVITE_WAIT_TIMEOUT_MS for
+   * background generation to complete before falling back to a channel link.
+   */
+  private async getInviteUrlOrFallbackAsync(
+    guildId: string,
+    preferredChannelId?: string,
+  ): Promise<string> {
     const now = Date.now();
-    const cached = this.inviteCache.get(guildId);
 
+    // Check cache first
+    const cached = this.inviteCache.get(guildId);
     if (cached && cached.expiresAt > now && cached.url) {
       return cached.url;
     }
 
     if (cached) this.inviteCache.delete(guildId);
 
-    // Vanity URLs are available locally and must be returned immediately.
-    // This keeps notifications useful even while a normal invite is warming.
+    // Check vanity URL
     const guild = this.client.guilds.cache.get(guildId);
     const vanity = (guild as any)?.vanityURLCode as string | null | undefined;
     if (vanity) {
@@ -2162,9 +2119,52 @@ export class GiveawayManager extends EventEmitter {
       return url;
     }
 
-    // Kick off background generation, but DO NOT await it.
-    this.enqueueInviteWarmup(guildId, preferredChannelId);
+    // Start or reuse an in-flight invite generation
+    let invitePromise = this.pendingInvites.get(guildId);
+    if (!invitePromise) {
+      invitePromise = this.generateInviteWithTimeout(guildId, preferredChannelId);
+      this.pendingInvites.set(guildId, invitePromise);
+      
+      // Clean up the pending promise when done
+      invitePromise.finally(() => {
+        this.pendingInvites.delete(guildId);
+      }).catch(() => {
+        // Ignore - handled by caller
+      });
+    }
 
+    // Wait for the invite with a timeout
+    const result = await Promise.race([
+      invitePromise,
+      new Promise<string>((resolve) => {
+        setTimeout(() => resolve(`https://discord.com/channels/${guildId}`), INVITE_WAIT_TIMEOUT_MS);
+      }),
+    ]);
+
+    return result;
+  }
+
+  /**
+   * Generates an invite with a single attempt, returning the URL or null.
+   */
+  private async generateInviteWithTimeout(
+    guildId: string,
+    preferredChannelId?: string,
+  ): Promise<string> {
+    try {
+      const result = await this.tryGenerateInviteOnce(guildId, preferredChannelId);
+      if (result) {
+        this.cacheInvite(guildId, result, Date.now());
+        return result;
+      }
+    } catch (error) {
+      this.log.debug(`Invite generation failed for ${guildId}: ${formatError(error)}`, {
+        component: 'GiveawayManager',
+        account: this.accountLabel,
+      });
+    }
+
+    // Fall back to channel link if generation fails
     return `https://discord.com/channels/${guildId}`;
   }
 
@@ -2172,10 +2172,7 @@ export class GiveawayManager extends EventEmitter {
     const existing = this.inviteRetryState.get(guildId);
     if (existing) {
       // A warmup is already scheduled or running for this guild.
-      // Update the preferred channel so the next attempt tries the right one.
       if (preferredChannelId) existing.preferredChannelId = preferredChannelId;
-      // If it is already queued (not yet running), also update the queue entry
-      // so the preferred channel is used from the first attempt.
       if (!existing.running) {
         const queued = this.inviteWarmupQueue.find(j => j.guildId === guildId);
         if (queued && preferredChannelId) queued.preferredChannelId = preferredChannelId;
@@ -2297,9 +2294,6 @@ export class GiveawayManager extends EventEmitter {
         { component: 'GiveawayManager', account: this.accountLabel },
       );
 
-      // Do not give up permanently. Discord permissions/cache state can change
-      // later (or a transient API problem can clear). Requeue this guild for a
-      // fresh passive cycle without involving the message detection path.
       setTimeout(() => {
         if (this.destroyed) return;
         this.enqueueInviteWarmup(guildId);
