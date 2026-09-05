@@ -153,19 +153,6 @@ const buildNav = () => {
     `;
 };
 
-const buildFooter = () => {
-    if (!footer) {
-        return;
-    }
-
-    footer.innerHTML = `
-        <div class="footer-inner">
-            <span class="footer-logo">untitled</span>
-            <span>Built for the VRFS community.</span>
-        </div>
-    `;
-};
-
 const setupNav = () => {
     if (!nav) {
         return;
