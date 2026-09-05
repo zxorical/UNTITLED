@@ -160,6 +160,9 @@ interface NotificationJob {
   messageId: string;
 }
 const DEDUP_TTL_MS = 10 * 60 * 1000;
+
+// Exact notification snapshots. These preserve every resolved value used by the active notification.
+const giveawayNotificationSnapshots = new Map<string, GiveawayData & Record<string, any>>();
 const DEDUP_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
 class NotificationService {
   private queue: NotificationJob[] = [];
@@ -305,6 +308,18 @@ class NotificationService {
         : { parse: ["everyone"] },
     });
     this.metrics.recordNotification(true, Date.now() - start);
+
+    // Save exactly what was rendered. The ended update must not re-resolve the
+    // invite or fall back to a different set of guild details.
+    giveawayNotificationSnapshots.set(sentMessage.id, {
+      ...data,
+      guildName,
+      guildIcon,
+      guildBanner,
+      memberCount,
+      inviteUrl,
+    });
+
     await setNotificationMessageId(data.messageId, data.channelId, sentMessage.id);
     try {
       await updateNotificationStatus?.(data.messageId, data.channelId, {
@@ -388,7 +403,7 @@ function buildGiveawayNotificationContainer(
   }
 
   const row = new ActionRowBuilder<ButtonBuilder>();
-  if (inviteUrl.startsWith("http") && status !== "ended") {
+  if (inviteUrl.startsWith("http")) {
     row.addComponents(
       new ButtonBuilder()
         .setLabel("Join Server")
@@ -2493,25 +2508,23 @@ export class BotManager {
             .catch(() => null);
           if (msg) {
             const guild = this.client.guilds.cache.get(giveaway.guildId);
-            const inviteUrl = this.getFastInviteUrl(
-              giveaway.guildId,
-              giveaway.channelId,
-              giveaway.inviteUrl
-            );
-            const container = buildGiveawayNotificationContainer(
-              {
-                ...giveaway,
-                guildName: giveaway.guildName || guild?.name || "Unknown",
-                guildIcon: giveaway.guildIcon || guild?.iconURL({ size: 512 }) || null,
-                guildBanner: giveaway.guildBanner || guild?.bannerURL({ size: 1024 }) || null,
-                memberCount: giveaway.memberCount ?? guild?.memberCount ?? null,
-                inviteUrl,
-              } as GiveawayData & Record<string, any>,
-              "ended"
-            );
+            const snapshot = giveawayNotificationSnapshots.get(notifMsgId);
+            const endedData = snapshot || ({
+              ...giveaway,
+              guildName: giveaway.guildName || guild?.name || "Unknown",
+              guildIcon: giveaway.guildIcon || guild?.iconURL({ size: 512 }) || null,
+              guildBanner: giveaway.guildBanner || guild?.bannerURL({ size: 1024 }) || null,
+              memberCount: giveaway.memberCount ?? guild?.memberCount ?? null,
+              // Never replace the original persisted invite with a newly
+              // resolved fallback during the ended update.
+              inviteUrl: giveaway.inviteUrl || giveaway.cachedInviteUrl || "No invite available",
+            } as GiveawayData & Record<string, any>);
+            const container = buildGiveawayNotificationContainer(endedData, "ended");
             await msg.edit({
               components: [container],
               flags: MessageFlags.IsComponentsV2,
+            }).then(() => {
+              giveawayNotificationSnapshots.delete(notifMsgId);
             }).catch(() => {});
           }
         }
