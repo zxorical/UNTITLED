@@ -84,10 +84,10 @@ const buildNav = () => {
                 ${link("api.html", "API")}
             </div>
 
-            <div class="account">
-                ${
-                    loggedIn
-                        ? `
+            ${
+                loggedIn
+                    ? `
+                        <div class="account">
                             <button
                                 class="account-button"
                                 type="button"
@@ -100,6 +100,7 @@ const buildNav = () => {
 
                                 <span class="account-details">
                                     <strong>${escapeHtml(username)}</strong>
+
                                     ${
                                         tag
                                             ? `<small>${escapeHtml(tag)}</small>`
@@ -119,6 +120,7 @@ const buildNav = () => {
 
                                     <div>
                                         <strong>${escapeHtml(username)}</strong>
+
                                         ${
                                             tag
                                                 ? `<span>${escapeHtml(tag)}</span>`
@@ -139,18 +141,18 @@ const buildNav = () => {
                                     Logout
                                 </button>
                             </div>
-                        `
-                        : `
-                            <button
-                                class="button primary nav-login"
-                                type="button"
-                                data-action="login"
-                            >
-                                Login
-                            </button>
-                        `
-                }
-            </div>
+                        </div>
+                    `
+                    : `
+                        <button
+                            class="button primary nav-login"
+                            type="button"
+                            data-action="login"
+                        >
+                            Login
+                        </button>
+                    `
+            }
         </nav>
     `;
 };
@@ -238,6 +240,30 @@ const setupNav = () => {
     }
 };
 
+const setupAccount = () => {
+    if (!loggedIn || !nav) {
+        return;
+    }
+
+    const button = nav.querySelector(".account-button");
+    const menu = nav.querySelector(".account-menu");
+
+    if (!button || !menu) {
+        return;
+    }
+
+    button.addEventListener("click", event => {
+        event.stopPropagation();
+
+        const open = menu.classList.toggle("open");
+
+        button.setAttribute(
+            "aria-expanded",
+            String(open)
+        );
+    });
+};
+
 const setupLogin = () => {
     if (page !== "login.html") {
         return;
@@ -245,13 +271,11 @@ const setupLogin = () => {
 
     const button = document.querySelector(".discord-login");
 
-    if (!button) {
-        return;
+    if (button) {
+        button.addEventListener("click", () => {
+            window.location.href = "/api/auth/discord";
+        });
     }
-
-    button.addEventListener("click", () => {
-        window.location.href = "/api/auth/discord";
-    });
 
     const createAccount = document.getElementById("createAccount");
 
@@ -276,7 +300,7 @@ const setupLogout = () => {
                     }
                 });
             } catch {
-                // Continue logout locally even if the request fails.
+                // Continue logout locally.
             }
 
             setLoginState(false);
@@ -321,7 +345,7 @@ const loadUser = async () => {
             JSON.stringify(data.user)
         );
     } catch {
-        // Website remains usable without authentication.
+        // Authentication is optional.
     }
 };
 
@@ -481,30 +505,6 @@ const start = async () => {
     checkPage();
 
     await loadUser();
-};
-
-const setupAccount = () => {
-    if (!loggedIn || !nav) {
-        return;
-    }
-
-    const button = nav.querySelector(".account-button");
-    const menu = nav.querySelector(".account-menu");
-
-    if (!button || !menu) {
-        return;
-    }
-
-    button.addEventListener("click", event => {
-        event.stopPropagation();
-
-        const open = menu.classList.toggle("open");
-
-        button.setAttribute(
-            "aria-expanded",
-            String(open)
-        );
-    });
 };
 
 document.addEventListener("keydown", closeOnEscape);
