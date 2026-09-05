@@ -332,24 +332,40 @@ function buildGiveawayNotificationContainer(
   const container = new ContainerBuilder()
     .setAccentColor(status === "ended" ? 0xe74c3c : 0x5865f2);
 
-  // Keep the original giveaway information intact; only the state/color changes.
-  addV2Text(
-    container,
+  const heading = new TextDisplayBuilder().setContent(
     `-# ${status === "ended" ? "Giveaway Ended" : "New Giveaway"}`
   );
-  addV2Text(container, `# ${truncate(data.prize || "Unknown Prize", 256)}`);
+  const title = new TextDisplayBuilder().setContent(
+    `# ${truncate(data.prize || "Unknown Prize", 256)}`
+  );
+  const details = new TextDisplayBuilder().setContent(
+    [
+      ...(status === "ended" ? ["### Status", "**Status:** Ended", ""] : []),
+      "### Details",
+      `**Server:** ${guildName}`,
+      `**Winners:** ${winnerCount}`,
+    ].join("\n")
+  );
 
-  if (status === "ended") {
-    addV2Text(container, "### Status\n**Status:** Ended");
+  // Components V2 has no embed thumbnail, so use a Section accessory.
+  // This keeps the server icon small and beside the giveaway details instead
+  // of rendering it as a huge full-width Media Gallery image.
+  if (guildIcon) {
+    const section = new SectionBuilder()
+      .addTextDisplayComponents(heading, title, details)
+      .setThumbnailAccessory(
+        new ThumbnailBuilder()
+          .setURL(guildIcon)
+          .setDescription(`${guildName} icon`)
+      );
+    container.addSectionComponents(section);
+  } else {
+    container.addTextDisplayComponents(heading, title, details);
   }
 
   addV2Text(
     container,
     [
-      "### Details",
-      `**Server:** ${guildName}`,
-      `**Winners:** ${winnerCount}`,
-      "",
       "### Time",
       `**Ends:** <t:${endTimestamp}:F>`,
       `**Countdown:** <t:${endTimestamp}:R>`,
@@ -360,33 +376,24 @@ function buildGiveawayNotificationContainer(
     ].filter(Boolean).join("\n")
   );
 
-  // Components V2 cannot use an embed, so preserve the old thumbnail/banner
-  // visually with native media components.
-  if (guildIcon) {
-    container.addMediaGalleryComponents(
-      new MediaGalleryBuilder().addItems({
-        media: { url: guildIcon },
-        description: `${guildName} icon`,
-      })
-    );
-  }
+  // Keep the original giveaway banner as a full-width V2 media gallery.
+  // Unlike the server icon, the old embed image was intentionally large.
   if (guildBanner) {
     container.addMediaGalleryComponents(
       new MediaGalleryBuilder().addItems({
         media: { url: guildBanner },
-        description: `${guildName} banner`,
+        description: `${guildName} giveaway banner`,
       })
     );
   }
 
   const row = new ActionRowBuilder<ButtonBuilder>();
-  if (inviteUrl.startsWith("http")) {
+  if (inviteUrl.startsWith("http") && status !== "ended") {
     row.addComponents(
       new ButtonBuilder()
         .setLabel("Join Server")
         .setStyle(ButtonStyle.Link)
         .setURL(inviteUrl)
-        .setDisabled(status === "ended")
     );
   }
   row.addComponents(
