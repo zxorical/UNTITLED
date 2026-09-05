@@ -283,46 +283,26 @@ class NotificationService {
     const winnerCount = extractWinnerCount(data.prize);
     const pingMention = process.env.PING_ROLE_ID ? `<@&${process.env.PING_ROLE_ID}>` : "@everyone";
 
-    const body = [
-      `### Details`,
-      `**Server:** ${guildName}`,
-      `**Winners:** ${winnerCount}`,
-      "",
-      `### Time`,
-      `**Ends:** <t:${endTimestamp}:F>`,
-      `**Countdown:** <t:${endTimestamp}:R>`,
-      "",
-      `### Links`,
-      `**Invite:** ${inviteUrl}`,
-      memberCount ? `**Members:** ${memberCount.toLocaleString()}` : "",
-    ].filter(Boolean).join("\n");
-
-    const container = createV2Container(data.prize || "Unknown Prize", body, 0x5865f2);
+    const container = buildGiveawayNotificationContainer(
+      {
+        ...data,
+        guildName,
+        guildIcon,
+        guildBanner,
+        memberCount,
+        inviteUrl,
+      },
+      "active"
+    );
     if (pingMention) addV2Text(container, pingMention);
-    if (guildIcon || guildBanner) {
-      const media = guildBanner || guildIcon;
-      if (media) {
-        container.addMediaGalleryComponents(
-          new MediaGalleryBuilder().addItems({
-            media: { url: media },
-            description: guildName,
-          })
-        );
-      }
-    }
-
-    const messageUrl = `https://discord.com/channels/${data.guildId}/${data.channelId}/${data.messageId}`;
-    const row = new ActionRowBuilder<ButtonBuilder>();
-    if (inviteUrl.startsWith("http")) {
-      row.addComponents(new ButtonBuilder().setLabel("Join Server").setStyle(ButtonStyle.Link).setURL(inviteUrl));
-    }
-    row.addComponents(new ButtonBuilder().setLabel("Message").setStyle(ButtonStyle.Link).setURL(messageUrl));
-    container.addActionRowComponents(row);
 
     const start = Date.now();
     const sentMessage = await channel.send({
       components: [container],
       flags: MessageFlags.IsComponentsV2,
+      allowedMentions: process.env.PING_ROLE_ID
+        ? { roles: [process.env.PING_ROLE_ID] }
+        : { parse: ["everyone"] },
     });
     this.metrics.recordNotification(true, Date.now() - start);
     await setNotificationMessageId(data.messageId, data.channelId, sentMessage.id);
@@ -335,6 +315,91 @@ class NotificationService {
     } catch {}
   }
 }
+function buildGiveawayNotificationContainer(
+  data: GiveawayData & Record<string, any>,
+  status: "active" | "ended"
+): ContainerBuilder {
+  const guildName = data.guildName || "Unknown";
+  const guildIcon = data.guildIcon || null;
+  const guildBanner = data.guildBanner || null;
+  const memberCount = data.memberCount ?? null;
+  const inviteUrl = data.inviteUrl || data.cachedInviteUrl || "No invite available";
+  const endsAt = data.endsAt || Date.now() + 3600000;
+  const endTimestamp = Math.floor(endsAt / 1000);
+  const winnerCount = extractWinnerCount(data.prize || "");
+  const messageUrl = `https://discord.com/channels/${data.guildId}/${data.channelId}/${data.messageId}`;
+
+  const container = new ContainerBuilder()
+    .setAccentColor(status === "ended" ? 0xe74c3c : 0x5865f2);
+
+  // Keep the original giveaway information intact; only the state/color changes.
+  addV2Text(
+    container,
+    `-# ${status === "ended" ? "Giveaway Ended" : "New Giveaway"}`
+  );
+  addV2Text(container, `# ${truncate(data.prize || "Unknown Prize", 256)}`);
+
+  if (status === "ended") {
+    addV2Text(container, "### Status\n**Status:** Ended");
+  }
+
+  addV2Text(
+    container,
+    [
+      "### Details",
+      `**Server:** ${guildName}`,
+      `**Winners:** ${winnerCount}`,
+      "",
+      "### Time",
+      `**Ends:** <t:${endTimestamp}:F>`,
+      `**Countdown:** <t:${endTimestamp}:R>`,
+      "",
+      "### Links",
+      `**Invite:** ${inviteUrl}`,
+      memberCount ? `**Members:** ${memberCount.toLocaleString()}` : "",
+    ].filter(Boolean).join("\n")
+  );
+
+  // Components V2 cannot use an embed, so preserve the old thumbnail/banner
+  // visually with native media components.
+  if (guildIcon) {
+    container.addMediaGalleryComponents(
+      new MediaGalleryBuilder().addItems({
+        media: { url: guildIcon },
+        description: `${guildName} icon`,
+      })
+    );
+  }
+  if (guildBanner) {
+    container.addMediaGalleryComponents(
+      new MediaGalleryBuilder().addItems({
+        media: { url: guildBanner },
+        description: `${guildName} banner`,
+      })
+    );
+  }
+
+  const row = new ActionRowBuilder<ButtonBuilder>();
+  if (inviteUrl.startsWith("http")) {
+    row.addComponents(
+      new ButtonBuilder()
+        .setLabel("Join Server")
+        .setStyle(ButtonStyle.Link)
+        .setURL(inviteUrl)
+        .setDisabled(status === "ended")
+    );
+  }
+  row.addComponents(
+    new ButtonBuilder()
+      .setLabel("Message")
+      .setStyle(ButtonStyle.Link)
+      .setURL(messageUrl)
+  );
+  container.addActionRowComponents(row);
+
+  return container;
+}
+
 function extractWinnerCount(prize: string): string {
   const match = prize.match(/(\d+)\s*[xX×]/);
   if (match) return match[1];
@@ -2420,10 +2485,22 @@ export class BotManager {
             .fetch(notifMsgId)
             .catch(() => null);
           if (msg) {
-            const container = createV2Container(
-              "Giveaway Ended",
-              "This giveaway has ended.\n\nThe original notification is no longer active.",
-              0xe74c3c
+            const guild = this.client.guilds.cache.get(giveaway.guildId);
+            const inviteUrl = this.getFastInviteUrl(
+              giveaway.guildId,
+              giveaway.channelId,
+              giveaway.inviteUrl
+            );
+            const container = buildGiveawayNotificationContainer(
+              {
+                ...giveaway,
+                guildName: giveaway.guildName || guild?.name || "Unknown",
+                guildIcon: giveaway.guildIcon || guild?.iconURL({ size: 512 }) || null,
+                guildBanner: giveaway.guildBanner || guild?.bannerURL({ size: 1024 }) || null,
+                memberCount: giveaway.memberCount ?? guild?.memberCount ?? null,
+                inviteUrl,
+              } as GiveawayData & Record<string, any>,
+              "ended"
             );
             await msg.edit({
               components: [container],
