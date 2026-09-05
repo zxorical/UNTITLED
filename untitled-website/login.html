@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Login | Untitled</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div id="navbar"></div>
+    <div class="background-blobs">
+        <div class="blob blob-one"></div>
+        <div class="blob blob-two"></div>
+        <div class="blob blob-three"></div>
+    </div>
+    <main>
+        <section class="auth-page">
+            <div class="auth-card">
+                <h1 id="greeting">Good Evening!</h1>
+                <p>
+                    Sign in with Discord to manage your Untitled account.
+                </p>
+                <button type="button" class="button primary discord-login" id="discordLogin">
+                    <svg
+                        class="discord-icon"
+                        viewBox="0 0 24 24"
+                        aria-hidden="true"
+                    >
+                        <path d="M19.54 4.2A16.9 16.9 0 0 0 15.2 2.86a.07.07 0 0 0-.07.04c-.19.34-.4.78-.55 1.13a15.6 15.6 0 0 0-5.16 0c-.15-.36-.36-.79-.56-1.13a.07.07 0 0 0-.07-.04A16.9 16.9 0 0 0 4.46 4.2a.07.07 0 0 0-.03.03C1.67 8.53.9 12.72 1.28 16.86a.08.08 0 0 0 .03.05 17 17 0 0 0 5.23 2.65.08.08 0 0 0 .08-.03c.4-.55.75-1.13 1.05-1.74a.08.08 0 0 0-.04-.1 11.2 11.2 0 0 1-1.64-.78.08.08 0 0 1-.01-.13l.33-.25a.08.08 0 0 1 .08-.01c3.44 1.57 7.16 1.57 10.56 0a.08.08 0 0 1 .08.01l.33.25a.08.08 0 0 1-.01.13c-.52.3-1.07.56-1.64.78a.08.08 0 0 0-.04.1c.31.61.66 1.19 1.05 1.74a.08.08 0 0 0 .08.03 17 17 0 0 0 5.24-2.65.08.08 0 0 0 .03-.05c.45-4.78-.77-8.94-3.15-12.63a.06.06 0 0 0-.03-.03ZM8.47 14.57c-1.03 0-1.88-.95-1.88-2.12s.83-2.12 1.88-2.12c1.06 0 1.9.96 1.88 2.12 0 1.17-.83 2.12-1.88 2.12Zm7.06 0c-1.03 0-1.88-.95-1.88-2.12s.83-2.12 1.88-2.12c1.06 0 1.9.96 1.88 2.12 0 1.17-.82 2.12-1.88 2.12Z"/>
+                    </svg>
+                    Continue with Discord
+                </button>
+                <p class="auth-note">
+                    Don't have an Untitled account?
+                    <button type="button" id="createAccount">
+                        Create one
+                    </button>
+                </p>
+            </div>
+        </section>
+    </main>
+    <footer id="footer"></footer>
+    <script src="script.js"></script>
+    <script src="js/main.js"></script>
+    <script>
+        const greeting = document.getElementById("greeting");
+        const hour = new Date().getHours();
+
+```
+    let greetingText;
+
+    if (hour >= 5 && hour < 12) {
+        greetingText = "Good Morning!";
+    } else if (hour >= 12 && hour < 18) {
+        greetingText = "Good Afternoon!";
+    } else if (hour >= 18 && hour < 23) {
+        greetingText = "Good Evening!";
+    } else {
+        greetingText = "Good Night!";
+    }
+
+    greeting.textContent = greetingText;
+
+    document.getElementById("discordLogin").addEventListener("click", () => {
+        window.location.href = "/auth/discord";
+    });
+
+    document.getElementById("createAccount").addEventListener("click", () => {
+        window.location.href = "/auth/discord";
+    });
+</script>
+```
+
+</body>
+</html>

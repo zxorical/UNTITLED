@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Untitled Dashboard</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+
+    <div class="background-blobs">
+        <div class="blob blob-one"></div>
+        <div class="blob blob-two"></div>
+        <div class="blob blob-three"></div>
+    </div>
+
+    <div id="navbar"></div>
+
+    <div class="page-content">
+        <main>
+
+            <section class="dashboard-header">
+                <div class="dashboard-header-content">
+
+                    <h1 id="greeting">
+                        Good afternoon, Gab!
+                    </h1>
+
+                    <p>
+                        Here's what's happening in your Untitled account!
+                    </p>
+
+                </div>
+            </section>
+
+            <section class="dashboard-overview">
+                <div class="overview-grid">
+
+                    <article class="overview-card">
+                        <p class="card-label">
+                            Giveaways
+                        </p>
+
+                        <h2 id="giveaway-count">
+                            6,769,420
+                        </h2>
+
+                        <p>
+                            Giveaways currently being tracked.
+                        </p>
+                    </article>
+
+                    <article class="overview-card">
+                        <p class="card-label">
+                            AutoJoin
+                        </p>
+
+                        <h2 id="autojoin-status">
+                            —
+                        </h2>
+
+                        <p id="autojoin-description">
+                            Checking AutoJoin status...
+                        </p>
+                    </article>
+
+                    <article class="overview-card">
+                        <p class="card-label">
+                            Watchlist
+                        </p>
+
+                        <h2 id="watchlist-count">
+                            —
+                        </h2>
+
+                        <p>
+                            Customs currently on your watchlist.
+                        </p>
+                    </article>
+
+                </div>
+            </section>
+
+            <section class="dashboard-chart">
+
+                <div class="section-heading">
+                    <h2>
+                        Giveaway wins
+                    </h2>
+
+                    <p>
+                        Your giveaway wins over time.
+                    </p>
+                </div>
+
+                <div class="chart-controls">
+                    <select
+                        id="chart-range"
+                        class="chart-select"
+                        aria-label="Choose giveaway win date range"
+                    >
+                        <option value="7">Last 7 days</option>
+                        <option value="30">Last 30 days</option>
+                        <option value="month">This month</option>
+                        <option value="last-month">Last month</option>
+                    </select>
+                </div>
+
+                <div class="chart-wrapper" id="wins-chart">
+
+                    <div class="chart-grid" aria-hidden="true">
+                        <div class="chart-grid-line"></div>
+                        <div class="chart-grid-line"></div>
+                        <div class="chart-grid-line"></div>
+                        <div class="chart-grid-line"></div>
+                        <div class="chart-grid-line"></div>
+                    </div>
+
+                    <div
+                        class="chart-bars"
+                        id="chart-bars"
+                        aria-label="Giveaway wins chart"
+                    ></div>
+
+                    <div class="chart-empty" id="chart-empty">
+                        No giveaway wins during this period.
+                    </div>
+
+                </div>
+
+            </section>
+
+            <section class="dashboard-features">
+
+                <div class="section-heading">
+                    <h2>
+                        Features
+                    </h2>
+
+                    <p>
+                        Manage the features available through Untitled.
+                    </p>
+                </div>
+
+                <div class="feature-grid">
+
+                    <article class="feature-card">
+                        <h3>
+                            Giveaway Tracker
+                        </h3>
+
+                        <p>
+                            Track giveaways across the servers that Untitled can monitor.
+                        </p>
+
+                        <a href="#">
+                            Open
+                        </a>
+                    </article>
+
+                    <article class="feature-card">
+                        <h3>
+                            AutoJoin
+                        </h3>
+
+                        <p>
+                            Automatically enter giveaways as they're detected.
+                        </p>
+
+                        <a href="#">
+                            Configure
+                        </a>
+                    </article>
+
+                    <article class="feature-card">
+                        <h3>
+                            Watchlist
+                        </h3>
+
+                        <p>
+                            Keep track of the VRFS customs that you're interested in.
+                        </p>
+
+                        <a href="#">
+                            Manage
+                        </a>
+                    </article>
+
+                    <article class="feature-card">
+                        <h3>
+                            League Tracker
+                        </h3>
+
+                        <p>
+                            Monitor leagues for available spots. Coming soon...
+                        </p>
+
+                        <a href="#">
+                            Open
+                        </a>
+                    </article>
+
+                </div>
+
+            </section>
+
+        </main>
+    </div>
+
+    <div
+        id="chart-tooltip"
+        class="chart-tooltip"
+        role="status"
+        aria-live="polite"
+    ></div>
+
+    <footer id="footer"></footer>
+
+    <script src="script.js"></script>
+    <script src="js/main.js"></script>
+
+    <script>
+        const chartBars = document.getElementById('chart-bars');
+        const chartTooltip = document.getElementById('chart-tooltip');
+        const chartRange = document.getElementById('chart-range');
+        const chartEmpty = document.getElementById('chart-empty');
+
+        let selectedBar = null;
+
+        const sampleData = {
+            7: [
+                { date: '25/08', wins: 3 },
+                { date: '26/08', wins: 7 },
+                { date: '27/08', wins: 4 },
+                { date: '28/08', wins: 9 },
+                { date: '29/08', wins: 6 },
+                { date: '30/08', wins: 11 },
+                { date: '31/08', wins: 8 }
+            ],
+
+            30: [
+                { date: '02/08', wins: 4 },
+                { date: '04/08', wins: 7 },
+                { date: '06/08', wins: 3 },
+                { date: '08/08', wins: 9 },
+                { date: '10/08', wins: 6 },
+                { date: '12/08', wins: 12 },
+                { date: '14/08', wins: 8 },
+                { date: '16/08', wins: 14 },
+                { date: '18/08', wins: 7 },
+                { date: '20/08', wins: 11 },
+                { date: '22/08', wins: 9 },
+                { date: '24/08', wins: 15 },
+                { date: '26/08', wins: 12 },
+                { date: '28/08', wins: 17 },
+                { date: '30/08', wins: 13 }
+            ],
+
+            month: [
+                { date: '01/08', wins: 5 },
+                { date: '04/08', wins: 8 },
+                { date: '07/08', wins: 6 },
+                { date: '10/08', wins: 12 },
+                { date: '13/08', wins: 9 },
+                { date: '16/08', wins: 15 },
+                { date: '19/08', wins: 11 },
+                { date: '22/08', wins: 18 },
+                { date: '25/08', wins: 14 },
+                { date: '28/08', wins: 20 },
+                { date: '31/08', wins: 16 }
+            ],
+
+            'last-month': [
+                { date: '01/07', wins: 6 },
+                { date: '04/07', wins: 9 },
+                { date: '07/07', wins: 4 },
+                { date: '10/07', wins: 13 },
+                { date: '13/07', wins: 8 },
+                { date: '16/07', wins: 17 },
+                { date: '19/07', wins: 11 },
+                { date: '22/07', wins: 15 },
+                { date: '25/07', wins: 19 },
+                { date: '28/07', wins: 14 },
+                { date: '31/07', wins: 21 }
+            ]
+        };
+
+        function renderWinsChart(data) {
+            chartBars.innerHTML = '';
+            chartTooltip.classList.remove('visible');
+            selectedBar = null;
+
+            if (!data.length || data.every(item => item.wins === 0)) {
+                chartEmpty.style.display = 'flex';
+                return;
+            }
+
+            chartEmpty.style.display = 'none';
+
+            const maxWins = Math.max(
+                ...data.map(item => item.wins),
+                1
+            );
+
+            data.forEach(item => {
+                const container = document.createElement('div');
+                container.className = 'chart-bar-container';
+
+                const bar = document.createElement('div');
+                bar.className = 'chart-bar';
+
+                const label = document.createElement('span');
+                label.className = 'chart-label';
+                label.textContent = item.date;
+
+                const height = Math.max(
+                    (item.wins / maxWins) * 100,
+                    item.wins > 0 ? 1 : 0
+                );
+
+                bar.style.height = `${height}%`;
+
+                container.appendChild(bar);
+                container.appendChild(label);
+                chartBars.appendChild(container);
+
+                const showTooltip = (event) => {
+                    chartTooltip.innerHTML =
+                        `<strong>${item.wins}</strong> win${item.wins === 1 ? '' : 's'} · ${item.date}`;
+
+                    chartTooltip.style.left = `${event.clientX}px`;
+                    chartTooltip.style.top = `${event.clientY}px`;
+                    chartTooltip.classList.add('visible');
+                };
+
+                const hideTooltip = () => {
+                    if (!container.classList.contains('selected')) {
+                        chartTooltip.classList.remove('visible');
+                    }
+                };
+
+                container.addEventListener(
+                    'mouseenter',
+                    showTooltip
+                );
+
+                container.addEventListener(
+                    'mousemove',
+                    showTooltip
+                );
+
+                container.addEventListener(
+                    'mouseleave',
+                    hideTooltip
+                );
+
+                container.addEventListener('click', (event) => {
+                    event.stopPropagation();
+
+                    if (
+                        selectedBar &&
+                        selectedBar !== container
+                    ) {
+                        selectedBar.classList.remove('selected');
+                    }
+
+                    if (
+                        container.classList.contains('selected')
+                    ) {
+                        container.classList.remove('selected');
+                        selectedBar = null;
+                        chartTooltip.classList.remove('visible');
+                        return;
+                    }
+
+                    container.classList.add('selected');
+                    selectedBar = container;
+
+                    showTooltip(event);
+                });
+            });
+        }
+
+        chartRange.addEventListener('change', () => {
+            renderWinsChart(
+                sampleData[chartRange.value]
+            );
+        });
+
+        document.addEventListener('click', (event) => {
+            if (
+                selectedBar &&
+                !event.target.closest('.chart-bar-container')
+            ) {
+                selectedBar.classList.remove('selected');
+                selectedBar = null;
+                chartTooltip.classList.remove('visible');
+            }
+        });
+
+        renderWinsChart(
+            sampleData[chartRange.value]
+        );
+    </script>
+
+</body>
+</html>
