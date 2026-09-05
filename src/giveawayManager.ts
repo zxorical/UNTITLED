@@ -40,16 +40,6 @@
  * 38. FIXED: INVITE_CACHE_TTL raised from 30m to 6h — permanent invites never
  *            expire on Discord's side so short TTL caused unnecessary re-generation
  *            churn that accelerated hitting the invite cap
- * 39. FIXED: tryGenerateInviteOnce — eliminated redundant double guild.invites.fetch().
- *            The second fetch (stored as existingChannelInvites) was always called AFTER
- *            the first already returned if invites existed, meaning it always saw an
- *            empty collection or repeated 403. This made the entire per-channel invite
- *            reuse optimisation and the 30016 fallback dead code — existingChannelInvites
- *            was ALWAYS null/empty when those code paths were reached. Fixed by fetching
- *            once and reusing the result (existingInvites) throughout the function.
- *            Also added zero-cost guild.invites.cache scan in getInviteUrlOrFallback
- *            so invites already resident in the discord.js cache from a prior warmup
- *            fetch are returned immediately without enqueueing another background job.
  */
 
 import { Client, Message, TextChannel } from 'discord.js-selfbot-v13';
@@ -164,7 +154,7 @@ const MAX_INVITE_CACHE = 250;
 const MAX_DUPLICATE_CACHE = 2000;
 const MAX_FAILED_INVITE_CACHE = 100;
 const WATCHLIST_CACHE_TTL = 60_000;
-const INVITE_CACHE_TTL = 6 * 60 * 60 * 1000; // 6h — permanent invites don't expire on Discord
+const INVITE_CACHE_TTL = 48 * 60 * 60 * 1000; // 6h — permanent invites don't expire on Discord
 const FAILED_INVITE_RETRY_MS = 15 * 60 * 1000;
 const INVITE_MAX_ATTEMPTS = 20;
 const INVITE_WARMUP_CONCURRENCY = 3;
@@ -2148,10 +2138,8 @@ export class GiveawayManager extends EventEmitter {
   //   2. Giveaway detection/notification NEVER waits for invite generation.
   //   3. A failed generation is retried passively up to 20 times.
   //   4. Only a small number of guilds generate invites concurrently.
-  //   5. Successful invites are cached for 6 hours (permanent invites never expire).
+  //   5. Successful invites are cached for 30 minutes.
   //   6. The giveaway's own channel is tried first when available.
-  //   7. guild.invites.fetch() is called ONCE per tryGenerateInviteOnce pass;
-  //      the result is reused for per-channel reuse + 30016 fallback (fix 39).
   // ═══════════════════════════════════════════════════════════════════════
 
   private getInviteUrlOrFallback(guildId: string, preferredChannelId?: string): string {
@@ -2172,27 +2160,6 @@ export class GiveawayManager extends EventEmitter {
       const url = `https://discord.gg/${vanity}`;
       this.cacheInvite(guildId, url, now);
       return url;
-    }
-
-    // FIX 39: Zero-cost recovery — scan the guild's already-resident invite cache
-    // (populated by any prior guild.invites.fetch() call during warmup) before
-    // falling back to a bare channel link. This catches the common race where a
-    // background warmup already fetched invites but the result arrived slightly
-    // after the first giveaway detection for this guild fired. No API call needed.
-    try {
-      const localCache = (guild as any)?.invites?.cache;
-      if (localCache?.size) {
-        const best =
-          localCache.find((inv: any) => inv.maxAge === 0 && inv.maxUses === 0) ??
-          localCache.find((inv: any) => inv.maxAge === 0) ??
-          localCache.first();
-        if (best?.url) {
-          this.cacheInvite(guildId, best.url, now);
-          return best.url;
-        }
-      }
-    } catch {
-      // Ignore — discord.js cache unavailable; fall through to background warmup.
     }
 
     // Kick off background generation, but DO NOT await it.
@@ -2370,30 +2337,16 @@ export class GiveawayManager extends EventEmitter {
       // Continue.
     }
 
-    // FIX 39: Fetch guild invites ONCE and reuse the result for the entire function.
-    //
-    // The previous code called guild.invites.fetch() twice:
-    //   1. At the top to get a quick early-return when invites already exist.
-    //   2. Below as `existingChannelInvites`, used for per-channel reuse + 30016 fallback.
-    //
-    // But the second fetch is ALWAYS a no-op:
-    //   • If the first fetch found invites → we returned early; line 2 is never reached.
-    //   • If the first fetch returned empty  → the second also returns empty.
-    //   • If the first fetch threw 403      → the second throws 403 again.
-    //
-    // Consequence: `existingChannelInvites` was ALWAYS null/empty, making the
-    // per-channel reuse loop and the 30016 fallback dead code. Guilds that hit the
-    // invite cap (30016) always got `null` even when usable invites were available.
-    //
-    // Fix: fetch once, store in `existingInvites`, use it everywhere below.
-    let existingInvites: any = null;
+    // Existing invites are preferred because this avoids creating unnecessary
+    // invites. A permissions error is expected and must not stop creation.
     try {
-      existingInvites = await guild.invites.fetch();
-      if (existingInvites?.size) {
+      const invites = await guild.invites.fetch();
+      if (invites?.size) {
         const best =
-          existingInvites.find((inv: any) => inv.maxAge === 0 && inv.maxUses === 0) ??
-          existingInvites.find((inv: any) => inv.maxAge === 0) ??
-          existingInvites.first();
+          invites.find(inv => inv.maxAge === 0 && inv.maxUses === 0) ??
+          invites.find(inv => inv.maxAge === 0) ??
+          invites.first();
+
         if (best?.url) return best.url;
       }
     } catch (error: any) {
@@ -2404,7 +2357,6 @@ export class GiveawayManager extends EventEmitter {
           account: this.accountLabel,
         });
       }
-      // existingInvites stays null — proceed to createInvite below.
     }
 
     const textChannels = Array.from(guild.channels.cache.values())
@@ -2485,6 +2437,16 @@ export class GiveawayManager extends EventEmitter {
       temporary: false,
     } as const;
 
+    // Try to fetch existing channel-scoped invites first so we never
+    // create more than necessary. This avoids Discord's 1000-invite-per-guild
+    // cap (error 30016) which permanently breaks new invite creation.
+    let existingChannelInvites: any = null;
+    try {
+      existingChannelInvites = await guild.invites.fetch();
+    } catch {
+      // MANAGE_GUILD not held — skip, fall through to createInvite.
+    }
+
     // One background attempt can try every reasonable text channel. The outer
     // warmup loop provides the 20 passive attempts.
     let channelAttemptCount = 0;
@@ -2495,19 +2457,17 @@ export class GiveawayManager extends EventEmitter {
         await delay(150);
       }
 
-      // FIX 39: Reuse an existing per-channel invite from the already-fetched
-      // collection. This was previously dead code because existingChannelInvites
-      // was re-fetched redundantly and was always null/empty by the time we got
-      // here. Now we use existingInvites, captured once above.
-      if (existingInvites?.size) {
+      // Reuse an existing permanent invite for this channel if available.
+      // Primary defence against hitting the 1000-invite cap.
+      if (existingChannelInvites?.size) {
         const existing =
-          existingInvites.find((inv: any) =>
+          existingChannelInvites.find((inv: any) =>
             inv.channel?.id === channel.id && inv.maxAge === 0 && inv.maxUses === 0
           ) ??
-          existingInvites.find((inv: any) =>
+          existingChannelInvites.find((inv: any) =>
             inv.channel?.id === channel.id && inv.maxAge === 0
           ) ??
-          existingInvites.find((inv: any) =>
+          existingChannelInvites.find((inv: any) =>
             inv.channel?.id === channel.id
           );
         if (existing?.url) return existing.url;
@@ -2548,22 +2508,14 @@ export class GiveawayManager extends EventEmitter {
           continue;
         }
 
-        // FIX 39: Guild hit Discord's 1000-invite hard cap — reuse any fetched invite.
-        // Previously existingChannelInvites was always null here (double-fetch bug)
-        // so the fallback never worked. Now existingInvites is properly populated
-        // and we pick the best available invite before giving up.
+        // Guild hit Discord's 1000-invite hard cap — reuse any fetched invite.
         if (code === 30016) {
           this.log.warn(
             `Guild ${guildId} hit Discord invite cap (30016); reusing fetched invite`,
             { component: 'GiveawayManager', account: this.accountLabel },
           );
-          if (existingInvites?.size) {
-            const fallback =
-              existingInvites.find((inv: any) => inv.maxAge === 0 && inv.maxUses === 0) ??
-              existingInvites.find((inv: any) => inv.maxAge === 0) ??
-              existingInvites.first();
-            if (fallback?.url) return fallback.url;
-          }
+          const fallback = existingChannelInvites?.first?.() as any;
+          if (fallback?.url) return fallback.url;
           return null; // Cap hit and nothing to reuse — bail.
         }
 
