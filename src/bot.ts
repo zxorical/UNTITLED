@@ -2517,7 +2517,10 @@ export class BotManager {
               memberCount: giveaway.memberCount ?? guild?.memberCount ?? null,
               // Never replace the original persisted invite with a newly
               // resolved fallback during the ended update.
-              inviteUrl: giveaway.inviteUrl || giveaway.cachedInviteUrl || "No invite available",
+              inviteUrl:
+    giveaway.inviteUrl ||
+    (giveaway as GiveawayData & Record<string, any>).cachedInviteUrl ||
+    "No invite available",
             } as GiveawayData & Record<string, any>);
             const container = buildGiveawayNotificationContainer(endedData, "ended");
             await msg.edit({
