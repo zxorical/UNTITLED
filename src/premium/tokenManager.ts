@@ -195,31 +195,23 @@ async function waitForReady(
   return new Promise<boolean>((resolve) => {
     let settled = false;
 
-    let timeout: NodeJS.Timeout;
-
     const finish = (ready: boolean) => {
-      if (settled) {
-        return;
-      }
+      if (settled) return;
 
       settled = true;
       clearTimeout(timeout);
       resolve(ready);
     };
 
-    timeout = setTimeout(() => {
-      finish(client.isReady());
+    const timeout = setTimeout(() => {
+      // Don't call client.isReady() here.
+      finish(false);
     }, timeoutMs);
 
-    try {
-      // @ts-ignore - discord.js-selfbot-v13 types may be incomplete
-      client.once('ready', () => {
-        finish(true);
-      });
-    } catch {
-      clearTimeout(timeout);
-      finish(false);
-    }
+    // @ts-ignore - discord.js-selfbot-v13 types are incomplete
+    client.once('ready', () => {
+      finish(true);
+    });
   });
 }
 
