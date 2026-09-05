@@ -195,40 +195,30 @@ async function waitForReady(
   return new Promise<boolean>((resolve) => {
     let settled = false;
 
+    let timeout: NodeJS.Timeout;
+
     const finish = (ready: boolean) => {
       if (settled) {
         return;
       }
 
       settled = true;
-
       clearTimeout(timeout);
       resolve(ready);
     };
 
-    const timeout = setTimeout(() => {
-      /*
-       * Do not treat this as a fatal connection failure.
-       *
-       * The client may still become ready shortly afterwards.
-       */
+    timeout = setTimeout(() => {
       finish(client.isReady());
     }, timeoutMs);
 
     try {
-      // discord.js-selfbot-v13 types may not expose this correctly.
-      // @ts-ignore
+      // @ts-ignore - discord.js-selfbot-v13 types may be incomplete
       client.once('ready', () => {
         finish(true);
       });
     } catch {
       clearTimeout(timeout);
-
-      /*
-       * If the event registration fails, simply check the state.
-       * Do not destroy the client here.
-       */
-      finish(client.isReady());
+      finish(false);
     }
   });
 }
