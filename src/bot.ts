@@ -79,33 +79,33 @@ import {
   checkPremium,
   clearPremiumCache,
 } from "./license/licenseMiddleware.js";
-import {
-  getUsername,
-  getProfile,
-  getOutfits,
-  getPlayer,
-  getMarketplace,
-  getMarketplaceItem,
-  searchMarketplace,
-  getCatalog,
-  getCatalogItem,
-  searchCatalog,
-  checkOwnership,
-  getSku,
-  getItemName,
-  getSection,
-  isItemFree,
-  getCreditsForItem,
-  getMarketplaceActive,
-  getMarketplaceOwners,
-  getMarketplaceCreatorName,
-  getMarketplaceCreatorId,
-  type VRFSItem,
-  type VRFSMarketplaceItem,
-  type VRFSProfile,
-  type VRFSOutfit,
-  type OwnershipCheckResult,
-} from "./middleware/api/vrfs.js";
+// [VRFS ARCHIVED] import {
+// [VRFS ARCHIVED]   getUsername,
+// [VRFS ARCHIVED]   getProfile,
+// [VRFS ARCHIVED]   getOutfits,
+// [VRFS ARCHIVED]   getPlayer,
+// [VRFS ARCHIVED]   getMarketplace,
+// [VRFS ARCHIVED]   getMarketplaceItem,
+// [VRFS ARCHIVED]   searchMarketplace,
+// [VRFS ARCHIVED]   getCatalog,
+// [VRFS ARCHIVED]   getCatalogItem,
+// [VRFS ARCHIVED]   searchCatalog,
+// [VRFS ARCHIVED]   checkOwnership,
+// [VRFS ARCHIVED]   getSku,
+// [VRFS ARCHIVED]   getItemName,
+// [VRFS ARCHIVED]   getSection,
+// [VRFS ARCHIVED]   isItemFree,
+// [VRFS ARCHIVED]   getCreditsForItem,
+// [VRFS ARCHIVED]   getMarketplaceActive,
+// [VRFS ARCHIVED]   getMarketplaceOwners,
+// [VRFS ARCHIVED]   getMarketplaceCreatorName,
+// [VRFS ARCHIVED]   getMarketplaceCreatorId,
+// [VRFS ARCHIVED]   type VRFSItem,
+// [VRFS ARCHIVED]   type VRFSMarketplaceItem,
+// [VRFS ARCHIVED]   type VRFSProfile,
+// [VRFS ARCHIVED]   type VRFSOutfit,
+// [VRFS ARCHIVED]   type OwnershipCheckResult,
+// [VRFS ARCHIVED] } from "./middleware/api/vrfs.js";
 declare function updateNotificationStatus(
   messageId: string,
   channelId: string,
@@ -163,17 +163,20 @@ const DEDUP_TTL_MS = 10 * 60 * 1000;
 const DEDUP_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
 class NotificationService {
   private queue: NotificationJob[] = [];
-  private processing = false;
+  private activeWorkers = 0;
+  private readonly maxWorkers = 4;
   private dedupMap = new Map<string, number>();
   private dedupSweepInterval: NodeJS.Timeout | null = null;
   private bot: Client;
   private metrics: MetricsCollector;
+
   constructor(bot: Client, metrics: MetricsCollector) {
     this.bot = bot;
     this.metrics = metrics;
     this.dedupSweepInterval = setInterval(() => this.sweepDedup(), DEDUP_SWEEP_INTERVAL_MS);
     this.dedupSweepInterval.unref?.();
   }
+
   private sweepDedup(): void {
     const now = Date.now();
     let removed = 0;
@@ -190,52 +193,57 @@ class NotificationService {
       });
     }
   }
+
   shutdown(): void {
     if (this.dedupSweepInterval) {
       clearInterval(this.dedupSweepInterval);
       this.dedupSweepInterval = null;
     }
+    this.queue.length = 0;
   }
-  enqueue(data: GiveawayData, inviteUrl: string) {
+
+  enqueue(data: GiveawayData, inviteUrl: string): void {
     const existing = this.dedupMap.get(data.messageId);
     if (existing !== undefined && Date.now() - existing < DEDUP_TTL_MS) {
-      logger.debug("Notification duplicate prevented", {
-        messageId: data.messageId,
-      });
+      logger.debug("Notification duplicate prevented", { messageId: data.messageId });
       return;
     }
+
     this.dedupMap.set(data.messageId, Date.now());
     (data as any).cachedInviteUrl = inviteUrl;
-    this.queue.push({
-      data,
-      attempt: 1,
-      maxRetries: 3,
-      messageId: data.messageId,
-    });
-    void this.processQueue();
+    this.queue.push({ data, attempt: 1, maxRetries: 3, messageId: data.messageId });
+    this.drain();
   }
-  private async processQueue() {
-    if (this.processing) return;
-    this.processing = true;
-    while (this.queue.length > 0) {
+
+  private drain(): void {
+    while (this.activeWorkers < this.maxWorkers && this.queue.length > 0) {
       const job = this.queue.shift()!;
-      try {
-        await this.sendWithRetry(job);
-      } catch (err) {
-        logger.error("Notification failed after retries", {
-          messageId: job.messageId,
-          error: formatError(err),
-        });
-        try {
-          await updateNotificationStatus?.(job.messageId, job.data.channelId, {
-            notificationStatus: "failed",
-            notificationError: formatError(err),
-          });
-        } catch {}
-      }
+      this.activeWorkers++;
+      void this.runJob(job).finally(() => {
+        this.activeWorkers--;
+        this.drain();
+      });
     }
-    this.processing = false;
   }
+
+  private async runJob(job: NotificationJob): Promise<void> {
+    try {
+      await this.sendWithRetry(job);
+    } catch (err) {
+      logger.error("Notification failed after retries", {
+        messageId: job.messageId,
+        error: formatError(err),
+      });
+      try {
+        await updateNotificationStatus?.(job.messageId, job.data.channelId, {
+          notificationStatus: "failed",
+          notificationError: formatError(err),
+        });
+      } catch {}
+      this.metrics.recordNotification(false, 0);
+    }
+  }
+
   private async sendWithRetry(job: NotificationJob): Promise<void> {
     let lastError: unknown;
     for (let attempt = 1; attempt <= job.maxRetries; attempt++) {
@@ -258,107 +266,63 @@ class NotificationService {
     }
     throw lastError;
   }
+
   private async sendOne(job: NotificationJob): Promise<void> {
     const channel = this.bot.channels.cache.get(CONFIG.trackerChannelId) as TextChannel | undefined;
     if (!channel) throw new Error("Tracker channel not found");
+
     const data = job.data;
     const guild = this.bot.guilds.cache.get(data.guildId);
     const guildName = guild?.name || data.guildName || "Unknown";
-    const guildIcon =
-      (data as any).guildIcon || guild?.iconURL({ size: 512 }) || null;
-    const guildBanner =
-      (data as any).guildBanner || guild?.bannerURL({ size: 1024 }) || null;
+    const guildIcon = (data as any).guildIcon || guild?.iconURL({ size: 512 }) || null;
+    const guildBanner = (data as any).guildBanner || guild?.bannerURL({ size: 1024 }) || null;
     const memberCount = ((data as any).memberCount || guild?.memberCount) ?? null;
-    let inviteUrl =
-      (data as any).cachedInviteUrl || data.inviteUrl || "No invite available";
-    if (inviteUrl === "No invite available" && data.guildId) {
-      try {
-        const targetGuild = this.bot.guilds.cache.get(data.guildId);
-        if (targetGuild) {
-          const invites = await targetGuild.invites.fetch().catch(
-            () => new Collection<string, Invite>()
-          );
-          const existingInvite = invites.find(
-            (inv: Invite) => inv.channelId === data.channelId && inv.maxUses === 0
-          );
-          if (existingInvite) {
-            inviteUrl = existingInvite.url;
-          } else {
-            const targetChannel = targetGuild.channels.cache.get(data.channelId);
-            if (
-              targetChannel &&
-              targetChannel.isTextBased() &&
-              "createInvite" in targetChannel
-            ) {
-              const perms = targetChannel.permissionsFor(this.bot.user?.id || "");
-              if (perms?.has("CreateInstantInvite")) {
-                const newInvite = await targetChannel.createInvite({
-                  maxAge: 86400,
-                  maxUses: 0,
-                  reason: "Giveaway notification",
-                });
-                inviteUrl = newInvite.url;
-              }
-            }
-          }
-        }
-      } catch (err) {
-        logger.debug(`Could not generate invite: ${formatError(err)}`);
-      }
-    }
+    const inviteUrl = (data as any).cachedInviteUrl || data.inviteUrl || "No invite available";
     const endsAt = data.endsAt || Date.now() + 3600000;
     const endTimestamp = Math.floor(endsAt / 1000);
     const winnerCount = extractWinnerCount(data.prize);
-    const pingMention = process.env.PING_ROLE_ID
-      ? `<@&${process.env.PING_ROLE_ID}>`
-      : "@everyone";
-    const description = [
-      "### Details",
+    const pingMention = process.env.PING_ROLE_ID ? `<@&${process.env.PING_ROLE_ID}>` : "@everyone";
+
+    const body = [
+      `### Details`,
       `**Server:** ${guildName}`,
-      `**Channel:** #${data.channelName}`,
       `**Winners:** ${winnerCount}`,
       "",
-      "### Time",
+      `### Time`,
       `**Ends:** <t:${endTimestamp}:F>`,
       `**Countdown:** <t:${endTimestamp}:R>`,
       "",
-      "### Links",
+      `### Links`,
       `**Invite:** ${inviteUrl}`,
       memberCount ? `**Members:** ${memberCount.toLocaleString()}` : "",
-    ]
-      .filter(Boolean)
-      .join("\n");
-    const embed = new EmbedBuilder()
-      .setAuthor({
-        name: "New Giveaway",
-        iconURL: this.bot.user?.displayAvatarURL(),
-      })
-      .setTitle(data.prize || "Unknown Prize")
-      .setDescription(description)
-      .setColor(0x5865f2);
-    if (guildIcon) embed.setThumbnail(guildIcon);
-    if (guildBanner) embed.setImage(guildBanner);
+    ].filter(Boolean).join("\n");
+
+    const container = createV2Container(data.prize || "Unknown Prize", body, 0x5865f2);
+    if (pingMention) addV2Text(container, pingMention);
+    if (guildIcon || guildBanner) {
+      const media = guildBanner || guildIcon;
+      if (media) {
+        container.addMediaGalleryComponents(
+          new MediaGalleryBuilder().addItems({
+            media: { url: media },
+            description: guildName,
+          })
+        );
+      }
+    }
+
     const messageUrl = `https://discord.com/channels/${data.guildId}/${data.channelId}/${data.messageId}`;
     const row = new ActionRowBuilder<ButtonBuilder>();
     if (inviteUrl.startsWith("http")) {
-      row.addComponents(
-        new ButtonBuilder()
-          .setLabel("Join Server")
-          .setStyle(ButtonStyle.Link)
-          .setURL(inviteUrl)
-      );
+      row.addComponents(new ButtonBuilder().setLabel("Join Server").setStyle(ButtonStyle.Link).setURL(inviteUrl));
     }
-    row.addComponents(
-      new ButtonBuilder()
-        .setLabel("Message")
-        .setStyle(ButtonStyle.Link)
-        .setURL(messageUrl)
-    );
+    row.addComponents(new ButtonBuilder().setLabel("Message").setStyle(ButtonStyle.Link).setURL(messageUrl));
+    container.addActionRowComponents(row);
+
     const start = Date.now();
     const sentMessage = await channel.send({
-      content: pingMention,
-      embeds: [embed],
-      components: [row],
+      components: [container],
+      flags: MessageFlags.IsComponentsV2,
     });
     this.metrics.recordNotification(true, Date.now() - start);
     await setNotificationMessageId(data.messageId, data.channelId, sentMessage.id);
@@ -384,7 +348,10 @@ async function deferReply(
   ephemeral = true
 ) {
   if (!interaction.deferred && !interaction.replied) {
-    await interaction.deferReply({ ephemeral });
+    await interaction.deferReply({ flags: ephemeral
+      ? MessageFlags.IsComponentsV2 | MessageFlags.Ephemeral
+      : MessageFlags.IsComponentsV2,
+    });
   }
 }
 
@@ -591,420 +558,422 @@ function safeUrl(value: unknown): string | null {
     return null;
   }
 }
-function formatNumber(value: unknown): string {
-  const n = Number(value ?? 0);
-  return Number.isFinite(n) ? n.toLocaleString() : "0";
-}
-function formatCredits(value: unknown): string {
-  const n = Number(value);
-  if (!Number.isFinite(n)) return "Unknown";
-  return `${n.toLocaleString()} Credits`;
-}
-function formatItemPrice(item: VRFSItem): string {
-  if (isItemFree(item)) return "Free";
-  const credits = getCreditsForItem(item);
-  if (credits !== null) return formatCredits(credits);
-  return "Paid";
-}
-function formatMarketPrice(item: VRFSMarketplaceItem): string {
-  const price = Number(item.coins_price);
-  return Number.isFinite(price) ? formatCredits(price) : "Unknown";
-}
-function marketType(item: VRFSMarketplaceItem): string {
-  const category = String(item.category_id ?? item.category ?? "");
-  const map: Record<string, string> = {
-    "1": "Boots",
-    "2": "Glasses",
-    "3": "Gloves",
-    "4": "Hat",
-    "5": "Mask",
-    "6": "Scarf",
-    "7": "Other",
-  };
-  if (map[category]) return map[category];
-  const sku = getSku(item).toLowerCase();
-  if (/boot|shoe/.test(sku)) return "Boots";
-  if (/glass|goggle/.test(sku)) return "Glasses";
-  if (/glove|hand/.test(sku)) return "Gloves";
-  if (/hat|cap|helmet/.test(sku)) return "Hat";
-  if (/mask|face/.test(sku)) return "Mask";
-  if (/scarf|neck/.test(sku)) return "Scarf";
-  return "Other";
-}
-function getCatalogImage(item: VRFSItem): string | null {
-  const candidates = [
-    item.image,
-    item.image_url,
-    item.thumbnail_url,
-    item.texture_url,
-    item.thumbnail,
-    typeof item.thumb === "string"
-      ? `https://vrfs.sebyplay.xyz/lockerchecker/assets/thumbs/${item.thumb}`
-      : null,
-  ];
-  for (const candidate of candidates) {
-    const url = safeUrl(candidate);
-    if (url) return url;
-  }
-  return null;
-}
-function getMarketplaceImage(item: VRFSMarketplaceItem): string | null {
-  const candidates = [
-    item.thumbnail_url,
-    item.texture_url,
-    item.thumbnail,
-    item.image_url,
-  ];
-  for (const candidate of candidates) {
-    const url = safeUrl(candidate);
-    if (url) return url;
-  }
-  return null;
-}
-function avatarUrl(id: number): string {
-  return `https://userpic.vrfs.org/avatar/avatar-pics/${encodeURIComponent(
-    String(id)
-  )}.png`;
-}
-function createEmbed(
-  title?: string,
-  color = 0x5865f2,
-  description?: string
-): EmbedBuilder {
-  const embed = new EmbedBuilder().setColor(color);
-  if (title) embed.setTitle(truncate(title, 256));
-  if (description) embed.setDescription(truncate(description, 4096));
-  return embed;
-}
-function createItemEmbed(item: VRFSItem): EmbedBuilder {
-  const name = getItemName(item);
-  const embed = createEmbed(name);
-  const sku = getSku(item);
-  if (sku) embed.setDescription(`\`${truncate(sku, 200)}\``);
-  const image = getCatalogImage(item);
-  if (image) embed.setImage(image);
-  embed.addFields(
-    { name: "Section", value: truncate(getSection(item), 1024), inline: true },
-    { name: "Price", value: formatItemPrice(item), inline: true },
-    {
-      name: "ID",
-      value: String(item.id ?? item.item_id ?? item.itemId ?? "Unknown"),
-      inline: true,
-    }
-  );
-  return embed;
-}
-function createMarketplaceEmbed(item: VRFSMarketplaceItem): EmbedBuilder {
-  const name = String((item.title ?? item.name ?? getSku(item)) || "Marketplace Item");
-  const embed = createEmbed(name, getMarketplaceActive(item) ? 0x2ecc71 : 0xe74c3c);
-  embed.setDescription(
-    `ID \`#${item.id}\`\n${getSku(item) ? `\`${getSku(item)}\`` : "No SKU available"}`
-  );
-  const image = getMarketplaceImage(item);
-  if (image) embed.setImage(image);
-  const creator = getMarketplaceCreatorName(item);
-  const creatorId = getMarketplaceCreatorId(item);
-  embed.addFields(
-    { name: "Type", value: marketType(item), inline: true },
-    {
-      name: "Price",
-      value: formatMarketPrice(item),
-      inline: true,
-    },
-    {
-      name: "Owners",
-      value: formatNumber(getMarketplaceOwners(item)),
-      inline: true,
-    },
-    {
-      name: "Creator",
-      value: creatorId ? `${creator}\nID \`${creatorId}\`` : creator,
-      inline: false,
-    },
-    {
-      name: "Availability",
-      value: getMarketplaceActive(item) ? "Available" : "Unavailable",
-      inline: true,
-    },
-    {
-      name: "Gifts",
-      value: formatNumber(item.gifts_left),
-      inline: true,
-    }
-  );
-  return embed;
-}
-function createPlayerEmbed(
-  id: number,
-  username: string,
-  profile?: VRFSProfile,
-  outfits?: VRFSOutfit[]
-): EmbedBuilder {
-  const embed = createEmbed(username);
-  embed.setDescription(`ID \`${id}\``);
-  embed.setThumbnail(avatarUrl(id));
-  embed.addFields(
-    {
-      name: "Country",
-      value: profile?.profileCountry || "Unknown",
-      inline: true,
-    },
-    {
-      name: "Followers",
-      value: formatNumber(profile?.followersCount),
-      inline: true,
-    },
-    {
-      name: "Public Outfits",
-      value: formatNumber(outfits?.length ?? 0),
-      inline: true,
-    }
-  );
-  const socials: Array<[string, string | undefined]> = [
-    ["User Tag", profile?.userTag],
-    ["TikTok", profile?.tiktokName],
-    ["YouTube", profile?.youtubeName],
-    ["Twitch", profile?.twitchName],
-    ["Instagram", profile?.instagramName],
-  ];
-  const availableSocials = socials.filter(([, value]) => value);
-  if (availableSocials.length > 0) {
-    embed.addFields(
-      availableSocials.map(([name, value]) => ({
-        name,
-        value: truncate(String(value), 1024),
-        inline: true,
-      }))
-    );
-  }
-  if (outfits && outfits.length > 0) {
-    const latest = outfits[0];
-    const slots = latest?.slots ?? {};
-    const slotLines = Object.entries(slots)
-      .filter(([, value]) => value)
-      .slice(0, 20)
-      .map(([slot, sku]) => `**${slot}**\n\`${sku}\``);
-    if (slotLines.length) {
-      embed.addFields({
-        name: "Latest Outfit",
-        value: truncate(slotLines.join("\n"), 1024),
-        inline: false,
-      });
-    }
-  }
-  return embed;
-}
-function createLockerSummaryEmbed(
-  id: number,
-  username: string,
-  catalog: VRFSItem[],
-  ownership: OwnershipCheckResult
-): EmbedBuilder {
-  const owned = ownership.owned.length;
-  const notOwned = ownership.notOwned.length;
-  const unknown = ownership.unknown.length;
-  const completion =
-    catalog.length > 0 ? ((owned / catalog.length) * 100).toFixed(1) : "0.0";
-  const ownedItems = catalog.filter((item) =>
-    ownership.owned.includes(getSku(item))
-  );
-  const free = ownedItems.filter(isItemFree).length;
-  const paid = Math.max(0, owned - free);
-  const sections = new Map<string, number>();
-  for (const item of ownedItems) {
-    const section = getSection(item);
-    sections.set(section, (sections.get(section) ?? 0) + 1);
-  }
-  const sectionLines = [...sections.entries()]
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 12)
-    .map(([section, count]) => `**${section}** — ${count.toLocaleString()}`);
-  const color =
-    unknown > 0 ? 0xf1c40f : 0x2ecc71;
-  const embed = createEmbed(
-    "Locker",
-    color,
-    `**${username}**\nID \`${id}\`\n\n**${owned.toLocaleString()} / ${catalog.length.toLocaleString()}** items owned\n${completion}% collection`
-  );
-  embed.setThumbnail(avatarUrl(id));
-  embed.addFields(
-    { name: "Free", value: free.toLocaleString(), inline: true },
-    { name: "Paid", value: paid.toLocaleString(), inline: true },
-    { name: "Unconfirmed", value: unknown.toLocaleString(), inline: true },
-    { name: "Not Owned", value: notOwned.toLocaleString(), inline: true }
-  );
-  if (sectionLines.length) {
-    embed.addFields({
-      name: "Collection by Section",
-      value: truncate(sectionLines.join("\n"), 1024),
-      inline: false,
-    });
-  }
-  if (ownership.health !== "ok") {
-    embed.addFields({
-      name: "Status",
-      value: "Some items could not be confirmed.",
-      inline: false,
-    });
-  }
-  return embed;
-}
-interface VRFSPage {
-  id: string;
-  type: "catalog" | "marketplace" | "locker";
-  userId: string;
-  createdAt: number;
-  page: number;
-  pageSize: number;
-  items: VRFSItem[] | VRFSMarketplaceItem[];
-  title: string;
-  description?: string;
-}
-function paginate<T>(items: T[], page: number, size: number) {
-  const totalPages = Math.max(1, Math.ceil(items.length / size));
-  const safePage = Math.max(0, Math.min(page, totalPages - 1));
-  return {
-    page: safePage,
-    totalPages,
-    items: items.slice(safePage * size, safePage * size + size),
-  };
-}
-function createPaginationRow(
-  id: string,
-  page: number,
-  totalPages: number
-): ActionRowBuilder<ButtonBuilder> {
-  return new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`vrfs_page:${id}:prev`)
-      .setLabel("⬅️")
-      .setStyle(ButtonStyle.Secondary)
-      .setDisabled(page <= 0),
-    new ButtonBuilder()
-      .setCustomId(`vrfs_page:${id}:current`)
-      .setLabel(`${page + 1} / ${totalPages}`)
-      .setStyle(ButtonStyle.Primary)
-      .setDisabled(true),
-    new ButtonBuilder()
-      .setCustomId(`vrfs_page:${id}:next`)
-      .setLabel("➡️")
-      .setStyle(ButtonStyle.Secondary)
-      .setDisabled(page >= totalPages - 1)
-  );
-}
-function createCatalogPage(
-  session: VRFSPage
-): V2Payload {
-  const result = paginate(
-    session.items as VRFSItem[],
-    session.page,
-    session.pageSize
-  );
-  const embed = createEmbed(
-    session.title,
-    0x5865f2,
-    session.description
-  );
-  const lines = result.items.map((item, index) => {
-    const position = result.page * session.pageSize + index + 1;
-    return `**${position}. ${truncate(getItemName(item), 80)}**\n\`${truncate(
-      getSku(item),
-      100
-    )}\` · ${getSection(item)} · ${formatItemPrice(item)}`;
-  });
-  embed.addFields({
-    name: "Items",
-    value: truncate(lines.join("\n\n") || "No items found.", 4096),
-    inline: false,
-  });
-  const container = embedToV2Container(embed);
-  if (result.totalPages > 1) {
-    container.addActionRowComponents(
-      createPaginationRow(session.id, result.page, result.totalPages)
-    );
-  }
-  return { components: [container], flags: MessageFlags.IsComponentsV2 };
-}
-function createMarketplacePage(
-  session: VRFSPage
-): V2Payload {
-  const result = paginate(
-    session.items as VRFSMarketplaceItem[],
-    session.page,
-    session.pageSize
-  );
-  const embed = createEmbed(
-    session.title,
-    0x5865f2,
-    session.description
-  );
-  const lines = result.items.map((item, index) => {
-    const position = result.page * session.pageSize + index + 1;
-    return `**${position}. ${truncate(
-      String(item.title ?? item.name ?? getSku(item)),
-      80
-    )}**\n#${item.id} · ${marketType(item)} · ${formatNumber(
-      getMarketplaceOwners(item)
-    )} owners`;
-  });
-  embed.addFields({
-    name: "Items",
-    value: truncate(lines.join("\n\n") || "No items found.", 4096),
-    inline: false,
-  });
-  const container = embedToV2Container(embed);
-  if (result.totalPages > 1) {
-    container.addActionRowComponents(
-      createPaginationRow(session.id, result.page, result.totalPages)
-    );
-  }
-  return { components: [container], flags: MessageFlags.IsComponentsV2 };
-}
-function createLockerPage(
-  session: VRFSPage
-): V2Payload {
-  const result = paginate(
-    session.items as VRFSItem[],
-    session.page,
-    session.pageSize
-  );
-  const embed = createEmbed(
-    session.title,
-    0x2ecc71,
-    session.description
-  );
-  const lines = result.items.map((item, index) => {
-    const position = result.page * session.pageSize + index + 1;
-    return `**${position}. ${truncate(getItemName(item), 80)}**\n\`${truncate(
-      getSku(item),
-      100
-    )}\` · ${getSection(item)} · ${formatItemPrice(item)}`;
-  });
-  embed.addFields({
-    name: "Owned Items",
-    value: truncate(lines.join("\n\n") || "No owned items.", 4096),
-    inline: false,
-  });
-  const image = result.items.length
-    ? getCatalogImage(result.items[0])
-    : null;
-  if (image) embed.setImage(image);
-  const container = embedToV2Container(embed);
-  if (result.totalPages > 1) {
-    container.addActionRowComponents(
-      createPaginationRow(session.id, result.page, result.totalPages)
-    );
-  }
-  return { components: [container], flags: MessageFlags.IsComponentsV2 };
-}
+// [VRFS ARCHIVED] function formatNumber(value: unknown): string {
+// [VRFS ARCHIVED]   const n = Number(value ?? 0);
+// [VRFS ARCHIVED]   return Number.isFinite(n) ? n.toLocaleString() : "0";
+// [VRFS ARCHIVED] }
+// [VRFS ARCHIVED] function formatCredits(value: unknown): string {
+// [VRFS ARCHIVED]   const n = Number(value);
+// [VRFS ARCHIVED]   if (!Number.isFinite(n)) return "Unknown";
+// [VRFS ARCHIVED]   return `${n.toLocaleString()} Credits`;
+// [VRFS ARCHIVED] }
+// [VRFS ARCHIVED] function formatItemPrice(item: VRFSItem): string {
+// [VRFS ARCHIVED]   if (isItemFree(item)) return "Free";
+// [VRFS ARCHIVED]   const credits = getCreditsForItem(item);
+// [VRFS ARCHIVED]   if (credits !== null) return formatCredits(credits);
+// [VRFS ARCHIVED]   return "Paid";
+// [VRFS ARCHIVED] }
+// [VRFS ARCHIVED] function formatMarketPrice(item: VRFSMarketplaceItem): string {
+// [VRFS ARCHIVED]   const price = Number(item.coins_price);
+// [VRFS ARCHIVED]   return Number.isFinite(price) ? formatCredits(price) : "Unknown";
+// [VRFS ARCHIVED] }
+// [VRFS ARCHIVED] function marketType(item: VRFSMarketplaceItem): string {
+// [VRFS ARCHIVED]   const category = String(item.category_id ?? item.category ?? "");
+// [VRFS ARCHIVED]   const map: Record<string, string> = {
+// [VRFS ARCHIVED]     "1": "Boots",
+// [VRFS ARCHIVED]     "2": "Glasses",
+// [VRFS ARCHIVED]     "3": "Gloves",
+// [VRFS ARCHIVED]     "4": "Hat",
+// [VRFS ARCHIVED]     "5": "Mask",
+// [VRFS ARCHIVED]     "6": "Scarf",
+// [VRFS ARCHIVED]     "7": "Other",
+// [VRFS ARCHIVED]   };
+// [VRFS ARCHIVED]   if (map[category]) return map[category];
+// [VRFS ARCHIVED]   const sku = getSku(item).toLowerCase();
+// [VRFS ARCHIVED]   if (/boot|shoe/.test(sku)) return "Boots";
+// [VRFS ARCHIVED]   if (/glass|goggle/.test(sku)) return "Glasses";
+// [VRFS ARCHIVED]   if (/glove|hand/.test(sku)) return "Gloves";
+// [VRFS ARCHIVED]   if (/hat|cap|helmet/.test(sku)) return "Hat";
+// [VRFS ARCHIVED]   if (/mask|face/.test(sku)) return "Mask";
+// [VRFS ARCHIVED]   if (/scarf|neck/.test(sku)) return "Scarf";
+// [VRFS ARCHIVED]   return "Other";
+// [VRFS ARCHIVED] }
+// [VRFS ARCHIVED] function getCatalogImage(item: VRFSItem): string | null {
+// [VRFS ARCHIVED]   const candidates = [
+// [VRFS ARCHIVED]     item.image,
+// [VRFS ARCHIVED]     item.image_url,
+// [VRFS ARCHIVED]     item.thumbnail_url,
+// [VRFS ARCHIVED]     item.texture_url,
+// [VRFS ARCHIVED]     item.thumbnail,
+// [VRFS ARCHIVED]     typeof item.thumb === "string"
+// [VRFS ARCHIVED]       ? `https://vrfs.sebyplay.xyz/lockerchecker/assets/thumbs/${item.thumb}`
+// [VRFS ARCHIVED]       : null,
+// [VRFS ARCHIVED]   ];
+// [VRFS ARCHIVED]   for (const candidate of candidates) {
+// [VRFS ARCHIVED]     const url = safeUrl(candidate);
+// [VRFS ARCHIVED]     if (url) return url;
+// [VRFS ARCHIVED]   }
+// [VRFS ARCHIVED]   return null;
+// [VRFS ARCHIVED] }
+// [VRFS ARCHIVED] function getMarketplaceImage(item: VRFSMarketplaceItem): string | null {
+// [VRFS ARCHIVED]   const candidates = [
+// [VRFS ARCHIVED]     item.thumbnail_url,
+// [VRFS ARCHIVED]     item.texture_url,
+// [VRFS ARCHIVED]     item.thumbnail,
+// [VRFS ARCHIVED]     item.image_url,
+// [VRFS ARCHIVED]   ];
+// [VRFS ARCHIVED]   for (const candidate of candidates) {
+// [VRFS ARCHIVED]     const url = safeUrl(candidate);
+// [VRFS ARCHIVED]     if (url) return url;
+// [VRFS ARCHIVED]   }
+// [VRFS ARCHIVED]   return null;
+// [VRFS ARCHIVED] }
+// [VRFS ARCHIVED] function avatarUrl(id: number): string {
+// [VRFS ARCHIVED]   return `https://userpic.vrfs.org/avatar/avatar-pics/${encodeURIComponent(
+// [VRFS ARCHIVED]     String(id)
+// [VRFS ARCHIVED]   )}.png`;
+// [VRFS ARCHIVED] }
+// [VRFS ARCHIVED] function createEmbed(
+// [VRFS ARCHIVED]   title?: string,
+// [VRFS ARCHIVED]   color = 0x5865f2,
+// [VRFS ARCHIVED]   description?: string
+// [VRFS ARCHIVED] ): EmbedBuilder {
+// [VRFS ARCHIVED]   const embed = new EmbedBuilder().setColor(color);
+// [VRFS ARCHIVED]   if (title) embed.setTitle(truncate(title, 256));
+// [VRFS ARCHIVED]   if (description) embed.setDescription(truncate(description, 4096));
+// [VRFS ARCHIVED]   return embed;
+// [VRFS ARCHIVED] }
+// [VRFS ARCHIVED] function createItemEmbed(item: VRFSItem): EmbedBuilder {
+// [VRFS ARCHIVED]   const name = getItemName(item);
+// [VRFS ARCHIVED]   const embed = createEmbed(name);
+// [VRFS ARCHIVED]   const sku = getSku(item);
+// [VRFS ARCHIVED]   if (sku) embed.setDescription(`\`${truncate(sku, 200)}\``);
+// [VRFS ARCHIVED]   const image = getCatalogImage(item);
+// [VRFS ARCHIVED]   if (image) embed.setImage(image);
+// [VRFS ARCHIVED]   embed.addFields(
+// [VRFS ARCHIVED]     { name: "Section", value: truncate(getSection(item), 1024), inline: true },
+// [VRFS ARCHIVED]     { name: "Price", value: formatItemPrice(item), inline: true },
+// [VRFS ARCHIVED]     {
+// [VRFS ARCHIVED]       name: "ID",
+// [VRFS ARCHIVED]       value: String(item.id ?? item.item_id ?? item.itemId ?? "Unknown"),
+// [VRFS ARCHIVED]       inline: true,
+// [VRFS ARCHIVED]     }
+// [VRFS ARCHIVED]   );
+// [VRFS ARCHIVED]   return embed;
+// [VRFS ARCHIVED] }
+// [VRFS ARCHIVED] function createMarketplaceEmbed(item: VRFSMarketplaceItem): EmbedBuilder {
+// [VRFS ARCHIVED]   const name = String((item.title ?? item.name ?? getSku(item)) || "Marketplace Item");
+// [VRFS ARCHIVED]   const embed = createEmbed(name, getMarketplaceActive(item) ? 0x2ecc71 : 0xe74c3c);
+// [VRFS ARCHIVED]   embed.setDescription(
+// [VRFS ARCHIVED]     `ID \`#${item.id}\`\n${getSku(item) ? `\`${getSku(item)}\`` : "No SKU available"}`
+// [VRFS ARCHIVED]   );
+// [VRFS ARCHIVED]   const image = getMarketplaceImage(item);
+// [VRFS ARCHIVED]   if (image) embed.setImage(image);
+// [VRFS ARCHIVED]   const creator = getMarketplaceCreatorName(item);
+// [VRFS ARCHIVED]   const creatorId = getMarketplaceCreatorId(item);
+// [VRFS ARCHIVED]   embed.addFields(
+// [VRFS ARCHIVED]     { name: "Type", value: marketType(item), inline: true },
+// [VRFS ARCHIVED]     {
+// [VRFS ARCHIVED]       name: "Price",
+// [VRFS ARCHIVED]       value: formatMarketPrice(item),
+// [VRFS ARCHIVED]       inline: true,
+// [VRFS ARCHIVED]     },
+// [VRFS ARCHIVED]     {
+// [VRFS ARCHIVED]       name: "Owners",
+// [VRFS ARCHIVED]       value: formatNumber(getMarketplaceOwners(item)),
+// [VRFS ARCHIVED]       inline: true,
+// [VRFS ARCHIVED]     },
+// [VRFS ARCHIVED]     {
+// [VRFS ARCHIVED]       name: "Creator",
+// [VRFS ARCHIVED]       value: creatorId ? `${creator}\nID \`${creatorId}\`` : creator,
+// [VRFS ARCHIVED]       inline: false,
+// [VRFS ARCHIVED]     },
+// [VRFS ARCHIVED]     {
+// [VRFS ARCHIVED]       name: "Availability",
+// [VRFS ARCHIVED]       value: getMarketplaceActive(item) ? "Available" : "Unavailable",
+// [VRFS ARCHIVED]       inline: true,
+// [VRFS ARCHIVED]     },
+// [VRFS ARCHIVED]     {
+// [VRFS ARCHIVED]       name: "Gifts",
+// [VRFS ARCHIVED]       value: formatNumber(item.gifts_left),
+// [VRFS ARCHIVED]       inline: true,
+// [VRFS ARCHIVED]     }
+// [VRFS ARCHIVED]   );
+// [VRFS ARCHIVED]   return embed;
+// [VRFS ARCHIVED] }
+// [VRFS ARCHIVED] function createPlayerEmbed(
+// [VRFS ARCHIVED]   id: number,
+// [VRFS ARCHIVED]   username: string,
+// [VRFS ARCHIVED]   profile?: VRFSProfile,
+// [VRFS ARCHIVED]   outfits?: VRFSOutfit[]
+// [VRFS ARCHIVED] ): EmbedBuilder {
+// [VRFS ARCHIVED]   const embed = createEmbed(username);
+// [VRFS ARCHIVED]   embed.setDescription(`ID \`${id}\``);
+// [VRFS ARCHIVED]   embed.setThumbnail(avatarUrl(id));
+// [VRFS ARCHIVED]   embed.addFields(
+// [VRFS ARCHIVED]     {
+// [VRFS ARCHIVED]       name: "Country",
+// [VRFS ARCHIVED]       value: profile?.profileCountry || "Unknown",
+// [VRFS ARCHIVED]       inline: true,
+// [VRFS ARCHIVED]     },
+// [VRFS ARCHIVED]     {
+// [VRFS ARCHIVED]       name: "Followers",
+// [VRFS ARCHIVED]       value: formatNumber(profile?.followersCount),
+// [VRFS ARCHIVED]       inline: true,
+// [VRFS ARCHIVED]     },
+// [VRFS ARCHIVED]     {
+// [VRFS ARCHIVED]       name: "Public Outfits",
+// [VRFS ARCHIVED]       value: formatNumber(outfits?.length ?? 0),
+// [VRFS ARCHIVED]       inline: true,
+// [VRFS ARCHIVED]     }
+// [VRFS ARCHIVED]   );
+// [VRFS ARCHIVED]   const socials: Array<[string, string | undefined]> = [
+// [VRFS ARCHIVED]     ["User Tag", profile?.userTag],
+// [VRFS ARCHIVED]     ["TikTok", profile?.tiktokName],
+// [VRFS ARCHIVED]     ["YouTube", profile?.youtubeName],
+// [VRFS ARCHIVED]     ["Twitch", profile?.twitchName],
+// [VRFS ARCHIVED]     ["Instagram", profile?.instagramName],
+// [VRFS ARCHIVED]   ];
+// [VRFS ARCHIVED]   const availableSocials = socials.filter(([, value]) => value);
+// [VRFS ARCHIVED]   if (availableSocials.length > 0) {
+// [VRFS ARCHIVED]     embed.addFields(
+// [VRFS ARCHIVED]       availableSocials.map(([name, value]) => ({
+// [VRFS ARCHIVED]         name,
+// [VRFS ARCHIVED]         value: truncate(String(value), 1024),
+// [VRFS ARCHIVED]         inline: true,
+// [VRFS ARCHIVED]       }))
+// [VRFS ARCHIVED]     );
+// [VRFS ARCHIVED]   }
+// [VRFS ARCHIVED]   if (outfits && outfits.length > 0) {
+// [VRFS ARCHIVED]     const latest = outfits[0];
+// [VRFS ARCHIVED]     const slots = latest?.slots ?? {};
+// [VRFS ARCHIVED]     const slotLines = Object.entries(slots)
+// [VRFS ARCHIVED]       .filter(([, value]) => value)
+// [VRFS ARCHIVED]       .slice(0, 20)
+// [VRFS ARCHIVED]       .map(([slot, sku]) => `**${slot}**\n\`${sku}\``);
+// [VRFS ARCHIVED]     if (slotLines.length) {
+// [VRFS ARCHIVED]       embed.addFields({
+// [VRFS ARCHIVED]         name: "Latest Outfit",
+// [VRFS ARCHIVED]         value: truncate(slotLines.join("\n"), 1024),
+// [VRFS ARCHIVED]         inline: false,
+// [VRFS ARCHIVED]       });
+// [VRFS ARCHIVED]     }
+// [VRFS ARCHIVED]   }
+// [VRFS ARCHIVED]   return embed;
+// [VRFS ARCHIVED] }
+// [VRFS ARCHIVED] function createLockerSummaryEmbed(
+// [VRFS ARCHIVED]   id: number,
+// [VRFS ARCHIVED]   username: string,
+// [VRFS ARCHIVED]   catalog: VRFSItem[],
+// [VRFS ARCHIVED]   ownership: OwnershipCheckResult
+// [VRFS ARCHIVED] ): EmbedBuilder {
+// [VRFS ARCHIVED]   const owned = ownership.owned.length;
+// [VRFS ARCHIVED]   const notOwned = ownership.notOwned.length;
+// [VRFS ARCHIVED]   const unknown = ownership.unknown.length;
+// [VRFS ARCHIVED]   const completion =
+// [VRFS ARCHIVED]     catalog.length > 0 ? ((owned / catalog.length) * 100).toFixed(1) : "0.0";
+// [VRFS ARCHIVED]   const ownedItems = catalog.filter((item) =>
+// [VRFS ARCHIVED]     ownership.owned.includes(getSku(item))
+// [VRFS ARCHIVED]   );
+// [VRFS ARCHIVED]   const free = ownedItems.filter(isItemFree).length;
+// [VRFS ARCHIVED]   const paid = Math.max(0, owned - free);
+// [VRFS ARCHIVED]   const sections = new Map<string, number>();
+// [VRFS ARCHIVED]   for (const item of ownedItems) {
+// [VRFS ARCHIVED]     const section = getSection(item);
+// [VRFS ARCHIVED]     sections.set(section, (sections.get(section) ?? 0) + 1);
+// [VRFS ARCHIVED]   }
+// [VRFS ARCHIVED]   const sectionLines = [...sections.entries()]
+// [VRFS ARCHIVED]     .sort((a, b) => b[1] - a[1])
+// [VRFS ARCHIVED]     .slice(0, 12)
+// [VRFS ARCHIVED]     .map(([section, count]) => `**${section}** — ${count.toLocaleString()}`);
+// [VRFS ARCHIVED]   const color =
+// [VRFS ARCHIVED]     unknown > 0 ? 0xf1c40f : 0x2ecc71;
+// [VRFS ARCHIVED]   const embed = createEmbed(
+// [VRFS ARCHIVED]     "Locker",
+// [VRFS ARCHIVED]     color,
+// [VRFS ARCHIVED]     `**${username}**\nID \`${id}\`\n\n**${owned.toLocaleString()} / ${catalog.length.toLocaleString()}** items owned\n${completion}% collection`
+// [VRFS ARCHIVED]   );
+// [VRFS ARCHIVED]   embed.setThumbnail(avatarUrl(id));
+// [VRFS ARCHIVED]   embed.addFields(
+// [VRFS ARCHIVED]     { name: "Free", value: free.toLocaleString(), inline: true },
+// [VRFS ARCHIVED]     { name: "Paid", value: paid.toLocaleString(), inline: true },
+// [VRFS ARCHIVED]     { name: "Unconfirmed", value: unknown.toLocaleString(), inline: true },
+// [VRFS ARCHIVED]     { name: "Not Owned", value: notOwned.toLocaleString(), inline: true }
+// [VRFS ARCHIVED]   );
+// [VRFS ARCHIVED]   if (sectionLines.length) {
+// [VRFS ARCHIVED]     embed.addFields({
+// [VRFS ARCHIVED]       name: "Collection by Section",
+// [VRFS ARCHIVED]       value: truncate(sectionLines.join("\n"), 1024),
+// [VRFS ARCHIVED]       inline: false,
+// [VRFS ARCHIVED]     });
+// [VRFS ARCHIVED]   }
+// [VRFS ARCHIVED]   if (ownership.health !== "ok") {
+// [VRFS ARCHIVED]     embed.addFields({
+// [VRFS ARCHIVED]       name: "Status",
+// [VRFS ARCHIVED]       value: "Some items could not be confirmed.",
+// [VRFS ARCHIVED]       inline: false,
+// [VRFS ARCHIVED]     });
+// [VRFS ARCHIVED]   }
+// [VRFS ARCHIVED]   return embed;
+// [VRFS ARCHIVED] }
+// [VRFS ARCHIVED] interface VRFSPage {
+// [VRFS ARCHIVED]   id: string;
+// [VRFS ARCHIVED]   type: "catalog" | "marketplace" | "locker";
+// [VRFS ARCHIVED]   userId: string;
+// [VRFS ARCHIVED]   createdAt: number;
+// [VRFS ARCHIVED]   page: number;
+// [VRFS ARCHIVED]   pageSize: number;
+// [VRFS ARCHIVED]   items: VRFSItem[] | VRFSMarketplaceItem[];
+// [VRFS ARCHIVED]   title: string;
+// [VRFS ARCHIVED]   description?: string;
+// [VRFS ARCHIVED] }
+// [VRFS ARCHIVED] function paginate<T>(items: T[], page: number, size: number) {
+// [VRFS ARCHIVED]   const totalPages = Math.max(1, Math.ceil(items.length / size));
+// [VRFS ARCHIVED]   const safePage = Math.max(0, Math.min(page, totalPages - 1));
+// [VRFS ARCHIVED]   return {
+// [VRFS ARCHIVED]     page: safePage,
+// [VRFS ARCHIVED]     totalPages,
+// [VRFS ARCHIVED]     items: items.slice(safePage * size, safePage * size + size),
+// [VRFS ARCHIVED]   };
+// [VRFS ARCHIVED] }
+// [VRFS ARCHIVED] function createPaginationRow(
+// [VRFS ARCHIVED]   id: string,
+// [VRFS ARCHIVED]   page: number,
+// [VRFS ARCHIVED]   totalPages: number
+// [VRFS ARCHIVED] ): ActionRowBuilder<ButtonBuilder> {
+// [VRFS ARCHIVED]   return new ActionRowBuilder<ButtonBuilder>().addComponents(
+// [VRFS ARCHIVED]     new ButtonBuilder()
+// [VRFS ARCHIVED]       .setCustomId(`vrfs_page:${id}:prev`)
+// [VRFS ARCHIVED]       .setLabel("⬅️")
+// [VRFS ARCHIVED]       .setStyle(ButtonStyle.Secondary)
+// [VRFS ARCHIVED]       .setDisabled(page <= 0),
+// [VRFS ARCHIVED]     new ButtonBuilder()
+// [VRFS ARCHIVED]       .setCustomId(`vrfs_page:${id}:current`)
+// [VRFS ARCHIVED]       .setLabel(`${page + 1} / ${totalPages}`)
+// [VRFS ARCHIVED]       .setStyle(ButtonStyle.Primary)
+// [VRFS ARCHIVED]       .setDisabled(true),
+// [VRFS ARCHIVED]     new ButtonBuilder()
+// [VRFS ARCHIVED]       .setCustomId(`vrfs_page:${id}:next`)
+// [VRFS ARCHIVED]       .setLabel("➡️")
+// [VRFS ARCHIVED]       .setStyle(ButtonStyle.Secondary)
+// [VRFS ARCHIVED]       .setDisabled(page >= totalPages - 1)
+// [VRFS ARCHIVED]   );
+// [VRFS ARCHIVED] }
+// [VRFS ARCHIVED] function createCatalogPage(
+// [VRFS ARCHIVED]   session: VRFSPage
+// [VRFS ARCHIVED] ): V2Payload {
+// [VRFS ARCHIVED]   const result = paginate(
+// [VRFS ARCHIVED]     session.items as VRFSItem[],
+// [VRFS ARCHIVED]     session.page,
+// [VRFS ARCHIVED]     session.pageSize
+// [VRFS ARCHIVED]   );
+// [VRFS ARCHIVED]   const embed = createEmbed(
+// [VRFS ARCHIVED]     session.title,
+// [VRFS ARCHIVED]     0x5865f2,
+// [VRFS ARCHIVED]     session.description
+// [VRFS ARCHIVED]   );
+// [VRFS ARCHIVED]   const lines = result.items.map((item, index) => {
+// [VRFS ARCHIVED]     const position = result.page * session.pageSize + index + 1;
+// [VRFS ARCHIVED]     return `**${position}. ${truncate(getItemName(item), 80)}**\n\`${truncate(
+// [VRFS ARCHIVED]       getSku(item),
+// [VRFS ARCHIVED]       100
+// [VRFS ARCHIVED]     )}\` · ${getSection(item)} · ${formatItemPrice(item)}`;
+// [VRFS ARCHIVED]   });
+// [VRFS ARCHIVED]   embed.addFields({
+// [VRFS ARCHIVED]     name: "Items",
+// [VRFS ARCHIVED]     value: truncate(lines.join("\n\n") || "No items found.", 4096),
+// [VRFS ARCHIVED]     inline: false,
+// [VRFS ARCHIVED]   });
+// [VRFS ARCHIVED]   const container = embedToV2Container(embed);
+// [VRFS ARCHIVED]   if (result.totalPages > 1) {
+// [VRFS ARCHIVED]     container.addActionRowComponents(
+// [VRFS ARCHIVED]       createPaginationRow(session.id, result.page, result.totalPages)
+// [VRFS ARCHIVED]     );
+// [VRFS ARCHIVED]   }
+// [VRFS ARCHIVED]   return { components: [container], flags: MessageFlags.IsComponentsV2 };
+// [VRFS ARCHIVED] }
+// [VRFS ARCHIVED] function createMarketplacePage(
+// [VRFS ARCHIVED]   session: VRFSPage
+// [VRFS ARCHIVED] ): V2Payload {
+// [VRFS ARCHIVED]   const result = paginate(
+// [VRFS ARCHIVED]     session.items as VRFSMarketplaceItem[],
+// [VRFS ARCHIVED]     session.page,
+// [VRFS ARCHIVED]     session.pageSize
+// [VRFS ARCHIVED]   );
+// [VRFS ARCHIVED]   const embed = createEmbed(
+// [VRFS ARCHIVED]     session.title,
+// [VRFS ARCHIVED]     0x5865f2,
+// [VRFS ARCHIVED]     session.description
+// [VRFS ARCHIVED]   );
+// [VRFS ARCHIVED]   const lines = result.items.map((item, index) => {
+// [VRFS ARCHIVED]     const position = result.page * session.pageSize + index + 1;
+// [VRFS ARCHIVED]     return `**${position}. ${truncate(
+// [VRFS ARCHIVED]       String(item.title ?? item.name ?? getSku(item)),
+// [VRFS ARCHIVED]       80
+// [VRFS ARCHIVED]     )}**\n#${item.id} · ${marketType(item)} · ${formatNumber(
+// [VRFS ARCHIVED]       getMarketplaceOwners(item)
+// [VRFS ARCHIVED]     )} owners`;
+// [VRFS ARCHIVED]   });
+// [VRFS ARCHIVED]   embed.addFields({
+// [VRFS ARCHIVED]     name: "Items",
+// [VRFS ARCHIVED]     value: truncate(lines.join("\n\n") || "No items found.", 4096),
+// [VRFS ARCHIVED]     inline: false,
+// [VRFS ARCHIVED]   });
+// [VRFS ARCHIVED]   const container = embedToV2Container(embed);
+// [VRFS ARCHIVED]   if (result.totalPages > 1) {
+// [VRFS ARCHIVED]     container.addActionRowComponents(
+// [VRFS ARCHIVED]       createPaginationRow(session.id, result.page, result.totalPages)
+// [VRFS ARCHIVED]     );
+// [VRFS ARCHIVED]   }
+// [VRFS ARCHIVED]   return { components: [container], flags: MessageFlags.IsComponentsV2 };
+// [VRFS ARCHIVED] }
+// [VRFS ARCHIVED] function createLockerPage(
+// [VRFS ARCHIVED]   session: VRFSPage
+// [VRFS ARCHIVED] ): V2Payload {
+// [VRFS ARCHIVED]   const result = paginate(
+// [VRFS ARCHIVED]     session.items as VRFSItem[],
+// [VRFS ARCHIVED]     session.page,
+// [VRFS ARCHIVED]     session.pageSize
+// [VRFS ARCHIVED]   );
+// [VRFS ARCHIVED]   const embed = createEmbed(
+// [VRFS ARCHIVED]     session.title,
+// [VRFS ARCHIVED]     0x2ecc71,
+// [VRFS ARCHIVED]     session.description
+// [VRFS ARCHIVED]   );
+// [VRFS ARCHIVED]   const lines = result.items.map((item, index) => {
+// [VRFS ARCHIVED]     const position = result.page * session.pageSize + index + 1;
+// [VRFS ARCHIVED]     return `**${position}. ${truncate(getItemName(item), 80)}**\n\`${truncate(
+// [VRFS ARCHIVED]       getSku(item),
+// [VRFS ARCHIVED]       100
+// [VRFS ARCHIVED]     )}\` · ${getSection(item)} · ${formatItemPrice(item)}`;
+// [VRFS ARCHIVED]   });
+// [VRFS ARCHIVED]   embed.addFields({
+// [VRFS ARCHIVED]     name: "Owned Items",
+// [VRFS ARCHIVED]     value: truncate(lines.join("\n\n") || "No owned items.", 4096),
+// [VRFS ARCHIVED]     inline: false,
+// [VRFS ARCHIVED]   });
+// [VRFS ARCHIVED]   const image = result.items.length
+// [VRFS ARCHIVED]     ? getCatalogImage(result.items[0])
+// [VRFS ARCHIVED]     : null;
+// [VRFS ARCHIVED]   if (image) embed.setImage(image);
+// [VRFS ARCHIVED]   const container = embedToV2Container(embed);
+// [VRFS ARCHIVED]   if (result.totalPages > 1) {
+// [VRFS ARCHIVED]     container.addActionRowComponents(
+// [VRFS ARCHIVED]       createPaginationRow(session.id, result.page, result.totalPages)
+// [VRFS ARCHIVED]     );
+// [VRFS ARCHIVED]   }
+// [VRFS ARCHIVED]   return { components: [container], flags: MessageFlags.IsComponentsV2 };
+// [VRFS ARCHIVED] }
 export class BotManager {
   private client: Client;
   private commandsRegistered = false;
   private presenceInterval: NodeJS.Timeout | null = null;
   private cleanupInterval: NodeJS.Timeout | null = null;
   private verificationInterval: NodeJS.Timeout | null = null;
-  private vrfsCleanupInterval: NodeJS.Timeout | null = null;
-  private vrfsPages = new Map<string, VRFSPage>();
+  private lastPresenceUpdate = 0;
+  private presenceUpdateInFlight: Promise<void> | null = null;
+// [VRFS ARCHIVED]   private vrfsCleanupInterval: NodeJS.Timeout | null = null;
+// [VRFS ARCHIVED]   private vrfsPages = new Map<string, VRFSPage>();
   private giveawayPages = new Map<string, GiveawayPageState>();
   public metrics = new MetricsCollector();
   public notifications: NotificationService;
@@ -1039,7 +1008,7 @@ export class BotManager {
     this.commands.set("eventtrack", this.eventTrackCommand.bind(this));
     this.commands.set("licenseadmin", this.licenseAdminCommand.bind(this));
     this.commands.set("revoke", this.revokeCommand.bind(this));
-    this.commands.set("vrfs", this.vrfsCommand.bind(this));
+// [VRFS ARCHIVED]     this.commands.set("vrfs", this.vrfsCommand.bind(this));
     this.client.on(
       "guildMemberUpdate",
       this.handleGuildMemberUpdate.bind(this)
@@ -1060,7 +1029,10 @@ export class BotManager {
       this.presenceInterval.unref?.();
       await this.purgeAndUpdatePresence();
       this.cleanupInterval = setInterval(
-        () => void this.purgeAndUpdatePresence(),
+        () => {
+          void this.purgeAndUpdatePresence();
+          this.cleanupPages();
+        },
         60_000
       );
       this.cleanupInterval.unref?.();
@@ -1074,11 +1046,11 @@ export class BotManager {
         300000
       );
       this.verificationInterval.unref?.();
-      this.vrfsCleanupInterval = setInterval(
-        () => this.cleanupVRFSPages(),
-        60_000
-      );
-      this.vrfsCleanupInterval.unref?.();
+// [VRFS ARCHIVED]       this.vrfsCleanupInterval = setInterval(
+// [VRFS ARCHIVED]         () => this.cleanupVRFSPages(),
+// [VRFS ARCHIVED]         60_000
+// [VRFS ARCHIVED]       );
+// [VRFS ARCHIVED]       this.vrfsCleanupInterval.unref?.();
     });
     this.client.on(
       "interactionCreate",
@@ -1139,10 +1111,10 @@ export class BotManager {
             await this.handleGiveawayPageButton(interaction);
             return;
           }
-          if (interaction.customId.startsWith("vrfs_page:")) {
-            await this.handleVRFSPageButton(interaction);
-            return;
-          }
+// [VRFS ARCHIVED]           if (interaction.customId.startsWith("vrfs_page:")) {
+// [VRFS ARCHIVED]             await this.handleVRFSPageButton(interaction);
+// [VRFS ARCHIVED]             return;
+// [VRFS ARCHIVED]           }
           return;
         }
         if (interaction.isModalSubmit()) {
@@ -1238,9 +1210,9 @@ export class BotManager {
     if (this.presenceInterval) clearInterval(this.presenceInterval);
     if (this.cleanupInterval) clearInterval(this.cleanupInterval);
     if (this.verificationInterval) clearInterval(this.verificationInterval);
-    if (this.vrfsCleanupInterval) clearInterval(this.vrfsCleanupInterval);
+// [VRFS ARCHIVED]     if (this.vrfsCleanupInterval) clearInterval(this.vrfsCleanupInterval);
     this.notifications.shutdown();
-    this.vrfsPages.clear();
+// [VRFS ARCHIVED]     this.vrfsPages.clear();
     await this.client.destroy();
   }
   public async sendGiveawayNotification(
@@ -1248,7 +1220,7 @@ export class BotManager {
   ): Promise<boolean> {
     this.notifications.enqueue(data, data.inviteUrl || "");
     this.metrics.recordDetection(Date.now() - data.detectedAt);
-    await this.updatePresence();
+    void this.updatePresence();
     return true;
   }
   private async sendNotificationPanel(): Promise<void> {
@@ -1367,11 +1339,11 @@ export class BotManager {
         });
       }
     }
-    await interaction.editReply({
-      content: `${typeLabel} notifications ${
+    await interaction.editReply(
+      v2EditPayload(createV2Container("Notification settings", `${typeLabel} notifications ${
         newState ? "enabled" : "disabled"
-      }.`,
-    });
+      }.`))
+    );
   }
   public async sendScrimNotification(data: any): Promise<boolean> {
     let channelId: string;
@@ -1421,14 +1393,7 @@ export class BotManager {
     const guildBanner =
       data.guildBanner || guild?.bannerURL({ size: 1024 }) || null;
     const memberCount = (data.memberCount || guild?.memberCount) ?? null;
-    let inviteUrl = data.inviteUrl || "No invite available";
-    if (inviteUrl === "No invite available" && data.guildId) {
-      inviteUrl = await this.resolveInviteUrl(
-        data.guildId,
-        data.channelId,
-        null
-      );
-    }
+    const inviteUrl = this.getFastInviteUrl(data.guildId, data.channelId, data.inviteUrl);
     let pingMention = "@everyone";
     if (data.type === "scrim") {
       const roleId = process.env.SCRIM_ROLE_ID;
@@ -1487,10 +1452,12 @@ export class BotManager {
         .setURL(messageUrl)
     );
     try {
+      const container = embedToV2Container(embed);
+      if (pingMention) addV2Text(container, pingMention);
+      container.addActionRowComponents(row);
       await channel.send({
-        content: pingMention,
-        embeds: [embed],
-        components: [row],
+        components: [container],
+        flags: MessageFlags.IsComponentsV2,
       });
       return true;
     } catch (error) {
@@ -1563,6 +1530,24 @@ export class BotManager {
       });
     }
   }
+  private getFastInviteUrl(
+    guildId: string | undefined,
+    channelId: string | undefined,
+    fallbackInvite?: string | null
+  ): string {
+    if (fallbackInvite && fallbackInvite.startsWith("http")) return fallbackInvite;
+    if (!guildId) return "No invite available";
+    const guild = this.client.guilds.cache.get(guildId);
+    if (!guild) return "No invite available";
+    if (guild.vanityURLCode) return `https://discord.gg/${guild.vanityURLCode}`;
+    const channel = channelId ? guild.channels.cache.get(channelId) : null;
+    if (channel && "createInvite" in channel) {
+      const cached = (channel as any).lastInviteUrl;
+      if (typeof cached === "string" && cached.startsWith("http")) return cached;
+    }
+    return "No invite available";
+  }
+
   private async resolveInviteUrl(
     guildId: string,
     channelId: string,
@@ -1630,14 +1615,7 @@ export class BotManager {
       if (!dmChannel) return false;
       const urlParts = messageUrl.split("/");
       const channelId = urlParts[5] || "";
-      let resolvedInvite = "No invite available";
-      if (guildId && channelId) {
-        resolvedInvite = await this.resolveInviteUrl(
-          guildId,
-          channelId,
-          inviteUrl
-        );
-      }
+      const resolvedInvite = this.getFastInviteUrl(guildId, channelId, inviteUrl);
       const endTimestamp = endsAt
         ? Math.floor(endsAt / 1000)
         : Math.floor((Date.now() + 3600000) / 1000);
@@ -1685,9 +1663,11 @@ export class BotManager {
           .setStyle(ButtonStyle.Link)
           .setURL(messageUrl)
       );
+      const container = embedToV2Container(embed);
+      container.addActionRowComponents(row);
       await dmChannel.send({
-        embeds: [embed],
-        components: [row],
+        components: [container],
+        flags: MessageFlags.IsComponentsV2,
       });
       return true;
     } catch {
@@ -1734,9 +1714,11 @@ export class BotManager {
           .setStyle(ButtonStyle.Link)
           .setURL(messageUrl)
       );
+      const container = embedToV2Container(embed);
+      container.addActionRowComponents(row);
       await dmChannel.send({
-        embeds: [embed],
-        components: [row],
+        components: [container],
+        flags: MessageFlags.IsComponentsV2,
       });
       return true;
     } catch {
@@ -1762,12 +1744,9 @@ export class BotManager {
     }
     await addItem(interaction.user.id, item);
     const items = await getItems(interaction.user.id);
-    await interaction.reply({
-      content: `Tracking **${item}**.\n\nYour items:\n${items
+    await replyV2Text(interaction, "Giveaway tracking", `Tracking **${item}**.\n\nYour items:\n${items
         .map((i) => `- ${i}`)
-        .join("\n")}`,
-      ephemeral: true,
-    });
+        .join("\n")}`);
   }
   private async giveawayRemove(
     interaction: ChatInputCommandInteraction<CacheType>
@@ -1779,12 +1758,9 @@ export class BotManager {
       return;
     }
     const items = await getItems(interaction.user.id);
-    await interaction.reply({
-      content: `Removed **${item}**.\n\nYour items:\n${items
+    await replyV2Text(interaction, "Giveaway tracking", `Removed **${item}**.\n\nYour items:\n${items
         .map((i) => `- ${i}`)
-        .join("\n")}`,
-      ephemeral: true,
-    });
+        .join("\n")}`);
   }
   private async giveawayList(
     interaction: ChatInputCommandInteraction<CacheType>
@@ -1794,12 +1770,9 @@ export class BotManager {
       await replyV2Text(interaction, "Updated", "You are not tracking any giveaway items. Use `/giveawaytrack add` to start.");
       return;
     }
-    await interaction.reply({
-      content: `**Tracked giveaway items (${items.length})**\n${items
+    await replyV2Text(interaction, "Giveaway tracking", `**Tracked giveaway items (${items.length})**\n${items
         .map((i) => `- ${i}`)
-        .join("\n")}`,
-      ephemeral: true,
-    });
+        .join("\n")}`);
   }
   private async giveawayClear(
     interaction: ChatInputCommandInteraction<CacheType>
@@ -1850,12 +1823,9 @@ export class BotManager {
     await addItem(interaction.user.id, eventItem);
     const items = await getItems(interaction.user.id);
     const eventItems = items.filter((i) => i.startsWith("event:"));
-    await interaction.reply({
-      content: `Tracking **${filter}**.\n\nYour event filters:\n${eventItems
+    await replyV2Text(interaction, "Event tracking", `Tracking **${filter}**.\n\nYour event filters:\n${eventItems
         .map((i) => `- ${i.replace("event:", "")}`)
-        .join("\n")}`,
-      ephemeral: true,
-    });
+        .join("\n")}`);
   }
   private async eventRemove(
     interaction: ChatInputCommandInteraction<CacheType>
@@ -1869,12 +1839,9 @@ export class BotManager {
     }
     const items = await getItems(interaction.user.id);
     const eventItems = items.filter((i) => i.startsWith("event:"));
-    await interaction.reply({
-      content: `Removed **${filter}**.\n\nYour event filters:\n${eventItems
+    await replyV2Text(interaction, "Event tracking", `Removed **${filter}**.\n\nYour event filters:\n${eventItems
         .map((i) => `- ${i.replace("event:", "")}`)
-        .join("\n")}`,
-      ephemeral: true,
-    });
+        .join("\n")}`);
   }
   private async eventList(
     interaction: ChatInputCommandInteraction<CacheType>
@@ -1885,12 +1852,9 @@ export class BotManager {
       await replyV2Text(interaction, "Updated", "You are not tracking any event filters. Use `/eventtrack add` to start.");
       return;
     }
-    await interaction.reply({
-      content: `**Event filters (${eventItems.length})**\n${eventItems
+    await replyV2Text(interaction, "Event tracking", `**Event filters (${eventItems.length})**\n${eventItems
         .map((i) => `- ${i.replace("event:", "")}`)
-        .join("\n")}`,
-      ephemeral: true,
-    });
+        .join("\n")}`);
   }
   private async eventClear(
     interaction: ChatInputCommandInteraction<CacheType>
@@ -1923,10 +1887,7 @@ export class BotManager {
     const user = interaction.options.getUser("user", true);
     const guildId = interaction.guildId;
     if (!guildId) {
-      await interaction.reply({
-        content: "This command must be used in a server.",
-        ephemeral: true,
-      });
+      await replyV2Text(interaction, "Unavailable", "This command must be used in a server.");
       return;
     }
     await interaction.deferReply({ ephemeral: true });
@@ -2178,13 +2139,13 @@ export class BotManager {
           value:
             "`add`, `remove`, `list`, `clear` — manage event filters",
           inline: false,
-        },
-        {
-          name: "/vrfs",
-          value:
-            "`player`, `locker`, `item`, `market`, `creator`, `stats`, `status`",
-          inline: false,
         }
+// [VRFS ARCHIVED]         {
+// [VRFS ARCHIVED]           name: "/vrfs",
+// [VRFS ARCHIVED]           value:
+// [VRFS ARCHIVED]             "`player`, `locker`, `item`, `market`, `creator`, `stats`, `status`",
+// [VRFS ARCHIVED]           inline: false,
+// [VRFS ARCHIVED]         }
       );
     await editV2Embed(interaction, embed);
   }
@@ -2428,17 +2389,23 @@ export class BotManager {
       });
     }
   }
-  private async updatePresence() {
-    const totalEver = await getTotalDetected();
-    this.client.user?.setPresence({
-      activities: [
-        {
-          name: `${totalEver.toLocaleString()} giveaways tracked`,
-          type: ActivityType.Watching,
-        },
-      ],
-      status: "online",
+  private async updatePresence(force = false): Promise<void> {
+    const now = Date.now();
+    if (!force && now - this.lastPresenceUpdate < 30_000) return;
+    if (this.presenceUpdateInFlight) return this.presenceUpdateInFlight;
+    this.presenceUpdateInFlight = (async () => {
+      const totalEver = await getTotalDetected();
+      this.client.user?.setPresence({
+        activities: [{ name: `${totalEver.toLocaleString()} giveaways tracked`, type: ActivityType.Watching }],
+        status: "online",
+      });
+      this.lastPresenceUpdate = Date.now();
+    })().catch((error) => {
+      logger.debug("Presence update failed", { error: formatError(error) });
+    }).finally(() => {
+      this.presenceUpdateInFlight = null;
     });
+    return this.presenceUpdateInFlight;
   }
   private async purgeAndUpdatePresence() {
     const removed = await purgeEndedGiveaways();
@@ -2452,14 +2419,16 @@ export class BotManager {
           const msg = await trackerChannel.messages
             .fetch(notifMsgId)
             .catch(() => null);
-          if (msg && msg.embeds.length > 0) {
-            const updatedEmbed = EmbedBuilder.from(msg.embeds[0])
-              .setColor(0xe74c3c)
-              .setAuthor({
-                name: "Giveaway Ended",
-                iconURL: msg.embeds[0].author?.iconURL || undefined,
-              });
-            await msg.edit({ embeds: [updatedEmbed] }).catch(() => {});
+          if (msg) {
+            const container = createV2Container(
+              "Giveaway Ended",
+              "This giveaway has ended.\n\nThe original notification is no longer active.",
+              0xe74c3c
+            );
+            await msg.edit({
+              components: [container],
+              flags: MessageFlags.IsComponentsV2,
+            }).catch(() => {});
           }
         }
       }
@@ -2610,610 +2579,611 @@ export class BotManager {
     await this.renderGiveawayPage(interaction, searchId);
   }
 
-  private cleanupVRFSPages(): void {
+  // [VRFS ARCHIVED] VRFS page cleanup is disabled while the VRFS API is archived.
+  private cleanupPages(): void {
     const cutoff = Date.now() - 10 * 60 * 1000;
-    for (const [id, page] of this.vrfsPages) {
-      if (page.createdAt < cutoff) this.vrfsPages.delete(id);
-    }
+    // [VRFS ARCHIVED] for (const [id, page] of this.vrfsPages) {
+    // [VRFS ARCHIVED]   if (page.createdAt < cutoff) this.vrfsPages.delete(id);
+    // [VRFS ARCHIVED] }
     for (const [id, page] of this.giveawayPages) {
       if (page.createdAt < cutoff) this.giveawayPages.delete(id);
     }
   }
-  private createVRFSPage(
-    userId: string,
-    type: VRFSPage["type"],
-    items: VRFSPage["items"],
-    title: string,
-    description?: string,
-    pageSize = 10
-  ): VRFSPage {
-    const id = `${Date.now().toString(36)}${Math.random()
-      .toString(36)
-      .slice(2, 8)}`;
-    const page: VRFSPage = {
-      id,
-      type,
-      userId,
-      createdAt: Date.now(),
-      page: 0,
-      pageSize,
-      items,
-      title,
-      description,
-    };
-    this.vrfsPages.set(id, page);
-    return page;
-  }
-  private async handleVRFSPageButton(
-    interaction: ButtonInteraction
-  ): Promise<void> {
-    const parts = interaction.customId.split(":");
-    if (parts.length !== 3) return;
-    const [, pageId, direction] = parts;
-    const session = this.vrfsPages.get(pageId);
-    if (!session) {
-      await interaction.reply({
-        content: "This result has expired. Run the command again.",
-        ephemeral: true,
-      });
-      return;
-    }
-    if (session.userId !== interaction.user.id) {
-      await interaction.reply({
-        content: "Only the person who requested this result can navigate it.",
-        ephemeral: true,
-      });
-      return;
-    }
-    if (direction === "current") return;
-    const next =
-      direction === "next"
-        ? session.page + 1
-        : Math.max(0, session.page - 1);
-    const totalPages = Math.max(
-      1,
-      Math.ceil(session.items.length / session.pageSize)
-    );
-    if (next < 0 || next >= totalPages) return;
-    session.page = next;
-    const page =
-      session.type === "catalog"
-        ? createCatalogPage(session)
-        : session.type === "marketplace"
-        ? createMarketplacePage(session)
-        : createLockerPage(session);
-    await interaction.update(page);
-  }
-  private async vrfsCommand(
-    interaction: ChatInputCommandInteraction<CacheType>
-  ): Promise<void> {
-    const sub = interaction.options.getSubcommand();
-    if (sub === "player") {
-      await this.vrfsPlayerCommand(interaction);
-      return;
-    }
-    if (sub === "locker") {
-      await this.vrfsLockerCommand(interaction);
-      return;
-    }
-    if (sub === "item") {
-      await this.vrfsItemCommand(interaction);
-      return;
-    }
-    if (sub === "market") {
-      await this.vrfsMarketCommand(interaction);
-      return;
-    }
-    if (sub === "creator") {
-      await this.vrfsCreatorCommand(interaction);
-      return;
-    }
-    if (sub === "stats") {
-      await this.vrfsStatsCommand(interaction);
-      return;
-    }
-    if (sub === "status") {
-      await this.vrfsStatusCommand(interaction);
-      return;
-    }
-  }
-  private async vrfsPlayerCommand(
-    interaction: ChatInputCommandInteraction<CacheType>
-  ): Promise<void> {
-    const id = interaction.options.getInteger("id", true);
-    await deferReply(interaction, false);
-    try {
-      const player = await getPlayer(id);
-      const username = player.username;
-      const profile = player.profile;
-      const outfits = player.outfits ?? [];
-      const embed = createPlayerEmbed(id, username, profile, outfits);
-      await editV2Embed(interaction, embed);
-    } catch (error) {
-      logger.warn("Player lookup failed", {
-        id,
-        error: formatError(error),
-      });
-      await editV2Text(interaction, "Player lookup", "That player could not be found.", 0xe74c3c);
-    }
-  }
-  private async vrfsLockerCommand(
-    interaction: ChatInputCommandInteraction<CacheType>
-  ): Promise<void> {
-    const id = interaction.options.getInteger("id", true);
-    const query = interaction.options.getString("item")?.trim() || null;
-    await deferReply(interaction, false);
-    try {
-      const catalog = await getCatalog();
-      if (!query) {
-        await interaction.editReply(
-          v2EditPayload(
-            createV2Container(
-              "Locker",
-              `Checking the collection for ID \`${id}\`.\n\nScanning ${catalog.length.toLocaleString()} items.`,
-              0x5865f2
-            )
-          )
-        );
-        const ownership = await checkOwnership(id, catalog.map(getSku), {
-          batchSize: 250,
-          minBatchSize: 5,
-          maxBatchSize: 500,
-          delayMs: 150,
-        });
-        const player = await getUsername(id);
-        const summary = createLockerSummaryEmbed(
-          id,
-          player.username,
-          catalog,
-          ownership
-        );
-        const ownedItems = catalog.filter((item) =>
-          ownership.owned.includes(getSku(item))
-        );
-        const session = this.createVRFSPage(
-          interaction.user.id,
-          "locker",
-          ownedItems,
-          "Owned Items",
-          `ID \`${id}\` · ${ownedItems.length.toLocaleString()} owned items`,
-          10
-        );
-        const summaryContainer = embedToV2Container(summary);
-        const lockerResult = paginate(ownedItems, session.page, session.pageSize);
-        const lockerLines = lockerResult.items.map((item: VRFSItem, index: number) => {
-          const position = lockerResult.page * session.pageSize + index + 1;
-          return `**${position}. ${truncate(getItemName(item), 80)}**\n\`${truncate(
-            getSku(item),
-            100
-          )}\` · ${getSection(item)} · ${formatItemPrice(item)}`;
-        });
-        addV2Text(
-          summaryContainer,
-          `### Owned Items\n${truncate(
-            lockerLines.join("\n\n") || "No owned items.",
-            4096
-          )}`
-        );
-        if (lockerResult.totalPages > 1) {
-          summaryContainer.addActionRowComponents(
-            createPaginationRow(session.id, lockerResult.page, lockerResult.totalPages)
-          );
-        }
-        await interaction.editReply(v2EditPayload(summaryContainer));
-        return;
-      }
-      const matches = await searchCatalog(query, 25);
-      if (!matches.length) {
-        await editV2Text(interaction, "Item search", `No items matched **${truncate(query, 100)}**.`, 0xe74c3c);
-        return;
-      }
-      if (matches.length === 1) {
-        const sku = getSku(matches[0]);
-        const ownership = await checkOwnership(id, [sku], {
-          batchSize: 1,
-          minBatchSize: 1,
-          maxBatchSize: 1,
-        });
-        const embed = createItemEmbed(matches[0]);
-        embed.addFields({
-          name: "Ownership",
-          value:
-            ownership.results[sku] === true
-              ? `Owned by ID \`${id}\``
-              : ownership.results[sku] === false
-              ? `Not owned by ID \`${id}\``
-              : "Could not be confirmed",
-          inline: false,
-        });
-        await editV2Embed(interaction, embed);
-        return;
-      }
-      const session = this.createVRFSPage(
-        interaction.user.id,
-        "catalog",
-        matches,
-        "Locker Search",
-        `Results for **${truncate(query, 100)}**`,
-        10
-      );
-      const page = createCatalogPage(session);
-      await interaction.editReply(page);
-    } catch (error) {
-      logger.warn("Locker request failed", {
-        id,
-        error: formatError(error),
-      });
-      await editV2Text(interaction, "Locker lookup", "The locker could not be loaded right now.", 0xe74c3c);
-    }
-  }
-  private async vrfsItemCommand(
-    interaction: ChatInputCommandInteraction<CacheType>
-  ): Promise<void> {
-    const query = interaction.options.getString("query", true).trim();
-    await deferReply(interaction, false);
-    try {
-      const item = await getCatalogItem(query);
-      if (item) {
-        await interaction.editReply({
-          components: [embedToV2Container(createItemEmbed(item))],
-          flags: MessageFlags.IsComponentsV2,
-        });
-        return;
-      }
-      const results = await searchCatalog(query, 50);
-      if (!results.length) {
-        await editV2Text(interaction, "Item search", `No items matched **${truncate(query, 100)}**.`, 0xe74c3c);
-        return;
-      }
-      if (results.length === 1) {
-        await interaction.editReply({
-          components: [embedToV2Container(createItemEmbed(results[0]))],
-          flags: MessageFlags.IsComponentsV2,
-        });
-        return;
-      }
-      const session = this.createVRFSPage(
-        interaction.user.id,
-        "catalog",
-        results,
-        "Item Search",
-        `Results for **${truncate(query, 100)}**`,
-        10
-      );
-      await interaction.editReply(createCatalogPage(session));
-    } catch (error) {
-      logger.warn("Item lookup failed", {
-        query,
-        error: formatError(error),
-      });
-      await editV2Text(interaction, "Item catalogue", "The item catalogue could not be loaded right now.", 0xe74c3c);
-    }
-  }
-  private async vrfsMarketCommand(
-    interaction: ChatInputCommandInteraction<CacheType>
-  ): Promise<void> {
-    const query = interaction.options.getString("query", true).trim();
-    await deferReply(interaction, false);
-    try {
-      const item = await getMarketplaceItem(query);
-      if (item) {
-        await interaction.editReply({
-          components: [embedToV2Container(createMarketplaceEmbed(item))],
-          flags: MessageFlags.IsComponentsV2,
-        });
-        return;
-      }
-      const results = await searchMarketplace(query, 50);
-      if (!results.length) {
-        await editV2Text(interaction, "Marketplace search", `No marketplace items matched **${truncate(query, 100)}**.`, 0xe74c3c);
-        return;
-      }
-      if (results.length === 1) {
-        await interaction.editReply({
-          components: [embedToV2Container(createMarketplaceEmbed(results[0]))],
-          flags: MessageFlags.IsComponentsV2,
-        });
-        return;
-      }
-      const session = this.createVRFSPage(
-        interaction.user.id,
-        "marketplace",
-        results,
-        "Marketplace Search",
-        `Results for **${truncate(query, 100)}**`,
-        10
-      );
-      await interaction.editReply(createMarketplacePage(session));
-    } catch (error) {
-      logger.warn("Marketplace lookup failed", {
-        query,
-        error: formatError(error),
-      });
-      await editV2Text(interaction, "Marketplace", "The marketplace could not be loaded right now.", 0xe74c3c);
-    }
-  }
-  private async vrfsCreatorCommand(
-    interaction: ChatInputCommandInteraction<CacheType>
-  ): Promise<void> {
-    const name = interaction.options.getString("name", true).trim().toLowerCase();
-    await deferReply(interaction, false);
-    try {
-      const marketplace = await getMarketplace();
-      const matches = marketplace.filter((item) =>
-        getMarketplaceCreatorName(item).toLowerCase().includes(name)
-      );
-      if (!matches.length) {
-        await editV2Text(interaction, "Creator search", `No creator matched **${truncate(name, 100)}**.`, 0xe74c3c);
-        return;
-      }
-      const creator = getMarketplaceCreatorName(matches[0]);
-      const creatorId = getMarketplaceCreatorId(matches[0]);
-      const active = matches.filter(getMarketplaceActive).length;
-      const totalOwners = matches.reduce(
-        (sum, item) => sum + getMarketplaceOwners(item),
-        0
-      );
-      const typeCounts = new Map<string, number>();
-      for (const item of matches) {
-        const type = marketType(item);
-        typeCounts.set(type, (typeCounts.get(type) ?? 0) + 1);
-      }
-      const embed = createEmbed(
-        creator,
-        0x5865f2,
-        `Marketplace creator${creatorId ? ` · ID \`${creatorId}\`` : ""}`
-      );
-      embed.addFields(
-        {
-          name: "Items",
-          value: matches.length.toLocaleString(),
-          inline: true,
-        },
-        {
-          name: "Available",
-          value: active.toLocaleString(),
-          inline: true,
-        },
-        {
-          name: "Total Owners",
-          value: totalOwners.toLocaleString(),
-          inline: true,
-        },
-        {
-          name: "Categories",
-          value:
-            [...typeCounts.entries()]
-              .sort((a, b) => b[1] - a[1])
-              .map(([type, count]) => `**${type}** — ${count}`)
-              .join("\n") || "None",
-          inline: false,
-        }
-      );
-      const preview = matches.slice(0, 10).map((item, index) => {
-        return `**${index + 1}. ${truncate(
-          String(item.title ?? item.name ?? getSku(item)),
-          70
-        )}**\n#${item.id} · ${marketType(item)} · ${formatNumber(
-          getMarketplaceOwners(item)
-        )} owners`;
-      });
-      embed.addFields({
-        name: "Items",
-        value: truncate(preview.join("\n\n") || "None", 4096),
-        inline: false,
-      });
-      const image = getMarketplaceImage(matches[0]);
-      if (image) embed.setImage(image);
-      await editV2Embed(interaction, embed);
-    } catch (error) {
-      logger.warn("Creator lookup failed", {
-        name,
-        error: formatError(error),
-      });
-      await editV2Text(interaction, "Creator lookup", "The creator information could not be loaded right now.", 0xe74c3c);
-    }
-  }
-  private async vrfsStatsCommand(
-    interaction: ChatInputCommandInteraction<CacheType>
-  ): Promise<void> {
-    await deferReply(interaction, false);
-    try {
-      const [catalog, marketplace] = await Promise.all([
-        getCatalog(),
-        getMarketplace(),
-      ]);
-      const free = catalog.filter(isItemFree).length;
-      const paid = Math.max(0, catalog.length - free);
-      const active = marketplace.filter(getMarketplaceActive).length;
-      const creators = new Set(
-        marketplace
-          .map(getMarketplaceCreatorId)
-          .filter((value) => value.length > 0)
-      ).size;
-      const owners = marketplace.reduce(
-        (sum, item) => sum + getMarketplaceOwners(item),
-        0
-      );
-      const sections = new Set(catalog.map(getSection)).size;
-      const embed = createEmbed(
-        "VRFS",
-        0x5865f2,
-        "Current game data overview."
-      );
-      embed.addFields(
-        {
-          name: "Catalogue Items",
-          value: catalog.length.toLocaleString(),
-          inline: true,
-        },
-        {
-          name: "Free",
-          value: free.toLocaleString(),
-          inline: true,
-        },
-        {
-          name: "Paid",
-          value: paid.toLocaleString(),
-          inline: true,
-        },
-        {
-          name: "Sections",
-          value: sections.toLocaleString(),
-          inline: true,
-        },
-        {
-          name: "Marketplace Items",
-          value: marketplace.length.toLocaleString(),
-          inline: true,
-        },
-        {
-          name: "Available",
-          value: active.toLocaleString(),
-          inline: true,
-        },
-        {
-          name: "Creators",
-          value: creators.toLocaleString(),
-          inline: true,
-        },
-        {
-          name: "Total Owners",
-          value: owners.toLocaleString(),
-          inline: true,
-        }
-      );
-      await editV2Embed(interaction, embed);
-    } catch (error) {
-      logger.warn("VRFS stats failed", {
-        error: formatError(error),
-      });
-      await editV2Text(interaction, "Statistics", "The statistics could not be loaded right now.", 0xe74c3c);
-    }
-  }
-  private async vrfsStatusCommand(
-    interaction: ChatInputCommandInteraction<CacheType>
-  ): Promise<void> {
-    await deferReply(interaction, false);
-    try {
-      const [catalog, marketplace] = await Promise.all([
-        getCatalog(),
-        getMarketplace(),
-      ]);
-      const embed = createEmbed(
-        "VRFS Status",
-        0x2ecc71,
-        "Game data services are responding normally."
-      );
-      embed.addFields(
-        {
-          name: "Catalogue",
-          value: `${catalog.length.toLocaleString()} items`,
-          inline: true,
-        },
-        {
-          name: "Marketplace",
-          value: `${marketplace.length.toLocaleString()} items`,
-          inline: true,
-        },
-        {
-          name: "Availability",
-          value: "Online",
-          inline: true,
-        }
-      );
-      await editV2Embed(interaction, embed);
-    } catch (error) {
-      logger.warn("VRFS status failed", {
-        error: formatError(error),
-      });
-      const embed = createEmbed(
-        "VRFS Status",
-        0xe74c3c,
-        "Game data services are currently unavailable."
-      );
-      embed.addFields({
-        name: "Availability",
-        value: "Unavailable",
-        inline: true,
-      });
-      await editV2Embed(interaction, embed);
-    }
-  }
+// [VRFS ARCHIVED]   private createVRFSPage(
+// [VRFS ARCHIVED]     userId: string,
+// [VRFS ARCHIVED]     type: VRFSPage["type"],
+// [VRFS ARCHIVED]     items: VRFSPage["items"],
+// [VRFS ARCHIVED]     title: string,
+// [VRFS ARCHIVED]     description?: string,
+// [VRFS ARCHIVED]     pageSize = 10
+// [VRFS ARCHIVED]   ): VRFSPage {
+// [VRFS ARCHIVED]     const id = `${Date.now().toString(36)}${Math.random()
+// [VRFS ARCHIVED]       .toString(36)
+// [VRFS ARCHIVED]       .slice(2, 8)}`;
+// [VRFS ARCHIVED]     const page: VRFSPage = {
+// [VRFS ARCHIVED]       id,
+// [VRFS ARCHIVED]       type,
+// [VRFS ARCHIVED]       userId,
+// [VRFS ARCHIVED]       createdAt: Date.now(),
+// [VRFS ARCHIVED]       page: 0,
+// [VRFS ARCHIVED]       pageSize,
+// [VRFS ARCHIVED]       items,
+// [VRFS ARCHIVED]       title,
+// [VRFS ARCHIVED]       description,
+// [VRFS ARCHIVED]     };
+// [VRFS ARCHIVED]     this.vrfsPages.set(id, page);
+// [VRFS ARCHIVED]     return page;
+// [VRFS ARCHIVED]   }
+// [VRFS ARCHIVED]   private async handleVRFSPageButton(
+// [VRFS ARCHIVED]     interaction: ButtonInteraction
+// [VRFS ARCHIVED]   ): Promise<void> {
+// [VRFS ARCHIVED]     const parts = interaction.customId.split(":");
+// [VRFS ARCHIVED]     if (parts.length !== 3) return;
+// [VRFS ARCHIVED]     const [, pageId, direction] = parts;
+// [VRFS ARCHIVED]     const session = this.vrfsPages.get(pageId);
+// [VRFS ARCHIVED]     if (!session) {
+// [VRFS ARCHIVED]       await interaction.reply({
+// [VRFS ARCHIVED]         content: "This result has expired. Run the command again.",
+// [VRFS ARCHIVED]         ephemeral: true,
+// [VRFS ARCHIVED]       });
+// [VRFS ARCHIVED]       return;
+// [VRFS ARCHIVED]     }
+// [VRFS ARCHIVED]     if (session.userId !== interaction.user.id) {
+// [VRFS ARCHIVED]       await interaction.reply({
+// [VRFS ARCHIVED]         content: "Only the person who requested this result can navigate it.",
+// [VRFS ARCHIVED]         ephemeral: true,
+// [VRFS ARCHIVED]       });
+// [VRFS ARCHIVED]       return;
+// [VRFS ARCHIVED]     }
+// [VRFS ARCHIVED]     if (direction === "current") return;
+// [VRFS ARCHIVED]     const next =
+// [VRFS ARCHIVED]       direction === "next"
+// [VRFS ARCHIVED]         ? session.page + 1
+// [VRFS ARCHIVED]         : Math.max(0, session.page - 1);
+// [VRFS ARCHIVED]     const totalPages = Math.max(
+// [VRFS ARCHIVED]       1,
+// [VRFS ARCHIVED]       Math.ceil(session.items.length / session.pageSize)
+// [VRFS ARCHIVED]     );
+// [VRFS ARCHIVED]     if (next < 0 || next >= totalPages) return;
+// [VRFS ARCHIVED]     session.page = next;
+// [VRFS ARCHIVED]     const page =
+// [VRFS ARCHIVED]       session.type === "catalog"
+// [VRFS ARCHIVED]         ? createCatalogPage(session)
+// [VRFS ARCHIVED]         : session.type === "marketplace"
+// [VRFS ARCHIVED]         ? createMarketplacePage(session)
+// [VRFS ARCHIVED]         : createLockerPage(session);
+// [VRFS ARCHIVED]     await interaction.update(page);
+// [VRFS ARCHIVED]   }
+// [VRFS ARCHIVED]   private async vrfsCommand(
+// [VRFS ARCHIVED]     interaction: ChatInputCommandInteraction<CacheType>
+// [VRFS ARCHIVED]   ): Promise<void> {
+// [VRFS ARCHIVED]     const sub = interaction.options.getSubcommand();
+// [VRFS ARCHIVED]     if (sub === "player") {
+// [VRFS ARCHIVED]       await this.vrfsPlayerCommand(interaction);
+// [VRFS ARCHIVED]       return;
+// [VRFS ARCHIVED]     }
+// [VRFS ARCHIVED]     if (sub === "locker") {
+// [VRFS ARCHIVED]       await this.vrfsLockerCommand(interaction);
+// [VRFS ARCHIVED]       return;
+// [VRFS ARCHIVED]     }
+// [VRFS ARCHIVED]     if (sub === "item") {
+// [VRFS ARCHIVED]       await this.vrfsItemCommand(interaction);
+// [VRFS ARCHIVED]       return;
+// [VRFS ARCHIVED]     }
+// [VRFS ARCHIVED]     if (sub === "market") {
+// [VRFS ARCHIVED]       await this.vrfsMarketCommand(interaction);
+// [VRFS ARCHIVED]       return;
+// [VRFS ARCHIVED]     }
+// [VRFS ARCHIVED]     if (sub === "creator") {
+// [VRFS ARCHIVED]       await this.vrfsCreatorCommand(interaction);
+// [VRFS ARCHIVED]       return;
+// [VRFS ARCHIVED]     }
+// [VRFS ARCHIVED]     if (sub === "stats") {
+// [VRFS ARCHIVED]       await this.vrfsStatsCommand(interaction);
+// [VRFS ARCHIVED]       return;
+// [VRFS ARCHIVED]     }
+// [VRFS ARCHIVED]     if (sub === "status") {
+// [VRFS ARCHIVED]       await this.vrfsStatusCommand(interaction);
+// [VRFS ARCHIVED]       return;
+// [VRFS ARCHIVED]     }
+// [VRFS ARCHIVED]   }
+// [VRFS ARCHIVED]   private async vrfsPlayerCommand(
+// [VRFS ARCHIVED]     interaction: ChatInputCommandInteraction<CacheType>
+// [VRFS ARCHIVED]   ): Promise<void> {
+// [VRFS ARCHIVED]     const id = interaction.options.getInteger("id", true);
+// [VRFS ARCHIVED]     await deferReply(interaction, false);
+// [VRFS ARCHIVED]     try {
+// [VRFS ARCHIVED]       const player = await getPlayer(id);
+// [VRFS ARCHIVED]       const username = player.username;
+// [VRFS ARCHIVED]       const profile = player.profile;
+// [VRFS ARCHIVED]       const outfits = player.outfits ?? [];
+// [VRFS ARCHIVED]       const embed = createPlayerEmbed(id, username, profile, outfits);
+// [VRFS ARCHIVED]       await editV2Embed(interaction, embed);
+// [VRFS ARCHIVED]     } catch (error) {
+// [VRFS ARCHIVED]       logger.warn("Player lookup failed", {
+// [VRFS ARCHIVED]         id,
+// [VRFS ARCHIVED]         error: formatError(error),
+// [VRFS ARCHIVED]       });
+// [VRFS ARCHIVED]       await editV2Text(interaction, "Player lookup", "That player could not be found.", 0xe74c3c);
+// [VRFS ARCHIVED]     }
+// [VRFS ARCHIVED]   }
+// [VRFS ARCHIVED]   private async vrfsLockerCommand(
+// [VRFS ARCHIVED]     interaction: ChatInputCommandInteraction<CacheType>
+// [VRFS ARCHIVED]   ): Promise<void> {
+// [VRFS ARCHIVED]     const id = interaction.options.getInteger("id", true);
+// [VRFS ARCHIVED]     const query = interaction.options.getString("item")?.trim() || null;
+// [VRFS ARCHIVED]     await deferReply(interaction, false);
+// [VRFS ARCHIVED]     try {
+// [VRFS ARCHIVED]       const catalog = await getCatalog();
+// [VRFS ARCHIVED]       if (!query) {
+// [VRFS ARCHIVED]         await interaction.editReply(
+// [VRFS ARCHIVED]           v2EditPayload(
+// [VRFS ARCHIVED]             createV2Container(
+// [VRFS ARCHIVED]               "Locker",
+// [VRFS ARCHIVED]               `Checking the collection for ID \`${id}\`.\n\nScanning ${catalog.length.toLocaleString()} items.`,
+// [VRFS ARCHIVED]               0x5865f2
+// [VRFS ARCHIVED]             )
+// [VRFS ARCHIVED]           )
+// [VRFS ARCHIVED]         );
+// [VRFS ARCHIVED]         const ownership = await checkOwnership(id, catalog.map(getSku), {
+// [VRFS ARCHIVED]           batchSize: 250,
+// [VRFS ARCHIVED]           minBatchSize: 5,
+// [VRFS ARCHIVED]           maxBatchSize: 500,
+// [VRFS ARCHIVED]           delayMs: 150,
+// [VRFS ARCHIVED]         });
+// [VRFS ARCHIVED]         const player = await getUsername(id);
+// [VRFS ARCHIVED]         const summary = createLockerSummaryEmbed(
+// [VRFS ARCHIVED]           id,
+// [VRFS ARCHIVED]           player.username,
+// [VRFS ARCHIVED]           catalog,
+// [VRFS ARCHIVED]           ownership
+// [VRFS ARCHIVED]         );
+// [VRFS ARCHIVED]         const ownedItems = catalog.filter((item) =>
+// [VRFS ARCHIVED]           ownership.owned.includes(getSku(item))
+// [VRFS ARCHIVED]         );
+// [VRFS ARCHIVED]         const session = this.createVRFSPage(
+// [VRFS ARCHIVED]           interaction.user.id,
+// [VRFS ARCHIVED]           "locker",
+// [VRFS ARCHIVED]           ownedItems,
+// [VRFS ARCHIVED]           "Owned Items",
+// [VRFS ARCHIVED]           `ID \`${id}\` · ${ownedItems.length.toLocaleString()} owned items`,
+// [VRFS ARCHIVED]           10
+// [VRFS ARCHIVED]         );
+// [VRFS ARCHIVED]         const summaryContainer = embedToV2Container(summary);
+// [VRFS ARCHIVED]         const lockerResult = paginate(ownedItems, session.page, session.pageSize);
+// [VRFS ARCHIVED]         const lockerLines = lockerResult.items.map((item: VRFSItem, index: number) => {
+// [VRFS ARCHIVED]           const position = lockerResult.page * session.pageSize + index + 1;
+// [VRFS ARCHIVED]           return `**${position}. ${truncate(getItemName(item), 80)}**\n\`${truncate(
+// [VRFS ARCHIVED]             getSku(item),
+// [VRFS ARCHIVED]             100
+// [VRFS ARCHIVED]           )}\` · ${getSection(item)} · ${formatItemPrice(item)}`;
+// [VRFS ARCHIVED]         });
+// [VRFS ARCHIVED]         addV2Text(
+// [VRFS ARCHIVED]           summaryContainer,
+// [VRFS ARCHIVED]           `### Owned Items\n${truncate(
+// [VRFS ARCHIVED]             lockerLines.join("\n\n") || "No owned items.",
+// [VRFS ARCHIVED]             4096
+// [VRFS ARCHIVED]           )}`
+// [VRFS ARCHIVED]         );
+// [VRFS ARCHIVED]         if (lockerResult.totalPages > 1) {
+// [VRFS ARCHIVED]           summaryContainer.addActionRowComponents(
+// [VRFS ARCHIVED]             createPaginationRow(session.id, lockerResult.page, lockerResult.totalPages)
+// [VRFS ARCHIVED]           );
+// [VRFS ARCHIVED]         }
+// [VRFS ARCHIVED]         await interaction.editReply(v2EditPayload(summaryContainer));
+// [VRFS ARCHIVED]         return;
+// [VRFS ARCHIVED]       }
+// [VRFS ARCHIVED]       const matches = await searchCatalog(query, 25);
+// [VRFS ARCHIVED]       if (!matches.length) {
+// [VRFS ARCHIVED]         await editV2Text(interaction, "Item search", `No items matched **${truncate(query, 100)}**.`, 0xe74c3c);
+// [VRFS ARCHIVED]         return;
+// [VRFS ARCHIVED]       }
+// [VRFS ARCHIVED]       if (matches.length === 1) {
+// [VRFS ARCHIVED]         const sku = getSku(matches[0]);
+// [VRFS ARCHIVED]         const ownership = await checkOwnership(id, [sku], {
+// [VRFS ARCHIVED]           batchSize: 1,
+// [VRFS ARCHIVED]           minBatchSize: 1,
+// [VRFS ARCHIVED]           maxBatchSize: 1,
+// [VRFS ARCHIVED]         });
+// [VRFS ARCHIVED]         const embed = createItemEmbed(matches[0]);
+// [VRFS ARCHIVED]         embed.addFields({
+// [VRFS ARCHIVED]           name: "Ownership",
+// [VRFS ARCHIVED]           value:
+// [VRFS ARCHIVED]             ownership.results[sku] === true
+// [VRFS ARCHIVED]               ? `Owned by ID \`${id}\``
+// [VRFS ARCHIVED]               : ownership.results[sku] === false
+// [VRFS ARCHIVED]               ? `Not owned by ID \`${id}\``
+// [VRFS ARCHIVED]               : "Could not be confirmed",
+// [VRFS ARCHIVED]           inline: false,
+// [VRFS ARCHIVED]         });
+// [VRFS ARCHIVED]         await editV2Embed(interaction, embed);
+// [VRFS ARCHIVED]         return;
+// [VRFS ARCHIVED]       }
+// [VRFS ARCHIVED]       const session = this.createVRFSPage(
+// [VRFS ARCHIVED]         interaction.user.id,
+// [VRFS ARCHIVED]         "catalog",
+// [VRFS ARCHIVED]         matches,
+// [VRFS ARCHIVED]         "Locker Search",
+// [VRFS ARCHIVED]         `Results for **${truncate(query, 100)}**`,
+// [VRFS ARCHIVED]         10
+// [VRFS ARCHIVED]       );
+// [VRFS ARCHIVED]       const page = createCatalogPage(session);
+// [VRFS ARCHIVED]       await interaction.editReply(page);
+// [VRFS ARCHIVED]     } catch (error) {
+// [VRFS ARCHIVED]       logger.warn("Locker request failed", {
+// [VRFS ARCHIVED]         id,
+// [VRFS ARCHIVED]         error: formatError(error),
+// [VRFS ARCHIVED]       });
+// [VRFS ARCHIVED]       await editV2Text(interaction, "Locker lookup", "The locker could not be loaded right now.", 0xe74c3c);
+// [VRFS ARCHIVED]     }
+// [VRFS ARCHIVED]   }
+// [VRFS ARCHIVED]   private async vrfsItemCommand(
+// [VRFS ARCHIVED]     interaction: ChatInputCommandInteraction<CacheType>
+// [VRFS ARCHIVED]   ): Promise<void> {
+// [VRFS ARCHIVED]     const query = interaction.options.getString("query", true).trim();
+// [VRFS ARCHIVED]     await deferReply(interaction, false);
+// [VRFS ARCHIVED]     try {
+// [VRFS ARCHIVED]       const item = await getCatalogItem(query);
+// [VRFS ARCHIVED]       if (item) {
+// [VRFS ARCHIVED]         await interaction.editReply({
+// [VRFS ARCHIVED]           components: [embedToV2Container(createItemEmbed(item))],
+// [VRFS ARCHIVED]           flags: MessageFlags.IsComponentsV2,
+// [VRFS ARCHIVED]         });
+// [VRFS ARCHIVED]         return;
+// [VRFS ARCHIVED]       }
+// [VRFS ARCHIVED]       const results = await searchCatalog(query, 50);
+// [VRFS ARCHIVED]       if (!results.length) {
+// [VRFS ARCHIVED]         await editV2Text(interaction, "Item search", `No items matched **${truncate(query, 100)}**.`, 0xe74c3c);
+// [VRFS ARCHIVED]         return;
+// [VRFS ARCHIVED]       }
+// [VRFS ARCHIVED]       if (results.length === 1) {
+// [VRFS ARCHIVED]         await interaction.editReply({
+// [VRFS ARCHIVED]           components: [embedToV2Container(createItemEmbed(results[0]))],
+// [VRFS ARCHIVED]           flags: MessageFlags.IsComponentsV2,
+// [VRFS ARCHIVED]         });
+// [VRFS ARCHIVED]         return;
+// [VRFS ARCHIVED]       }
+// [VRFS ARCHIVED]       const session = this.createVRFSPage(
+// [VRFS ARCHIVED]         interaction.user.id,
+// [VRFS ARCHIVED]         "catalog",
+// [VRFS ARCHIVED]         results,
+// [VRFS ARCHIVED]         "Item Search",
+// [VRFS ARCHIVED]         `Results for **${truncate(query, 100)}**`,
+// [VRFS ARCHIVED]         10
+// [VRFS ARCHIVED]       );
+// [VRFS ARCHIVED]       await interaction.editReply(createCatalogPage(session));
+// [VRFS ARCHIVED]     } catch (error) {
+// [VRFS ARCHIVED]       logger.warn("Item lookup failed", {
+// [VRFS ARCHIVED]         query,
+// [VRFS ARCHIVED]         error: formatError(error),
+// [VRFS ARCHIVED]       });
+// [VRFS ARCHIVED]       await editV2Text(interaction, "Item catalogue", "The item catalogue could not be loaded right now.", 0xe74c3c);
+// [VRFS ARCHIVED]     }
+// [VRFS ARCHIVED]   }
+// [VRFS ARCHIVED]   private async vrfsMarketCommand(
+// [VRFS ARCHIVED]     interaction: ChatInputCommandInteraction<CacheType>
+// [VRFS ARCHIVED]   ): Promise<void> {
+// [VRFS ARCHIVED]     const query = interaction.options.getString("query", true).trim();
+// [VRFS ARCHIVED]     await deferReply(interaction, false);
+// [VRFS ARCHIVED]     try {
+// [VRFS ARCHIVED]       const item = await getMarketplaceItem(query);
+// [VRFS ARCHIVED]       if (item) {
+// [VRFS ARCHIVED]         await interaction.editReply({
+// [VRFS ARCHIVED]           components: [embedToV2Container(createMarketplaceEmbed(item))],
+// [VRFS ARCHIVED]           flags: MessageFlags.IsComponentsV2,
+// [VRFS ARCHIVED]         });
+// [VRFS ARCHIVED]         return;
+// [VRFS ARCHIVED]       }
+// [VRFS ARCHIVED]       const results = await searchMarketplace(query, 50);
+// [VRFS ARCHIVED]       if (!results.length) {
+// [VRFS ARCHIVED]         await editV2Text(interaction, "Marketplace search", `No marketplace items matched **${truncate(query, 100)}**.`, 0xe74c3c);
+// [VRFS ARCHIVED]         return;
+// [VRFS ARCHIVED]       }
+// [VRFS ARCHIVED]       if (results.length === 1) {
+// [VRFS ARCHIVED]         await interaction.editReply({
+// [VRFS ARCHIVED]           components: [embedToV2Container(createMarketplaceEmbed(results[0]))],
+// [VRFS ARCHIVED]           flags: MessageFlags.IsComponentsV2,
+// [VRFS ARCHIVED]         });
+// [VRFS ARCHIVED]         return;
+// [VRFS ARCHIVED]       }
+// [VRFS ARCHIVED]       const session = this.createVRFSPage(
+// [VRFS ARCHIVED]         interaction.user.id,
+// [VRFS ARCHIVED]         "marketplace",
+// [VRFS ARCHIVED]         results,
+// [VRFS ARCHIVED]         "Marketplace Search",
+// [VRFS ARCHIVED]         `Results for **${truncate(query, 100)}**`,
+// [VRFS ARCHIVED]         10
+// [VRFS ARCHIVED]       );
+// [VRFS ARCHIVED]       await interaction.editReply(createMarketplacePage(session));
+// [VRFS ARCHIVED]     } catch (error) {
+// [VRFS ARCHIVED]       logger.warn("Marketplace lookup failed", {
+// [VRFS ARCHIVED]         query,
+// [VRFS ARCHIVED]         error: formatError(error),
+// [VRFS ARCHIVED]       });
+// [VRFS ARCHIVED]       await editV2Text(interaction, "Marketplace", "The marketplace could not be loaded right now.", 0xe74c3c);
+// [VRFS ARCHIVED]     }
+// [VRFS ARCHIVED]   }
+// [VRFS ARCHIVED]   private async vrfsCreatorCommand(
+// [VRFS ARCHIVED]     interaction: ChatInputCommandInteraction<CacheType>
+// [VRFS ARCHIVED]   ): Promise<void> {
+// [VRFS ARCHIVED]     const name = interaction.options.getString("name", true).trim().toLowerCase();
+// [VRFS ARCHIVED]     await deferReply(interaction, false);
+// [VRFS ARCHIVED]     try {
+// [VRFS ARCHIVED]       const marketplace = await getMarketplace();
+// [VRFS ARCHIVED]       const matches = marketplace.filter((item) =>
+// [VRFS ARCHIVED]         getMarketplaceCreatorName(item).toLowerCase().includes(name)
+// [VRFS ARCHIVED]       );
+// [VRFS ARCHIVED]       if (!matches.length) {
+// [VRFS ARCHIVED]         await editV2Text(interaction, "Creator search", `No creator matched **${truncate(name, 100)}**.`, 0xe74c3c);
+// [VRFS ARCHIVED]         return;
+// [VRFS ARCHIVED]       }
+// [VRFS ARCHIVED]       const creator = getMarketplaceCreatorName(matches[0]);
+// [VRFS ARCHIVED]       const creatorId = getMarketplaceCreatorId(matches[0]);
+// [VRFS ARCHIVED]       const active = matches.filter(getMarketplaceActive).length;
+// [VRFS ARCHIVED]       const totalOwners = matches.reduce(
+// [VRFS ARCHIVED]         (sum, item) => sum + getMarketplaceOwners(item),
+// [VRFS ARCHIVED]         0
+// [VRFS ARCHIVED]       );
+// [VRFS ARCHIVED]       const typeCounts = new Map<string, number>();
+// [VRFS ARCHIVED]       for (const item of matches) {
+// [VRFS ARCHIVED]         const type = marketType(item);
+// [VRFS ARCHIVED]         typeCounts.set(type, (typeCounts.get(type) ?? 0) + 1);
+// [VRFS ARCHIVED]       }
+// [VRFS ARCHIVED]       const embed = createEmbed(
+// [VRFS ARCHIVED]         creator,
+// [VRFS ARCHIVED]         0x5865f2,
+// [VRFS ARCHIVED]         `Marketplace creator${creatorId ? ` · ID \`${creatorId}\`` : ""}`
+// [VRFS ARCHIVED]       );
+// [VRFS ARCHIVED]       embed.addFields(
+// [VRFS ARCHIVED]         {
+// [VRFS ARCHIVED]           name: "Items",
+// [VRFS ARCHIVED]           value: matches.length.toLocaleString(),
+// [VRFS ARCHIVED]           inline: true,
+// [VRFS ARCHIVED]         },
+// [VRFS ARCHIVED]         {
+// [VRFS ARCHIVED]           name: "Available",
+// [VRFS ARCHIVED]           value: active.toLocaleString(),
+// [VRFS ARCHIVED]           inline: true,
+// [VRFS ARCHIVED]         },
+// [VRFS ARCHIVED]         {
+// [VRFS ARCHIVED]           name: "Total Owners",
+// [VRFS ARCHIVED]           value: totalOwners.toLocaleString(),
+// [VRFS ARCHIVED]           inline: true,
+// [VRFS ARCHIVED]         },
+// [VRFS ARCHIVED]         {
+// [VRFS ARCHIVED]           name: "Categories",
+// [VRFS ARCHIVED]           value:
+// [VRFS ARCHIVED]             [...typeCounts.entries()]
+// [VRFS ARCHIVED]               .sort((a, b) => b[1] - a[1])
+// [VRFS ARCHIVED]               .map(([type, count]) => `**${type}** — ${count}`)
+// [VRFS ARCHIVED]               .join("\n") || "None",
+// [VRFS ARCHIVED]           inline: false,
+// [VRFS ARCHIVED]         }
+// [VRFS ARCHIVED]       );
+// [VRFS ARCHIVED]       const preview = matches.slice(0, 10).map((item, index) => {
+// [VRFS ARCHIVED]         return `**${index + 1}. ${truncate(
+// [VRFS ARCHIVED]           String(item.title ?? item.name ?? getSku(item)),
+// [VRFS ARCHIVED]           70
+// [VRFS ARCHIVED]         )}**\n#${item.id} · ${marketType(item)} · ${formatNumber(
+// [VRFS ARCHIVED]           getMarketplaceOwners(item)
+// [VRFS ARCHIVED]         )} owners`;
+// [VRFS ARCHIVED]       });
+// [VRFS ARCHIVED]       embed.addFields({
+// [VRFS ARCHIVED]         name: "Items",
+// [VRFS ARCHIVED]         value: truncate(preview.join("\n\n") || "None", 4096),
+// [VRFS ARCHIVED]         inline: false,
+// [VRFS ARCHIVED]       });
+// [VRFS ARCHIVED]       const image = getMarketplaceImage(matches[0]);
+// [VRFS ARCHIVED]       if (image) embed.setImage(image);
+// [VRFS ARCHIVED]       await editV2Embed(interaction, embed);
+// [VRFS ARCHIVED]     } catch (error) {
+// [VRFS ARCHIVED]       logger.warn("Creator lookup failed", {
+// [VRFS ARCHIVED]         name,
+// [VRFS ARCHIVED]         error: formatError(error),
+// [VRFS ARCHIVED]       });
+// [VRFS ARCHIVED]       await editV2Text(interaction, "Creator lookup", "The creator information could not be loaded right now.", 0xe74c3c);
+// [VRFS ARCHIVED]     }
+// [VRFS ARCHIVED]   }
+// [VRFS ARCHIVED]   private async vrfsStatsCommand(
+// [VRFS ARCHIVED]     interaction: ChatInputCommandInteraction<CacheType>
+// [VRFS ARCHIVED]   ): Promise<void> {
+// [VRFS ARCHIVED]     await deferReply(interaction, false);
+// [VRFS ARCHIVED]     try {
+// [VRFS ARCHIVED]       const [catalog, marketplace] = await Promise.all([
+// [VRFS ARCHIVED]         getCatalog(),
+// [VRFS ARCHIVED]         getMarketplace(),
+// [VRFS ARCHIVED]       ]);
+// [VRFS ARCHIVED]       const free = catalog.filter(isItemFree).length;
+// [VRFS ARCHIVED]       const paid = Math.max(0, catalog.length - free);
+// [VRFS ARCHIVED]       const active = marketplace.filter(getMarketplaceActive).length;
+// [VRFS ARCHIVED]       const creators = new Set(
+// [VRFS ARCHIVED]         marketplace
+// [VRFS ARCHIVED]           .map(getMarketplaceCreatorId)
+// [VRFS ARCHIVED]           .filter((value) => value.length > 0)
+// [VRFS ARCHIVED]       ).size;
+// [VRFS ARCHIVED]       const owners = marketplace.reduce(
+// [VRFS ARCHIVED]         (sum, item) => sum + getMarketplaceOwners(item),
+// [VRFS ARCHIVED]         0
+// [VRFS ARCHIVED]       );
+// [VRFS ARCHIVED]       const sections = new Set(catalog.map(getSection)).size;
+// [VRFS ARCHIVED]       const embed = createEmbed(
+// [VRFS ARCHIVED]         "VRFS",
+// [VRFS ARCHIVED]         0x5865f2,
+// [VRFS ARCHIVED]         "Current game data overview."
+// [VRFS ARCHIVED]       );
+// [VRFS ARCHIVED]       embed.addFields(
+// [VRFS ARCHIVED]         {
+// [VRFS ARCHIVED]           name: "Catalogue Items",
+// [VRFS ARCHIVED]           value: catalog.length.toLocaleString(),
+// [VRFS ARCHIVED]           inline: true,
+// [VRFS ARCHIVED]         },
+// [VRFS ARCHIVED]         {
+// [VRFS ARCHIVED]           name: "Free",
+// [VRFS ARCHIVED]           value: free.toLocaleString(),
+// [VRFS ARCHIVED]           inline: true,
+// [VRFS ARCHIVED]         },
+// [VRFS ARCHIVED]         {
+// [VRFS ARCHIVED]           name: "Paid",
+// [VRFS ARCHIVED]           value: paid.toLocaleString(),
+// [VRFS ARCHIVED]           inline: true,
+// [VRFS ARCHIVED]         },
+// [VRFS ARCHIVED]         {
+// [VRFS ARCHIVED]           name: "Sections",
+// [VRFS ARCHIVED]           value: sections.toLocaleString(),
+// [VRFS ARCHIVED]           inline: true,
+// [VRFS ARCHIVED]         },
+// [VRFS ARCHIVED]         {
+// [VRFS ARCHIVED]           name: "Marketplace Items",
+// [VRFS ARCHIVED]           value: marketplace.length.toLocaleString(),
+// [VRFS ARCHIVED]           inline: true,
+// [VRFS ARCHIVED]         },
+// [VRFS ARCHIVED]         {
+// [VRFS ARCHIVED]           name: "Available",
+// [VRFS ARCHIVED]           value: active.toLocaleString(),
+// [VRFS ARCHIVED]           inline: true,
+// [VRFS ARCHIVED]         },
+// [VRFS ARCHIVED]         {
+// [VRFS ARCHIVED]           name: "Creators",
+// [VRFS ARCHIVED]           value: creators.toLocaleString(),
+// [VRFS ARCHIVED]           inline: true,
+// [VRFS ARCHIVED]         },
+// [VRFS ARCHIVED]         {
+// [VRFS ARCHIVED]           name: "Total Owners",
+// [VRFS ARCHIVED]           value: owners.toLocaleString(),
+// [VRFS ARCHIVED]           inline: true,
+// [VRFS ARCHIVED]         }
+// [VRFS ARCHIVED]       );
+// [VRFS ARCHIVED]       await editV2Embed(interaction, embed);
+// [VRFS ARCHIVED]     } catch (error) {
+// [VRFS ARCHIVED]       logger.warn("VRFS stats failed", {
+// [VRFS ARCHIVED]         error: formatError(error),
+// [VRFS ARCHIVED]       });
+// [VRFS ARCHIVED]       await editV2Text(interaction, "Statistics", "The statistics could not be loaded right now.", 0xe74c3c);
+// [VRFS ARCHIVED]     }
+// [VRFS ARCHIVED]   }
+// [VRFS ARCHIVED]   private async vrfsStatusCommand(
+// [VRFS ARCHIVED]     interaction: ChatInputCommandInteraction<CacheType>
+// [VRFS ARCHIVED]   ): Promise<void> {
+// [VRFS ARCHIVED]     await deferReply(interaction, false);
+// [VRFS ARCHIVED]     try {
+// [VRFS ARCHIVED]       const [catalog, marketplace] = await Promise.all([
+// [VRFS ARCHIVED]         getCatalog(),
+// [VRFS ARCHIVED]         getMarketplace(),
+// [VRFS ARCHIVED]       ]);
+// [VRFS ARCHIVED]       const embed = createEmbed(
+// [VRFS ARCHIVED]         "VRFS Status",
+// [VRFS ARCHIVED]         0x2ecc71,
+// [VRFS ARCHIVED]         "Game data services are responding normally."
+// [VRFS ARCHIVED]       );
+// [VRFS ARCHIVED]       embed.addFields(
+// [VRFS ARCHIVED]         {
+// [VRFS ARCHIVED]           name: "Catalogue",
+// [VRFS ARCHIVED]           value: `${catalog.length.toLocaleString()} items`,
+// [VRFS ARCHIVED]           inline: true,
+// [VRFS ARCHIVED]         },
+// [VRFS ARCHIVED]         {
+// [VRFS ARCHIVED]           name: "Marketplace",
+// [VRFS ARCHIVED]           value: `${marketplace.length.toLocaleString()} items`,
+// [VRFS ARCHIVED]           inline: true,
+// [VRFS ARCHIVED]         },
+// [VRFS ARCHIVED]         {
+// [VRFS ARCHIVED]           name: "Availability",
+// [VRFS ARCHIVED]           value: "Online",
+// [VRFS ARCHIVED]           inline: true,
+// [VRFS ARCHIVED]         }
+// [VRFS ARCHIVED]       );
+// [VRFS ARCHIVED]       await editV2Embed(interaction, embed);
+// [VRFS ARCHIVED]     } catch (error) {
+// [VRFS ARCHIVED]       logger.warn("VRFS status failed", {
+// [VRFS ARCHIVED]         error: formatError(error),
+// [VRFS ARCHIVED]       });
+// [VRFS ARCHIVED]       const embed = createEmbed(
+// [VRFS ARCHIVED]         "VRFS Status",
+// [VRFS ARCHIVED]         0xe74c3c,
+// [VRFS ARCHIVED]         "Game data services are currently unavailable."
+// [VRFS ARCHIVED]       );
+// [VRFS ARCHIVED]       embed.addFields({
+// [VRFS ARCHIVED]         name: "Availability",
+// [VRFS ARCHIVED]         value: "Unavailable",
+// [VRFS ARCHIVED]         inline: true,
+// [VRFS ARCHIVED]       });
+// [VRFS ARCHIVED]       await editV2Embed(interaction, embed);
+// [VRFS ARCHIVED]     }
+// [VRFS ARCHIVED]   }
   private async registerCommands(): Promise<void> {
     if (this.commandsRegistered) return;
-    const vrfsCommand = new SlashCommandBuilder()
-      .setName("vrfs")
-      .setDescription("Player, locker, item and marketplace tools")
-      .addSubcommand((sub) =>
-        sub
-          .setName("player")
-          .setDescription("View a player")
-          .addIntegerOption((opt) =>
-            opt
-              .setName("id")
-              .setDescription("Player ID")
-              .setRequired(true)
-              .setMinValue(1)
-          )
-      )
-      .addSubcommand((sub) =>
-        sub
-          .setName("locker")
-          .setDescription("View a player's locker")
-          .addIntegerOption((opt) =>
-            opt
-              .setName("id")
-              .setDescription("Player ID")
-              .setRequired(true)
-              .setMinValue(1)
-          )
-          .addStringOption((opt) =>
-            opt
-              .setName("item")
-              .setDescription("Optional item name or SKU")
-              .setRequired(false)
-          )
-      )
-      .addSubcommand((sub) =>
-        sub
-          .setName("item")
-          .setDescription("Look up an item")
-          .addStringOption((opt) =>
-            opt
-              .setName("query")
-              .setDescription("Item name, SKU or ID")
-              .setRequired(true)
-          )
-      )
-      .addSubcommand((sub) =>
-        sub
-          .setName("market")
-          .setDescription("Look up a marketplace item")
-          .addStringOption((opt) =>
-            opt
-              .setName("query")
-              .setDescription("Marketplace ID, name or SKU")
-              .setRequired(true)
-          )
-      )
-      .addSubcommand((sub) =>
-        sub
-          .setName("creator")
-          .setDescription("View a marketplace creator")
-          .addStringOption((opt) =>
-            opt
-              .setName("name")
-              .setDescription("Creator name")
-              .setRequired(true)
-          )
-      )
-      .addSubcommand((sub) =>
-        sub.setName("stats").setDescription("View game item statistics")
-      )
-      .addSubcommand((sub) =>
-        sub.setName("status").setDescription("View game data status")
-      );
+// [VRFS ARCHIVED]     const vrfsCommand = new SlashCommandBuilder()
+// [VRFS ARCHIVED]       .setName("vrfs")
+// [VRFS ARCHIVED]       .setDescription("Player, locker, item and marketplace tools")
+// [VRFS ARCHIVED]       .addSubcommand((sub) =>
+// [VRFS ARCHIVED]         sub
+// [VRFS ARCHIVED]           .setName("player")
+// [VRFS ARCHIVED]           .setDescription("View a player")
+// [VRFS ARCHIVED]           .addIntegerOption((opt) =>
+// [VRFS ARCHIVED]             opt
+// [VRFS ARCHIVED]               .setName("id")
+// [VRFS ARCHIVED]               .setDescription("Player ID")
+// [VRFS ARCHIVED]               .setRequired(true)
+// [VRFS ARCHIVED]               .setMinValue(1)
+// [VRFS ARCHIVED]           )
+// [VRFS ARCHIVED]       )
+// [VRFS ARCHIVED]       .addSubcommand((sub) =>
+// [VRFS ARCHIVED]         sub
+// [VRFS ARCHIVED]           .setName("locker")
+// [VRFS ARCHIVED]           .setDescription("View a player's locker")
+// [VRFS ARCHIVED]           .addIntegerOption((opt) =>
+// [VRFS ARCHIVED]             opt
+// [VRFS ARCHIVED]               .setName("id")
+// [VRFS ARCHIVED]               .setDescription("Player ID")
+// [VRFS ARCHIVED]               .setRequired(true)
+// [VRFS ARCHIVED]               .setMinValue(1)
+// [VRFS ARCHIVED]           )
+// [VRFS ARCHIVED]           .addStringOption((opt) =>
+// [VRFS ARCHIVED]             opt
+// [VRFS ARCHIVED]               .setName("item")
+// [VRFS ARCHIVED]               .setDescription("Optional item name or SKU")
+// [VRFS ARCHIVED]               .setRequired(false)
+// [VRFS ARCHIVED]           )
+// [VRFS ARCHIVED]       )
+// [VRFS ARCHIVED]       .addSubcommand((sub) =>
+// [VRFS ARCHIVED]         sub
+// [VRFS ARCHIVED]           .setName("item")
+// [VRFS ARCHIVED]           .setDescription("Look up an item")
+// [VRFS ARCHIVED]           .addStringOption((opt) =>
+// [VRFS ARCHIVED]             opt
+// [VRFS ARCHIVED]               .setName("query")
+// [VRFS ARCHIVED]               .setDescription("Item name, SKU or ID")
+// [VRFS ARCHIVED]               .setRequired(true)
+// [VRFS ARCHIVED]           )
+// [VRFS ARCHIVED]       )
+// [VRFS ARCHIVED]       .addSubcommand((sub) =>
+// [VRFS ARCHIVED]         sub
+// [VRFS ARCHIVED]           .setName("market")
+// [VRFS ARCHIVED]           .setDescription("Look up a marketplace item")
+// [VRFS ARCHIVED]           .addStringOption((opt) =>
+// [VRFS ARCHIVED]             opt
+// [VRFS ARCHIVED]               .setName("query")
+// [VRFS ARCHIVED]               .setDescription("Marketplace ID, name or SKU")
+// [VRFS ARCHIVED]               .setRequired(true)
+// [VRFS ARCHIVED]           )
+// [VRFS ARCHIVED]       )
+// [VRFS ARCHIVED]       .addSubcommand((sub) =>
+// [VRFS ARCHIVED]         sub
+// [VRFS ARCHIVED]           .setName("creator")
+// [VRFS ARCHIVED]           .setDescription("View a marketplace creator")
+// [VRFS ARCHIVED]           .addStringOption((opt) =>
+// [VRFS ARCHIVED]             opt
+// [VRFS ARCHIVED]               .setName("name")
+// [VRFS ARCHIVED]               .setDescription("Creator name")
+// [VRFS ARCHIVED]               .setRequired(true)
+// [VRFS ARCHIVED]           )
+// [VRFS ARCHIVED]       )
+// [VRFS ARCHIVED]       .addSubcommand((sub) =>
+// [VRFS ARCHIVED]         sub.setName("stats").setDescription("View game item statistics")
+// [VRFS ARCHIVED]       )
+// [VRFS ARCHIVED]       .addSubcommand((sub) =>
+// [VRFS ARCHIVED]         sub.setName("status").setDescription("View game data status")
+// [VRFS ARCHIVED]       );
     const commandData = [
       new SlashCommandBuilder()
         .setName("stats")
@@ -3336,7 +3306,7 @@ export class BotManager {
         .setName("licenseadmin")
         .setDescription("Send the admin license panel")
         .setDefaultMemberPermissions(0),
-      vrfsCommand,
+// [VRFS ARCHIVED]       vrfsCommand,
     ];
     const rest = new REST({ version: "10" }).setToken(this.botToken);
     try {
