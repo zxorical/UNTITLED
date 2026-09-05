@@ -1235,35 +1235,7 @@ ACCOUNT
   border-color: rgba(255, 255, 255, 0.12);
 }
 
-/* =========================
-FOOTER
-========================= */
 
-footer {
-  margin: 3rem 1.5rem 1rem;
-
-  border-top: 1px solid rgba(255, 255, 255, 0.06);
-}
-
-.footer-inner {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-
-  padding: 1.5rem 0;
-
-  color: rgb(145, 165, 190);
-
-  font-size: 0.8rem;
-}
-
-.footer-logo {
-  color: white;
-
-  font-family: "Comic Sans MS", cursive;
-
-  font-size: 1.2rem;
-}
 
 /* =========================
 SCROLLBAR
