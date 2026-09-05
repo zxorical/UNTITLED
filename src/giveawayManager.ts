@@ -30,6 +30,16 @@
  * 35. FIXED: enqueueInviteWarmup — updates the queued job's preferredChannelId
  *            in-place when a warmup is waiting to run, so the first attempt already
  *            tries the giveaway's own channel
+ * 36. FIXED: tryGenerateInviteOnce — fetch existing guild invites first and reuse
+ *            a channel-matched permanent invite before calling createInvite, avoiding
+ *            Discord's hard 1000-invite-per-guild cap (error 30016) which was the
+ *            root cause of "works then stops" — as guilds accumulated invites the
+ *            cap was hit, createInvite failed, and the fallback channel link was used
+ * 37. FIXED: Error 30016 (invite cap) now handled explicitly — falls back to any
+ *            previously fetched invite rather than silently returning null
+ * 38. FIXED: INVITE_CACHE_TTL raised from 30m to 6h — permanent invites never
+ *            expire on Discord's side so short TTL caused unnecessary re-generation
+ *            churn that accelerated hitting the invite cap
  */
 
 import { Client, Message, TextChannel } from 'discord.js-selfbot-v13';
@@ -144,7 +154,7 @@ const MAX_INVITE_CACHE = 250;
 const MAX_DUPLICATE_CACHE = 2000;
 const MAX_FAILED_INVITE_CACHE = 100;
 const WATCHLIST_CACHE_TTL = 60_000;
-const INVITE_CACHE_TTL = 30 * 60 * 1000;
+const INVITE_CACHE_TTL = 6 * 60 * 60 * 1000; // 6h — permanent invites don't expire on Discord
 const FAILED_INVITE_RETRY_MS = 15 * 60 * 1000;
 const INVITE_MAX_ATTEMPTS = 20;
 const INVITE_WARMUP_CONCURRENCY = 3;
@@ -2420,12 +2430,22 @@ export class GiveawayManager extends EventEmitter {
     // If local permission state is incomplete, Discord remains authoritative.
     for (const channel of textChannels) add(channel);
 
-    const options = {
+    const createOptions = {
       maxAge: 0,
       maxUses: 0,
       reason: 'Giveaway tracker - auto-generated invite',
       temporary: false,
     } as const;
+
+    // Try to fetch existing channel-scoped invites first so we never
+    // create more than necessary. This avoids Discord's 1000-invite-per-guild
+    // cap (error 30016) which permanently breaks new invite creation.
+    let existingChannelInvites: any = null;
+    try {
+      existingChannelInvites = await guild.invites.fetch();
+    } catch {
+      // MANAGE_GUILD not held — skip, fall through to createInvite.
+    }
 
     // One background attempt can try every reasonable text channel. The outer
     // warmup loop provides the 20 passive attempts.
@@ -2437,9 +2457,25 @@ export class GiveawayManager extends EventEmitter {
         await delay(150);
       }
 
+      // Reuse an existing permanent invite for this channel if available.
+      // Primary defence against hitting the 1000-invite cap.
+      if (existingChannelInvites?.size) {
+        const existing =
+          existingChannelInvites.find((inv: any) =>
+            inv.channel?.id === channel.id && inv.maxAge === 0 && inv.maxUses === 0
+          ) ??
+          existingChannelInvites.find((inv: any) =>
+            inv.channel?.id === channel.id && inv.maxAge === 0
+          ) ??
+          existingChannelInvites.find((inv: any) =>
+            inv.channel?.id === channel.id
+          );
+        if (existing?.url) return existing.url;
+      }
+
       try {
         const invite = await Promise.race([
-          channel.createInvite(options),
+          channel.createInvite(createOptions),
           new Promise<never>((_, reject) =>
             setTimeout(() => reject(Object.assign(new Error('timeout'), { code: 'TIMEOUT' })),
               INVITE_ATTEMPT_TIMEOUT_MS)
@@ -2472,11 +2508,22 @@ export class GiveawayManager extends EventEmitter {
           continue;
         }
 
+        // Guild hit Discord's 1000-invite hard cap — reuse any fetched invite.
+        if (code === 30016) {
+          this.log.warn(
+            `Guild ${guildId} hit Discord invite cap (30016); reusing fetched invite`,
+            { component: 'GiveawayManager', account: this.accountLabel },
+          );
+          const fallback = existingChannelInvites?.first?.() as any;
+          if (fallback?.url) return fallback.url;
+          return null; // Cap hit and nothing to reuse — bail.
+        }
+
         this.log.debug(
           `createInvite failed in #${channel.name} for ${guildId}: ${formatError(error)}`,
           { component: 'GiveawayManager', account: this.accountLabel },
         );
-        // Non-permission error (transient, etc.) — keep trying other channels.
+        // Transient error — keep trying other channels.
         continue;
       }
     }
