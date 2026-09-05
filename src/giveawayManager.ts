@@ -74,8 +74,12 @@ const DRAFT_PHRASES = [
 ];
 
 const ENDED_PHRASES = [
-  'ended', 'winner', 'closed', 'congratulations', 'results',
-  'giveaway has ended', 'giveaway ended', 'giveaway is over',
+  'giveaway has ended',
+  'giveaway ended',
+  'giveaway is over',
+  'giveaway is now closed',
+  'giveaway has been closed',
+  'giveaway has closed',
 ];
 
 const DURATION_REGEX = /(\d+)\s*(minute|min|m|hour|h)/i;
@@ -720,8 +724,10 @@ function parseTimestamps(text: string, now: number): ParsedTimestamps {
   while ((match = TIMESTAMP_REGEX.exec(text)) !== null) {
     const raw = parseInt(match[1], 10);
     const tsMs = raw < 1e12 ? raw * 1000 : raw;
-    if (Number.isFinite(tsMs) && tsMs > now) {
+    if (Number.isFinite(tsMs)) {
       all.push(tsMs);
+      // Prefer the latest timestamp in the message. Keeping past timestamps
+      // here is important so an edited giveaway can be recognized as ended.
       if (end === null || tsMs > end) end = tsMs;
     }
   }
@@ -1746,8 +1752,24 @@ export class GiveawayManager extends EventEmitter {
           const existing = await getGiveaway(message.id, message.channel.id);
           if (existing) {
             await updateLastSeen(message.id, message.channel.id);
-            if (existing.status === 'active' && isEndedGiveaway(parsed)) {
-              await markEnded(message.id, message.channel.id);
+
+            // The database record is the source of truth for giveaway lifetime.
+            // Do NOT end a giveaway just because an edited embed contains words
+            // such as "winner", "results", etc. Those are common while a
+            // giveaway is still active. Only an explicit ended state is trusted
+            // when there is no stored end timestamp. Otherwise, wait for the
+            // stored endsAt to pass.
+            if (existing.status === 'active') {
+              const storedEndsAt = typeof existing.endsAt === 'number'
+                ? existing.endsAt
+                : null;
+              const endedByDatabaseTime = storedEndsAt !== null && storedEndsAt <= Date.now();
+              const endedExplicitlyWithoutTimestamp =
+                storedEndsAt === null && isEndedGiveaway(parsed);
+
+              if (endedByDatabaseTime || endedExplicitlyWithoutTimestamp) {
+                await markEnded(message.id, message.channel.id);
+              }
             }
             return;
           }
@@ -1906,9 +1928,16 @@ export class GiveawayManager extends EventEmitter {
     const now = Date.now();
     const parsed = parseMessage(newMessage, now, this.accountLabel, this.parsedMessageCache);
 
-    if (isEndedGiveaway(parsed)) {
+    // Message edits are NOT allowed to override the stored giveaway lifetime.
+    // If the database has an end timestamp, it is the authoritative clock.
+    // Explicit ended text is only a fallback for records that have no timestamp.
+    const storedEndsAt = typeof existing.endsAt === 'number' ? existing.endsAt : null;
+    const endedByDatabaseTime = storedEndsAt !== null && storedEndsAt <= now;
+    const endedExplicitlyWithoutTimestamp = storedEndsAt === null && isEndedGiveaway(parsed);
+
+    if (endedByDatabaseTime || endedExplicitlyWithoutTimestamp) {
       await markEnded(newMessage.id, newMessage.channel.id);
-      this.log.debug(`Giveaway ended via edit: ${newMessage.id}`);
+      this.log.debug(`Giveaway ended via authoritative database state: ${newMessage.id}`);
     }
   }
 
