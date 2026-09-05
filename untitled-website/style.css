@@ -11,7 +11,7 @@ html {
 body {
   margin: 0;
   min-height: 100vh;
-  background: rgb(51, 30, 83);
+  background: rgb(10, 24, 48);
   color: white;
   font-family: "Manrope", sans-serif;
   overflow-x: hidden;
@@ -40,7 +40,7 @@ BACKGROUND
 .blob-one {
   width: 35rem;
   height: 35rem;
-  background-color: rgb(120, 110, 255);
+  background-color: rgb(35, 100, 190);
   top: -15rem;
   left: -10rem;
   animation: float-one 24s ease-in-out infinite alternate;
@@ -49,7 +49,7 @@ BACKGROUND
 .blob-two {
   width: 28rem;
   height: 28rem;
-  background-color: rgb(90, 120, 255);
+  background-color: rgb(45, 125, 220);
   top: 25%;
   right: -12rem;
   animation: float-two 30s ease-in-out infinite alternate;
@@ -58,7 +58,7 @@ BACKGROUND
 .blob-three {
   width: 32rem;
   height: 32rem;
-  background-color: rgb(180, 120, 255);
+  background-color: rgb(25, 75, 150);
   bottom: -18rem;
   left: 35%;
   animation: float-three 27s ease-in-out infinite alternate;
@@ -129,7 +129,7 @@ nav {
   min-height: 4.4rem;
   padding: 0.8rem 2rem;
 
-  background-color: rgba(20, 15, 35, 0.55);
+  background-color: rgba(8, 18, 36, 0.62);
 
   border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: 0.7rem;
@@ -137,7 +137,7 @@ nav {
   backdrop-filter: blur(14px);
   -webkit-backdrop-filter: blur(14px);
 
-  box-shadow: 0 10px 35px rgba(0, 0, 0, 0.15);
+  box-shadow: 0 10px 35px rgba(0, 0, 0, 0.2);
 }
 
 .logo {
@@ -178,7 +178,7 @@ nav {
 }
 
 .nav-links a:hover {
-  color: rgb(172, 171, 255);
+  color: rgb(105, 160, 235);
   transform: translateY(-1px);
 }
 
@@ -201,7 +201,7 @@ GENERAL
 
   margin: 0 0 0.75rem;
 
-  color: rgb(172, 171, 255);
+  color: rgb(105, 160, 235);
 
   font-size: 0.75rem;
   font-weight: 800;
@@ -229,7 +229,7 @@ GENERAL
 
   margin: 1.5rem auto 0;
 
-  color: rgb(228, 237, 255);
+  color: rgb(215, 229, 248);
 
   font-size: 1.2rem;
   line-height: 1.7;
@@ -267,11 +267,11 @@ HERO
 }
 
 .hero h1 span {
-  color: rgb(172, 171, 255);
+  color: rgb(105, 160, 235);
 }
 
 .hero p span {
-  color: rgb(172, 171, 255);
+  color: rgb(105, 160, 235);
 }
 
 .hero p {
@@ -279,7 +279,7 @@ HERO
 
   margin: 2rem auto;
 
-  color: rgb(228, 237, 255);
+  color: rgb(215, 229, 248);
 
   font-size: 1.35rem;
   line-height: 1.6;
@@ -332,11 +332,11 @@ BUTTONS
 
 .button.primary {
   color: white;
-  background-color: rgb(120, 110, 255);
+  background-color: rgb(55, 115, 205);
 }
 
 .button.primary:hover {
-  background-color: rgb(135, 125, 255);
+  background-color: rgb(70, 130, 220);
 }
 
 .button.secondary {
@@ -370,7 +370,7 @@ HOME FEATURES
 }
 
 .section-heading p {
-  color: rgb(228, 237, 255);
+  color: rgb(215, 229, 248);
   font-size: 1.1rem;
 }
 
@@ -410,12 +410,12 @@ HOME FEATURES
 }
 
 .feature-card p {
-  color: rgb(210, 214, 235);
+  color: rgb(195, 210, 232);
   line-height: 1.6;
 }
 
 .feature-card a {
-  color: rgb(172, 171, 255);
+  color: rgb(105, 160, 235);
 
   text-decoration: none;
 
@@ -450,7 +450,7 @@ FEATURES PAGE
 .large-feature p {
   margin: 0;
 
-  color: rgb(210, 214, 235);
+  color: rgb(195, 210, 232);
 
   line-height: 1.7;
 }
@@ -460,7 +460,7 @@ FEATURES PAGE
 
   margin-bottom: 0.5rem;
 
-  color: rgb(172, 171, 255);
+  color: rgb(105, 160, 235);
 
   font-size: 0.7rem;
   font-weight: 800;
@@ -515,7 +515,7 @@ COMPARISON
 }
 
 .comparison-title {
-  color: rgb(172, 171, 255);
+  color: rgb(105, 160, 235);
 
   font-weight: 800;
 }
@@ -533,7 +533,7 @@ COMPARISON ICONS
 }
 
 .comparison-icon.check {
-  color: rgb(172, 171, 255);
+  color: rgb(105, 160, 235);
 }
 
 .comparison-icon.cross {
@@ -556,7 +556,7 @@ COMPARISON ICONS
 }
 
 .comparison-status.included {
-  color: rgb(221, 220, 255);
+  color: rgb(190, 215, 245);
 }
 
 .comparison-status.unavailable {
@@ -593,7 +593,7 @@ INFORMATION
 .info-card p {
   margin: 0;
 
-  color: rgb(210, 214, 235);
+  color: rgb(195, 210, 232);
 
   line-height: 1.7;
 }
@@ -626,7 +626,7 @@ DOCS
 .docs-sidebar a {
   padding: 0.65rem 0.8rem;
 
-  color: rgb(170, 170, 190);
+  color: rgb(170, 190, 215);
 
   text-decoration: none;
 
@@ -665,7 +665,7 @@ DOCS
 .docs-content p {
   margin: 0 0 1rem;
 
-  color: rgb(205, 208, 225);
+  color: rgb(200, 215, 235);
 
   font-size: 1rem;
   line-height: 1.8;
@@ -674,7 +674,7 @@ DOCS
 .docs-content code {
   padding: 0.15rem 0.35rem;
 
-  color: rgb(190, 187, 255);
+  color: rgb(170, 205, 240);
   background-color: rgba(0, 0, 0, 0.2);
 
   border-radius: 0.3rem;
@@ -688,7 +688,7 @@ DOCS
   margin-top: 1.5rem;
   padding: 1.2rem;
 
-  color: rgb(220, 220, 235);
+  color: rgb(215, 225, 240);
   background-color: rgba(0, 0, 0, 0.22);
 
   border: 1px solid rgba(255, 255, 255, 0.06);
@@ -722,7 +722,7 @@ LOGIN
 
   padding: 3rem;
 
-  background-color: rgba(20, 15, 35, 0.55);
+  background-color: rgba(8, 18, 36, 0.62);
 
   border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: 1rem;
@@ -730,7 +730,7 @@ LOGIN
   backdrop-filter: blur(16px);
   -webkit-backdrop-filter: blur(16px);
 
-  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.2);
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.25);
 
   text-align: center;
 }
@@ -749,7 +749,7 @@ LOGIN
 .auth-card > p {
   margin: 1rem 0 2rem;
 
-  color: rgb(210, 214, 235);
+  color: rgb(195, 210, 232);
 
   line-height: 1.6;
 }
@@ -803,7 +803,7 @@ DISCORD LOGIN
 
   margin-top: 1.5rem;
 
-  color: rgb(155, 158, 180);
+  color: rgb(155, 175, 200);
 
   font-size: 0.85rem;
   line-height: 1.6;
@@ -818,7 +818,7 @@ DISCORD LOGIN
   border: none;
   background: none;
 
-  color: rgb(172, 171, 255);
+  color: rgb(105, 160, 235);
 
   font-family: "Manrope", sans-serif;
   font-size: 0.85rem;
@@ -856,7 +856,7 @@ API
 
   margin-right: 1rem;
 
-  color: rgb(172, 171, 255);
+  color: rgb(105, 160, 235);
 
   font-size: 0.75rem;
   font-weight: 800;
@@ -872,7 +872,7 @@ API
 .api-card p {
   margin-bottom: 0;
 
-  color: rgb(180, 184, 205);
+  color: rgb(175, 195, 220);
 }
 
 /* =========================
@@ -903,7 +903,7 @@ DASHBOARD
 .dashboard-header p:last-child {
   margin: 1rem 0 0;
 
-  color: rgb(210, 214, 235);
+  color: rgb(195, 210, 232);
 
   font-size: 1rem;
   line-height: 1.6;
@@ -932,7 +932,7 @@ DASHBOARD OVERVIEW
 .overview-card .card-label {
   margin: 0 0 0.75rem;
 
-  color: rgb(172, 171, 255);
+  color: rgb(105, 160, 235);
 
   font-size: 0.75rem;
   font-weight: 800;
@@ -951,7 +951,7 @@ DASHBOARD OVERVIEW
 .overview-card p:last-child {
   margin: 0.75rem 0 0;
 
-  color: rgb(180, 184, 205);
+  color: rgb(175, 195, 220);
 
   line-height: 1.5;
 }
@@ -1136,7 +1136,7 @@ DASHBOARD CHART
   border: 1px solid rgba(255, 255, 255, 0.1);
   border-radius: 8px;
 
-  background: rgba(18, 18, 18, 0.94);
+  background: rgba(8, 18, 36, 0.94);
 
   backdrop-filter: blur(12px);
   -webkit-backdrop-filter: blur(12px);
@@ -1202,7 +1202,7 @@ ACCOUNT
 }
 
 .account-name {
-  color: rgb(220, 220, 235);
+  color: rgb(210, 225, 242);
 
   font-size: 0.9rem;
   font-weight: 700;
@@ -1252,7 +1252,7 @@ footer {
 
   padding: 1.5rem 0;
 
-  color: rgb(150, 150, 170);
+  color: rgb(145, 165, 190);
 
   font-size: 0.8rem;
 }
@@ -1278,13 +1278,13 @@ SCROLLBAR
 }
 
 ::-webkit-scrollbar-thumb {
-  background: rgba(172, 171, 255, 0.3);
+  background: rgba(70, 130, 220, 0.45);
 
   border-radius: 999px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(172, 171, 255, 0.55);
+  background: rgba(105, 160, 235, 0.65);
 }
 
 /* =========================
@@ -1331,19 +1331,19 @@ PRICING
 }
 
 .pricing-card.premium {
-  background-color: rgba(120, 110, 255, 0.24);
+  background-color: rgba(55, 115, 205, 0.24);
 
-  border-color: rgba(172, 171, 255, 0.18);
+  border-color: rgba(105, 160, 235, 0.18);
 }
 
 .nav-toggle {
-    display: none;
+  display: none;
 }
 
 .pricing-label {
   margin-bottom: 0.75rem;
 
-  color: rgb(172, 171, 255);
+  color: rgb(105, 160, 235);
 
   font-size: 0.7rem;
   font-weight: 800;
@@ -1364,7 +1364,7 @@ PRICING
 .pricing-description {
   margin: 0.75rem 0 2rem;
 
-  color: rgb(180, 184, 205);
+  color: rgb(175, 195, 220);
 
   line-height: 1.6;
 }
@@ -1390,7 +1390,7 @@ PRICING
 }
 
 .price-period {
-  color: rgb(155, 158, 180);
+  color: rgb(155, 175, 200);
 
   font-size: 0.9rem;
   font-weight: 700;
@@ -1414,7 +1414,7 @@ PRICING
 
   gap: 0.7rem;
 
-  color: rgb(215, 218, 235);
+  color: rgb(210, 225, 242);
 
   font-size: 0.95rem;
 }
@@ -1431,11 +1431,11 @@ PRICING FEATURE ICONS
 
   flex-shrink: 0;
 
-  color: rgb(172, 171, 255);
+  color: rgb(105, 160, 235);
 }
 
 .pricing-card.premium .pricing-feature-icon {
-  color: rgb(205, 202, 255);
+  color: rgb(175, 210, 245);
 }
 
 /* =========================
@@ -1453,7 +1453,7 @@ PRICING BUTTON
 
   margin: 2rem auto 0;
 
-  color: rgb(155, 158, 180);
+  color: rgb(155, 175, 200);
 
   font-size: 0.85rem;
   line-height: 1.6;
@@ -1493,7 +1493,7 @@ PRICING CTA
 
   margin: 1rem auto 1.75rem;
 
-  color: rgb(180, 184, 205);
+  color: rgb(175, 195, 220);
 
   line-height: 1.7;
 }
@@ -1697,26 +1697,32 @@ MOBILE
     top: calc(100% + 9px);
   }
 }
+
 /* =========================
 DAILY SPIN
 ========================= */
+
 .daily-spin-page {
   padding-bottom: 7rem;
 }
+
 .daily-spin {
   padding: 2rem 0 7rem;
 }
+
 .daily-spin-grid {
   display: grid;
   grid-template-columns: minmax(0, 1.2fr) minmax(300px, 0.8fr);
   gap: 1rem;
   align-items: stretch;
 }
+
 .daily-spin-card,
 .daily-spin-sidebar .overview-card {
   background-color: rgba(0, 0, 0, 0.16);
   border-radius: 0.8rem;
 }
+
 .daily-spin-card {
   position: relative;
   min-height: 620px;
@@ -1725,24 +1731,28 @@ DAILY SPIN
   flex-direction: column;
   justify-content: space-between;
 }
+
 .daily-spin-card-header {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
   gap: 2rem;
 }
+
 .daily-spin-card-header h2 {
   margin: 0;
   font-size: 2rem;
   font-weight: 800;
   letter-spacing: -0.03em;
 }
+
 .daily-spin-card-header p:last-child {
   max-width: 550px;
   margin: 0.75rem 0 0;
-  color: rgb(180, 184, 205);
+  color: rgb(175, 195, 220);
   line-height: 1.6;
 }
+
 .coin-balance {
   display: flex;
   align-items: center;
@@ -1756,6 +1766,7 @@ DAILY SPIN
   font-size: 0.85rem;
   font-weight: 800;
 }
+
 .coin-icon {
   width: 1.1rem;
   height: 1.1rem;
@@ -1763,11 +1774,12 @@ DAILY SPIN
   align-items: center;
   justify-content: center;
   border-radius: 50%;
-  background-color: rgb(172, 171, 255);
-  color: rgb(51, 30, 83);
+  background-color: rgb(105, 160, 235);
+  color: rgb(10, 24, 48);
   font-size: 0.65rem;
   font-weight: 900;
 }
+
 .daily-spin-wheel {
   position: relative;
   display: flex;
@@ -1776,6 +1788,7 @@ DAILY SPIN
   min-height: 430px;
   padding: 2rem 0 1.5rem;
 }
+
 .daily-spin-pointer {
   position: absolute;
   top: 0.5rem;
@@ -1787,209 +1800,357 @@ DAILY SPIN
   border-left: 14px solid transparent;
   border-right: 14px solid transparent;
   border-top: 28px solid white;
-  filter: drop-shadow(0 5px 8px rgba(0,0,0,.35));
+  filter: drop-shadow(0 5px 8px rgba(0, 0, 0, 0.35));
 }
+
 .daily-spin-wheel-inner {
   --wheel-size: min(390px, 76vw);
+
   position: relative;
+
   width: var(--wheel-size);
   aspect-ratio: 1;
+
   overflow: visible;
-  border: 9px solid rgb(38,23,62);
+
+  border: 9px solid rgb(17, 42, 78);
   border-radius: 50%;
-  background: conic-gradient(from -22.5deg, rgb(121,109,255) 0deg 45deg, rgb(67,51,102) 45deg 90deg, rgb(130,118,255) 90deg 135deg, rgb(67,51,102) 135deg 180deg, rgb(121,109,255) 180deg 225deg, rgb(67,51,102) 225deg 270deg, rgb(143,132,255) 270deg 315deg, rgb(67,51,102) 315deg 360deg);
-  box-shadow: 0 22px 50px rgba(0,0,0,.34), 0 0 0 2px rgba(255,255,255,.08), inset 0 0 0 2px rgba(255,255,255,.1), inset 0 0 35px rgba(22,13,38,.3);
-  transition: transform 4.8s cubic-bezier(.16,1,.3,1);
+
+  background: conic-gradient(
+    from -22.5deg,
+    rgb(55, 115, 205) 0deg 45deg,
+    rgb(25, 53, 88) 45deg 90deg,
+    rgb(70, 130, 220) 90deg 135deg,
+    rgb(25, 53, 88) 135deg 180deg,
+    rgb(55, 115, 205) 180deg 225deg,
+    rgb(25, 53, 88) 225deg 270deg,
+    rgb(85, 145, 225) 270deg 315deg,
+    rgb(25, 53, 88) 315deg 360deg
+  );
+
+  box-shadow:
+    0 22px 50px rgba(0, 0, 0, 0.34),
+    0 0 0 2px rgba(255, 255, 255, 0.08),
+    inset 0 0 0 2px rgba(255, 255, 255, 0.1),
+    inset 0 0 35px rgba(5, 18, 38, 0.3);
+
+  transition: transform 4.8s cubic-bezier(.16, 1, .3, 1);
+
   will-change: transform;
 }
+
 .daily-spin-wheel-inner::before {
   content: '';
+
   position: absolute;
   inset: 8px;
   z-index: 3;
-  border: 1px solid rgba(255,255,255,.18);
+
+  border: 1px solid rgba(255, 255, 255, 0.18);
   border-radius: 50%;
-  box-shadow: inset 0 0 0 5px rgba(255,255,255,.025);
+
+  box-shadow:
+    inset 0 0 0 5px rgba(255, 255, 255, 0.025);
+
   pointer-events: none;
 }
+
 .daily-spin-wheel-inner::after {
   content: '';
+
   position: absolute;
   top: 50%;
   left: 50%;
   z-index: 12;
+
   width: 84px;
   height: 84px;
-  transform: translate(-50%,-50%);
-  border: 6px solid rgb(49,31,76);
+
+  transform: translate(-50%, -50%);
+
+  border: 6px solid rgb(22, 48, 84);
   border-radius: 50%;
-  background: radial-gradient(circle at 35% 30%, rgb(76,59,112), rgb(43,27,67) 70%);
-  box-shadow: 0 8px 25px rgba(0,0,0,.4), inset 0 1px 0 rgba(255,255,255,.08);
+
+  background:
+    radial-gradient(
+      circle at 35% 30%,
+      rgb(48, 82, 125),
+      rgb(18, 42, 72) 70%
+    );
+
+  box-shadow:
+    0 8px 25px rgba(0, 0, 0, 0.4),
+    inset 0 1px 0 rgba(255, 255, 255, 0.08);
+
   pointer-events: none;
 }
+
 .daily-spin-reward {
   position: absolute;
+
   top: 50%;
   left: 50%;
   z-index: 10;
+
   display: flex;
   align-items: center;
   justify-content: center;
+
   width: 108px;
   min-height: 38px;
-  padding: .45rem .5rem;
+
+  padding: 0.45rem 0.5rem;
   margin: 0;
-  transform: translate(-50%,-50%) rotate(var(--angle)) translateY(calc(var(--wheel-radius) * -1)) rotate(calc(var(--angle) * -1));
+
+  transform:
+    translate(-50%, -50%)
+    rotate(var(--angle))
+    translateY(calc(var(--wheel-radius) * -1))
+    rotate(calc(var(--angle) * -1));
+
   transform-origin: center;
-  color: rgba(255,255,255,.98);
+
+  color: rgba(255, 255, 255, 0.98);
+
   font-family: 'Manrope', sans-serif;
-  font-size: .68rem;
+  font-size: 0.68rem;
   font-weight: 800;
+
   line-height: 1.15;
-  letter-spacing: .025em;
+
+  letter-spacing: 0.025em;
+
   text-align: center;
   text-transform: uppercase;
+
   text-wrap: balance;
-  text-shadow: 0 1px 4px rgba(25,14,42,.75);
+
+  text-shadow: 0 1px 4px rgba(5, 18, 38, 0.75);
+
   pointer-events: none;
 }
-.reward-one { --angle: 0deg; --wheel-radius: 112px; }
-.reward-two { --angle: 45deg; --wheel-radius: 112px; }
-.reward-three { --angle: 90deg; --wheel-radius: 112px; }
-.reward-four { --angle: 135deg; --wheel-radius: 112px; }
-.reward-five { --angle: 180deg; --wheel-radius: 112px; }
-.reward-six { --angle: 225deg; --wheel-radius: 112px; }
-.reward-seven { --angle: 270deg; --wheel-radius: 112px; }
-.reward-eight { --angle: 315deg; --wheel-radius: 112px; }
+
+.reward-one {
+  --angle: 0deg;
+  --wheel-radius: 112px;
+}
+
+.reward-two {
+  --angle: 45deg;
+  --wheel-radius: 112px;
+}
+
+.reward-three {
+  --angle: 90deg;
+  --wheel-radius: 112px;
+}
+
+.reward-four {
+  --angle: 135deg;
+  --wheel-radius: 112px;
+}
+
+.reward-five {
+  --angle: 180deg;
+  --wheel-radius: 112px;
+}
+
+.reward-six {
+  --angle: 225deg;
+  --wheel-radius: 112px;
+}
+
+.reward-seven {
+  --angle: 270deg;
+  --wheel-radius: 112px;
+}
+
+.reward-eight {
+  --angle: 315deg;
+  --wheel-radius: 112px;
+}
+
 .daily-spin-wheel-center {
   position: absolute;
+
   top: 50%;
   left: 50%;
   z-index: 20;
+
   display: flex;
   align-items: center;
   justify-content: center;
+
   width: 70px;
   height: 70px;
-  transform: translate(-50%,-50%);
+
+  transform: translate(-50%, -50%);
+
   color: white;
+
   font-family: 'Manrope', sans-serif;
-  font-size: .7rem;
+  font-size: 0.7rem;
   font-weight: 900;
+
   line-height: 1;
-  letter-spacing: .08em;
+
+  letter-spacing: 0.08em;
+
   text-align: center;
   text-transform: uppercase;
+
   pointer-events: none;
 }
+
 .daily-spin-action {
   display: flex;
   flex-direction: column;
   align-items: center;
+
   gap: 0.75rem;
 }
+
 .daily-spin-action .button {
   min-width: 190px;
 }
+
 .daily-spin-action .button:disabled {
   opacity: 0.45;
   cursor: not-allowed;
   transform: none;
 }
+
 .daily-spin-action p {
   margin: 0;
-  color: rgb(155, 158, 180);
+
+  color: rgb(155, 175, 200);
+
   font-size: 0.8rem;
   text-align: center;
 }
+
 .daily-spin-sidebar {
   display: flex;
   flex-direction: column;
+
   gap: 1rem;
 }
+
 .daily-spin-sidebar .overview-card {
   padding: 2rem;
 }
+
 .daily-spin-sidebar .overview-card h2 {
   letter-spacing: -0.04em;
 }
+
 .progress-bar {
   width: 100%;
   height: 8px;
+
   margin-top: 1rem;
+
   overflow: hidden;
+
   background-color: rgba(255, 255, 255, 0.08);
+
   border-radius: 999px;
 }
+
 .progress-bar-fill {
   width: 82.67%;
   height: 100%;
-  background-color: rgb(120, 110, 255);
+
+  background-color: rgb(55, 115, 205);
+
   border-radius: inherit;
+
   transition: width 0.3s ease;
 }
+
 .daily-spin-rewards {
   padding-bottom: 2rem;
 }
+
 .daily-spin-rewards .section-heading {
   margin-bottom: 2rem;
 }
+
 .daily-spin-rewards .feature-card h3 {
   color: white;
   font-size: 1.35rem;
 }
+
 .daily-spin-rewards .card-label {
   margin: 0 0 0.75rem;
-  color: rgb(172, 171, 255);
+
+  color: rgb(105, 160, 235);
+
   font-size: 0.7rem;
   font-weight: 800;
+
   letter-spacing: 0.1em;
   text-transform: uppercase;
 }
+
 .daily-spin-rewards .feature-card p:last-child {
   margin-bottom: 0;
 }
+
 .daily-spin-page .pricing-cta {
   margin-top: 3rem;
 }
+
 @media (max-width: 900px) {
   .daily-spin-grid {
     grid-template-columns: 1fr;
   }
+
   .daily-spin-card {
     min-height: auto;
   }
+
   .daily-spin-sidebar {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
+
   .daily-spin-sidebar .overview-card:last-child {
     grid-column: 1 / -1;
   }
 }
+
 @media (max-width: 700px) {
   .daily-spin {
     padding: 1rem 0 5rem;
   }
+
   .daily-spin-card {
     padding: 2rem;
   }
+
   .daily-spin-card-header {
     flex-direction: column;
     gap: 1rem;
   }
+
   .daily-spin-wheel {
     min-height: 350px;
   }
+
   .daily-spin-wheel-inner {
     width: min(320px, 84vw);
   }
+
   .daily-spin-reward {
     width: 88px;
     min-height: 34px;
-    padding: .35rem .35rem;
-    font-size: .58rem;
+
+    padding: 0.35rem;
+
+    font-size: 0.58rem;
   }
+
   .reward-one,
   .reward-two,
   .reward-three,
@@ -2000,20 +2161,23 @@ DAILY SPIN
   .reward-eight {
     --wheel-radius: 91px;
   }
+
   .daily-spin-sidebar {
     grid-template-columns: 1fr;
   }
+
   .daily-spin-sidebar .overview-card:last-child {
     grid-column: auto;
   }
+
   .daily-spin-rewards .feature-grid {
     grid-template-columns: 1fr;
   }
 }
+
 @media (prefers-reduced-motion: reduce) {
   .daily-spin-wheel-inner,
   .progress-bar-fill {
     transition: none;
   }
 }
-
