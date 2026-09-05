@@ -1,4 +1,4 @@
-const page = window.location.pathname.split("/").pop() || "index.html";
+const page = window.location.pathname.replace(/^\/+|\/+$/g, "") || "index";
 
 const nav = document.getElementById("navbar");
 const footer = document.getElementById("footer");
@@ -12,7 +12,9 @@ const escapeHtml = value => String(value)
 
 const getUser = () => {
     try {
-        return JSON.parse(sessionStorage.getItem("untitled_user") || "null");
+        return JSON.parse(
+            sessionStorage.getItem("untitled_user") || "null"
+        );
     } catch {
         return null;
     }
@@ -28,8 +30,15 @@ const avatar = user?.id && user?.avatar
     ? `https://cdn.discordapp.com/avatars/${encodeURIComponent(user.id)}/${encodeURIComponent(user.avatar)}.png?size=128`
     : "https://cdn.discordapp.com/embed/avatars/0.png";
 
-const username = user?.globalName || user?.username || "Account";
-const tag = user?.username ? `@${user.username}` : "";
+const username =
+    user?.globalName ||
+    user?.username ||
+    "Account";
+
+const tag =
+    user?.username
+        ? `@${user.username}`
+        : "";
 
 const setLoginState = value => {
     sessionStorage.setItem(
@@ -39,21 +48,28 @@ const setLoginState = value => {
 };
 
 const goToLogin = () => {
-    if (page !== "login.html") {
-        window.location.href = "login.html";
+    if (page !== "login") {
+        window.location.href = "/login";
     }
 };
 
-const getPath = file => {
-    if (file === "index.html") {
-        return page === "index.html" || page === "";
+const getPath = route => {
+    if (route === "/") {
+        return page === "index";
     }
 
-    return page === file;
+    return page === route.replace(/^\/+|\/+$/g, "");
 };
 
-const link = (file, text) => {
-    return `<a href="${file}"${getPath(file) ? ' class="active"' : ""}>${text}</a>`;
+const link = (route, text) => {
+    return `
+        <a
+            href="${route}"
+            ${getPath(route) ? 'class="active"' : ""}
+        >
+            ${text}
+        </a>
+    `;
 };
 
 const buildNav = () => {
@@ -63,7 +79,7 @@ const buildNav = () => {
 
     nav.innerHTML = `
         <nav>
-            <a href="index.html" class="logo">untitled</a>
+            <a href="/" class="logo">untitled</a>
 
             <button
                 class="nav-toggle"
@@ -77,11 +93,11 @@ const buildNav = () => {
             </button>
 
             <div class="nav-links">
-                ${link("features.html", "Features")}
-                ${link("prices.html", "Pricing")}
-                ${link("information.html", "Information")}
-                ${link("docs.html", "Docs")}
-                ${link("api.html", "API")}
+                ${link("/features", "Features")}
+                ${link("/prices", "Pricing")}
+                ${link("/information", "Information")}
+                ${link("/docs", "Docs")}
+                ${link("/api", "API")}
             </div>
 
             ${
@@ -99,11 +115,17 @@ const buildNav = () => {
                                 >
 
                                 <span class="account-details">
-                                    <strong>${escapeHtml(username)}</strong>
+                                    <strong>
+                                        ${escapeHtml(username)}
+                                    </strong>
 
                                     ${
                                         tag
-                                            ? `<small>${escapeHtml(tag)}</small>`
+                                            ? `
+                                                <small>
+                                                    ${escapeHtml(tag)}
+                                                </small>
+                                            `
                                             : ""
                                     }
                                 </span>
@@ -117,18 +139,29 @@ const buildNav = () => {
                                     >
 
                                     <div>
-                                        <strong>${escapeHtml(username)}</strong>
+                                        <strong>
+                                            ${escapeHtml(username)}
+                                        </strong>
 
                                         ${
                                             tag
-                                                ? `<span>${escapeHtml(tag)}</span>`
+                                                ? `
+                                                    <span>
+                                                        ${escapeHtml(tag)}
+                                                    </span>
+                                                `
                                                 : ""
                                         }
                                     </div>
                                 </div>
 
-                                <a href="account.html">Account</a>
-                                <a href="settings.html">Settings</a>
+                                <a href="/account">
+                                    Account
+                                </a>
+
+                                <a href="/settings">
+                                    Settings
+                                </a>
 
                                 <button
                                     type="button"
@@ -153,6 +186,32 @@ const buildNav = () => {
     `;
 };
 
+const buildFooter = () => {
+    if (!footer) {
+        return;
+    }
+
+    footer.innerHTML = `
+        <footer>
+            <div class="footer-inner">
+                <div class="footer-brand">
+                    <strong>untitled</strong>
+                    <span>
+                        Built for the community.
+                    </span>
+                </div>
+
+                <div class="footer-links">
+                    <a href="/features">Features</a>
+                    <a href="/prices">Pricing</a>
+                    <a href="/docs">Docs</a>
+                    <a href="/api">API</a>
+                </div>
+            </div>
+        </footer>
+    `;
+};
+
 const setupNav = () => {
     if (!nav) {
         return;
@@ -163,7 +222,8 @@ const setupNav = () => {
 
     if (button && links) {
         button.addEventListener("click", () => {
-            const open = links.classList.toggle("open");
+            const open =
+                links.classList.toggle("open");
 
             button.setAttribute(
                 "aria-expanded",
@@ -172,7 +232,9 @@ const setupNav = () => {
 
             button.setAttribute(
                 "aria-label",
-                open ? "Close navigation" : "Open navigation"
+                open
+                    ? "Close navigation"
+                    : "Open navigation"
             );
         });
 
@@ -193,14 +255,18 @@ const setupNav = () => {
         });
     }
 
-    const accountButton = nav.querySelector(".account-button");
-    const accountMenu = nav.querySelector(".account-menu");
+    const accountButton =
+        nav.querySelector(".account-button");
+
+    const accountMenu =
+        nav.querySelector(".account-menu");
 
     if (accountButton && accountMenu) {
         accountButton.addEventListener("click", event => {
             event.stopPropagation();
 
-            const open = accountMenu.classList.toggle("open");
+            const open =
+                accountMenu.classList.toggle("open");
 
             accountButton.setAttribute(
                 "aria-expanded",
@@ -228,8 +294,11 @@ const setupAccount = () => {
         return;
     }
 
-    const button = nav.querySelector(".account-button");
-    const menu = nav.querySelector(".account-menu");
+    const button =
+        nav.querySelector(".account-button");
+
+    const menu =
+        nav.querySelector(".account-menu");
 
     if (!button || !menu) {
         return;
@@ -238,7 +307,8 @@ const setupAccount = () => {
     button.addEventListener("click", event => {
         event.stopPropagation();
 
-        const open = menu.classList.toggle("open");
+        const open =
+            menu.classList.toggle("open");
 
         button.setAttribute(
             "aria-expanded",
@@ -248,66 +318,94 @@ const setupAccount = () => {
 };
 
 const setupLogin = () => {
-    if (page !== "login.html") {
+    if (page !== "login") {
         return;
     }
 
-    const button = document.querySelector(".discord-login");
+    const button =
+        document.querySelector(".discord-login");
 
     if (button) {
         button.addEventListener("click", () => {
-            window.location.href = "/api/auth/discord";
+            window.location.href =
+                "/api/auth/discord";
         });
     }
 
-    const createAccount = document.getElementById("createAccount");
+    const createAccount =
+        document.getElementById("createAccount");
 
     if (createAccount) {
         createAccount.addEventListener("click", () => {
-            window.location.href = "/api/auth/discord";
+            window.location.href =
+                "/api/auth/discord";
         });
     }
 };
 
 const setupLogout = () => {
-    document.querySelectorAll("[data-logout]").forEach(button => {
-        button.addEventListener("click", async () => {
-            button.disabled = true;
+    document
+        .querySelectorAll("[data-logout]")
+        .forEach(button => {
+            button.addEventListener(
+                "click",
+                async () => {
+                    button.disabled = true;
 
-            try {
-                await fetch("/api/auth/logout", {
-                    method: "POST",
-                    credentials: "include",
-                    headers: {
-                        Accept: "application/json"
+                    try {
+                        await fetch(
+                            "/api/auth/logout",
+                            {
+                                method: "POST",
+                                credentials: "include",
+                                headers: {
+                                    Accept:
+                                        "application/json"
+                                }
+                            }
+                        );
+                    } catch {
+                        // Continue logout locally.
                     }
-                });
-            } catch {
-                // Continue logout locally.
-            }
 
-            setLoginState(false);
-            sessionStorage.removeItem("untitled_user");
+                    setLoginState(false);
 
-            window.location.href = "login.html";
+                    sessionStorage.removeItem(
+                        "untitled_user"
+                    );
+
+                    window.location.href =
+                        "/login";
+                }
+            );
         });
-    });
 };
 
 const loadUser = async () => {
     try {
-        const response = await fetch("/api/auth/me", {
-            method: "GET",
-            credentials: "include",
-            headers: {
-                Accept: "application/json"
-            },
-            cache: "no-store"
-        });
+        const response = await fetch(
+            "/api/auth/me",
+            {
+                method: "GET",
+                credentials: "include",
+                headers: {
+                    Accept:
+                        "application/json"
+                },
+                cache: "no-store"
+            }
+        );
 
-        if (response.status === 401 || response.status === 403) {
+        if (
+            response.status === 401 ||
+            response.status === 403
+        ) {
             setLoginState(false);
-            sessionStorage.removeItem("untitled_user");
+
+            sessionStorage.removeItem(
+                "untitled_user"
+            );
+
             return;
         }
 
@@ -315,7 +413,8 @@ const loadUser = async () => {
             return;
         }
 
-        const data = await response.json();
+        const data =
+            await response.json();
 
         if (!data?.user) {
             return;
@@ -337,28 +436,40 @@ const setupProtectedUi = () => {
         return;
     }
 
-    document.querySelectorAll("[data-user-name]").forEach(item => {
-        item.textContent = username;
-    });
+    document
+        .querySelectorAll("[data-user-name]")
+        .forEach(item => {
+            item.textContent = username;
+        });
 
-    document.querySelectorAll("[data-user-avatar]").forEach(item => {
-        item.src = avatar;
-        item.alt = `${username} avatar`;
-    });
+    document
+        .querySelectorAll("[data-user-avatar]")
+        .forEach(item => {
+            item.src = avatar;
+            item.alt =
+                `${username} avatar`;
+        });
 
-    document.querySelectorAll("[data-user-id]").forEach(item => {
-        if (user?.id) {
-            item.textContent = user.id;
-        }
-    });
+    document
+        .querySelectorAll("[data-user-id]")
+        .forEach(item => {
+            if (user?.id) {
+                item.textContent = user.id;
+            }
+        });
 
-    document.querySelectorAll("[data-user-tag]").forEach(item => {
-        item.textContent = tag;
-    });
+    document
+        .querySelectorAll("[data-user-tag]")
+        .forEach(item => {
+            item.textContent = tag;
+        });
 };
 
 const setupLoginNotice = () => {
-    const notice = document.querySelector("[data-login-required]");
+    const notice =
+        document.querySelector(
+            "[data-login-required]"
+        );
 
     if (!notice || loggedIn) {
         return;
@@ -372,10 +483,17 @@ const closeOnEscape = event => {
         return;
     }
 
-    const links = nav?.querySelector(".nav-links");
-    const button = nav?.querySelector(".nav-toggle");
-    const menu = nav?.querySelector(".account-menu");
-    const accountButton = nav?.querySelector(".account-button");
+    const links =
+        nav?.querySelector(".nav-links");
+
+    const button =
+        nav?.querySelector(".nav-toggle");
+
+    const menu =
+        nav?.querySelector(".account-menu");
+
+    const accountButton =
+        nav?.querySelector(".account-button");
 
     if (links?.classList.contains("open")) {
         links.classList.remove("open");
@@ -412,9 +530,13 @@ const setupExternalLinks = () => {
                 window.location.href
             );
 
-            if (url.origin !== window.location.origin) {
+            if (
+                url.origin !==
+                window.location.origin
+            ) {
                 item.target = "_blank";
-                item.rel = "noopener noreferrer";
+                item.rel =
+                    "noopener noreferrer";
             }
         });
 };
@@ -423,59 +545,88 @@ const setupButtons = () => {
     document
         .querySelectorAll("[data-action]")
         .forEach(button => {
-            const action = button.dataset.action;
+            const action =
+                button.dataset.action;
 
             if (!action) {
                 return;
             }
 
             if (action === "login") {
-                button.addEventListener("click", goToLogin);
+                button.addEventListener(
+                    "click",
+                    goToLogin
+                );
             }
 
             if (action === "dashboard") {
-                button.addEventListener("click", () => {
-                    if (loggedIn) {
-                        window.location.href = "dashboard.html";
-                    } else {
-                        goToLogin();
+                button.addEventListener(
+                    "click",
+                    () => {
+                        if (loggedIn) {
+                            window.location.href =
+                                "/dashboard";
+                        } else {
+                            goToLogin();
+                        }
                     }
-                });
+                );
             }
 
             if (action === "premium") {
-                button.addEventListener("click", () => {
-                    window.location.href = "prices.html";
-                });
+                button.addEventListener(
+                    "click",
+                    () => {
+                        window.location.href =
+                            "/prices";
+                    }
+                );
             }
         });
 };
 
 const setActiveLinks = () => {
-    nav?.querySelectorAll(".nav-links a").forEach(item => {
-        const href = item.getAttribute("href");
+    nav
+        ?.querySelectorAll(".nav-links a")
+        .forEach(item => {
+            const href =
+                item.getAttribute("href");
 
-        if (!href) {
-            return;
-        }
+            if (!href) {
+                return;
+            }
 
-        const file = href.split("/").pop() || "index.html";
+            const pathname =
+                new URL(
+                    href,
+                    window.location.origin
+                ).pathname;
 
-        if (file === page) {
-            item.classList.add("active");
-        }
-    });
+            const route =
+                pathname
+                    .replace(
+                        /^\/+|\/+$/g,
+                        ""
+                    ) || "index";
+
+            if (route === page) {
+                item.classList.add("active");
+            }
+        });
 };
 
 const checkPage = () => {
-    if (page !== "login.html") {
-        document.documentElement.classList.add("logged-page");
+    if (page !== "login") {
+        document.documentElement.classList.add(
+            "logged-page"
+        );
     }
 };
 
 const start = async () => {
     buildNav();
     buildFooter();
+
     setupNav();
     setupAccount();
     setupLogin();
@@ -490,5 +641,12 @@ const start = async () => {
     await loadUser();
 };
 
-document.addEventListener("keydown", closeOnEscape);
-document.addEventListener("DOMContentLoaded", start);
+document.addEventListener(
+    "keydown",
+    closeOnEscape
+);
+
+document.addEventListener(
+    "DOMContentLoaded",
+    start
+);
