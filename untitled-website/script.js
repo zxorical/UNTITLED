@@ -129,8 +129,6 @@ const buildNav = () => {
                                     </div>
                                 </div>
 
-                                <div class="account-menu-line"></div>
-
                                 <a href="account.html">Account</a>
                                 <a href="settings.html">Settings</a>
 
