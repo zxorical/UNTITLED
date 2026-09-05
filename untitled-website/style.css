@@ -1336,6 +1336,10 @@ PRICING
   border-color: rgba(172, 171, 255, 0.18);
 }
 
+.nav-toggle {
+    display: none;
+}
+
 .pricing-label {
   margin-bottom: 0.75rem;
 
