@@ -1698,69 +1698,56 @@ export class BotManager {
         user = this.client.users.cache.get(userId);
         if (!user) return false;
       }
+
       const dmChannel = await user.createDM().catch(() => null);
       if (!dmChannel) return false;
+
+      // Keep watchlist DMs visually/content-wise identical to the main giveaway
+      // notification by using the exact same Components V2 renderer.
       const urlParts = messageUrl.split("/");
       const channelId = urlParts[5] || "";
-      const resolvedInvite = this.getFastInviteUrl(guildId, channelId, inviteUrl);
-      const endTimestamp = endsAt
-        ? Math.floor(endsAt / 1000)
-        : Math.floor((Date.now() + 3600000) / 1000);
-      const winnerCount = extractWinnerCount(prize);
-      const description = [
-        "### Details",
-        `**Server:** ${guildName}`,
-        `**Channel:** #${channelName}`,
-        `**Winners:** ${winnerCount}`,
-        "",
-        "### Time",
-        `**Ends:** <t:${endTimestamp}:F>`,
-        `**Countdown:** <t:${endTimestamp}:R>`,
-        "",
-        "### Links",
-        `**Invite:** ${resolvedInvite}`,
-        memberCount
-          ? `**Members:** ${memberCount.toLocaleString()}`
-          : "",
-      ]
-        .filter(Boolean)
-        .join("\n");
-      const embed = new EmbedBuilder()
-        .setAuthor({
-          name: "New Giveaway",
-          iconURL: this.client.user?.displayAvatarURL(),
-        })
-        .setTitle(prize || "Unknown Prize")
-        .setDescription(description)
-        .setColor(0x5865f2);
-      if (guildIcon) embed.setThumbnail(guildIcon);
-      if (guildBanner) embed.setImage(guildBanner);
-      const row = new ActionRowBuilder<ButtonBuilder>();
-      if (resolvedInvite.startsWith("http")) {
-        row.addComponents(
-          new ButtonBuilder()
-            .setLabel("Join Server")
-            .setStyle(ButtonStyle.Link)
-            .setURL(resolvedInvite)
-        );
-      }
-      row.addComponents(
-        new ButtonBuilder()
-          .setLabel("Message")
-          .setStyle(ButtonStyle.Link)
-          .setURL(messageUrl)
-      );
-      const container = embedToV2Container(embed);
-      container.addActionRowComponents(row);
+      const messageId = urlParts[6] || "";
+
+      const resolvedGuild = guildId
+        ? this.client.guilds.cache.get(guildId)
+        : undefined;
+
+      const resolvedInvite =
+        inviteUrl && inviteUrl.startsWith("http")
+          ? inviteUrl
+          : this.getFastInviteUrl(guildId, channelId, inviteUrl);
+
+      const data: GiveawayData & Record<string, any> = {
+        messageId,
+        channelId,
+        guildId: guildId || "",
+        guildName: guildName || resolvedGuild?.name || "Unknown",
+        channelName: channelName || "unknown",
+        authorId: "",
+        prize: prize || "Unknown Prize",
+        detectedAt: detectedAt ?? Date.now(),
+        endsAt,
+        detectionTimeMs: 0,
+        guildIcon: guildIcon ?? resolvedGuild?.iconURL({ size: 512 }) ?? null,
+        guildBanner: guildBanner ?? resolvedGuild?.bannerURL({ size: 1024 }) ?? null,
+        memberCount: memberCount ?? resolvedGuild?.memberCount ?? null,
+        inviteUrl: resolvedInvite,
+      };
+
+      const container = buildGiveawayNotificationContainer(data, "active");
+
       await dmChannel.send({
         components: [container],
         flags: MessageFlags.IsComponentsV2,
       });
+
       return true;
-    } catch {
+    } catch (error) {
+      logger.debug(`Failed to send watchlist DM: ${formatError(error)}`);
       return false;
     }
   }
+
   public async sendGiveawayEndedDM(
     userId: string,
     prize: string,
