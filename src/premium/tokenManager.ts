@@ -2,16 +2,13 @@
  * @module tokenManager
  * Token encryption, validation, and session management
  *
- * FIXES APPLIED:
- * 1. Session cleanup interval to prevent memory leaks
- * 2. Race condition prevention with isRestoring flag
- * 3. Proper client destruction on failed logins
- * 4. Session age limits (24 hours max)
- * 5. Proper shutdown function
- * 6. Concurrent restore prevention
- * 7. Active session tracking with cleanup
- * 8. Debug logging for session lifecycle
- * 9. Fixed client.once type error with proper type casting
+ * Session lifecycle goals:
+ * - Never intentionally disconnect healthy sessions because of age/idle timers.
+ * - Never destroy the existing session until a replacement successfully logs in.
+ * - Fully destroy clients when sessions are explicitly stopped.
+ * - Clean up failed login clients.
+ * - Prevent concurrent restore operations.
+ * - Keep memory usage bounded without randomly killing Discord sessions.
  */
 
 import crypto from 'crypto';
@@ -23,8 +20,11 @@ import { logger } from '../logger.js';
 // ============================================================================
 
 const ENCRYPTION_KEY = process.env.TOKEN_ENCRYPTION_KEY;
+
 if (!ENCRYPTION_KEY || ENCRYPTION_KEY.length !== 64) {
-  throw new Error('TOKEN_ENCRYPTION_KEY must be 64 hex characters (32 bytes)');
+  throw new Error(
+    'TOKEN_ENCRYPTION_KEY must be 64 hex characters (32 bytes)',
+  );
 }
 
 const KEY = Buffer.from(ENCRYPTION_KEY, 'hex');
@@ -33,20 +33,26 @@ const IV_LENGTH = 16;
 export function encryptToken(text: string): string {
   const iv = crypto.randomBytes(IV_LENGTH);
   const cipher = crypto.createCipheriv('aes-256-cbc', KEY, iv);
+
   let encrypted = cipher.update(text, 'utf8', 'hex');
   encrypted += cipher.final('hex');
-  return iv.toString('hex') + ':' + encrypted;
+
+  return `${iv.toString('hex')}:${encrypted}`;
 }
 
 export function decryptToken(encrypted: string): string {
   const parts = encrypted.split(':');
+
   if (parts.length !== 2) {
     throw new Error('Invalid encrypted token format');
   }
+
   const iv = Buffer.from(parts[0], 'hex');
   const decipher = crypto.createDecipheriv('aes-256-cbc', KEY, iv);
+
   let decrypted = decipher.update(parts[1], 'hex', 'utf8');
   decrypted += decipher.final('utf8');
+
   return decrypted;
 }
 
@@ -54,34 +60,46 @@ export function decryptToken(encrypted: string): string {
 // Token Validation
 // ============================================================================
 
+/**
+ * Validates a token using a temporary client.
+ *
+ * IMPORTANT:
+ * This client is always destroyed after validation.
+ * This should only be called when validation is actually needed.
+ */
 export async function validateDiscordToken(token: string): Promise<boolean> {
   const client = new Client();
+
   let success = false;
-  
+
   try {
     await client.login(token);
+
     success = true;
     return true;
-  } catch {
+  } catch (error) {
+    logger.debug('Token validation failed', {
+      component: 'TokenManager',
+      error: error instanceof Error ? error.message : String(error),
+    });
+
     return false;
   } finally {
-    // Always destroy, whether login succeeded or failed
     try {
-      await client.destroy();
+      await destroyClient(client);
     } catch {
-      // Ignore — client may not have gotten far enough to need cleanup
+      // Ignore cleanup failures.
     }
-    // Log validation result
-    if (success) {
-      logger.debug('Token validation successful', { component: 'TokenManager' });
-    } else {
-      logger.debug('Token validation failed', { component: 'TokenManager' });
-    }
+
+    logger.debug('Token validation completed', {
+      component: 'TokenManager',
+      success,
+    });
   }
 }
 
 // ============================================================================
-// Session Management
+// Session Types
 // ============================================================================
 
 interface TokenSession {
@@ -95,80 +113,222 @@ interface TokenSession {
   isActive: boolean;
 }
 
+// ============================================================================
+// Session State
+// ============================================================================
+
 const sessions = new Map<string, TokenSession>();
-
-// ============================================================================
-// Session Cleanup Constants
-// ============================================================================
-
-const SESSION_CLEANUP_INTERVAL_MS = 3600000; // 1 hour
-const SESSION_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 hours
-const SESSION_IDLE_TIMEOUT_MS = 12 * 60 * 60 * 1000; // 12 hours idle timeout
 
 let sessionCleanupInterval: NodeJS.Timeout | null = null;
 let isRestoring = false;
+let isShuttingDown = false;
 
 // ============================================================================
-// Session Management Functions
+// Constants
 // ============================================================================
 
 /**
- * Starts a token session. Returns true if login succeeded and the
- * session was registered, false otherwise.
+ * Cleanup is intentionally lightweight.
+ *
+ * We DO NOT use this to disconnect sessions based on age or inactivity.
+ *
+ * Discord sessions are long-lived and should remain alive until:
+ * - explicitly stopped
+ * - the application shuts down
+ * - the session fails and another part of the application decides
+ *   that it needs to reconnect
+ */
+const SESSION_CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
+
+// ============================================================================
+// Client Cleanup
+// ============================================================================
+
+/**
+ * Safely destroy a Discord client.
+ *
+ * Discord/selfbot clients can have internal timers, websocket state,
+ * listeners and other resources. Cleanup is kept in one place so every
+ * code path behaves consistently.
+ */
+async function destroyClient(client: Client | null | undefined): Promise<void> {
+  if (!client) {
+    return;
+  }
+
+  try {
+    client.removeAllListeners();
+  } catch {
+    // Ignore listener cleanup errors.
+  }
+
+  try {
+    await client.destroy();
+  } catch {
+    // Ignore destroy errors.
+  }
+}
+
+// ============================================================================
+// Ready Waiting
+// ============================================================================
+
+/**
+ * Wait for the client to become ready.
+ *
+ * login() normally handles the connection process, but we give the client
+ * a short window to emit ready before registering it as a session.
+ *
+ * IMPORTANT:
+ * A ready timeout does NOT destroy the client.
+ *
+ * The client may still be establishing its connection.
+ */
+async function waitForReady(
+  client: Client,
+  timeoutMs = 5000,
+): Promise<boolean> {
+  if (client.isReady()) {
+    return true;
+  }
+
+  return new Promise<boolean>((resolve) => {
+    let settled = false;
+
+    const finish = (ready: boolean) => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+
+      clearTimeout(timeout);
+      resolve(ready);
+    };
+
+    const timeout = setTimeout(() => {
+      /*
+       * Do not treat this as a fatal connection failure.
+       *
+       * The client may still become ready shortly afterwards.
+       */
+      finish(client.isReady());
+    }, timeoutMs);
+
+    try {
+      // discord.js-selfbot-v13 types may not expose this correctly.
+      // @ts-ignore
+      client.once('ready', () => {
+        finish(true);
+      });
+    } catch {
+      clearTimeout(timeout);
+
+      /*
+       * If the event registration fails, simply check the state.
+       * Do not destroy the client here.
+       */
+      finish(client.isReady());
+    }
+  });
+}
+
+// ============================================================================
+// Session Management
+// ============================================================================
+
+/**
+ * Starts a token session.
+ *
+ * IMPORTANT:
+ * The existing session is NOT destroyed until the new client has
+ * successfully logged in.
+ *
+ * This prevents:
+ *
+ * old session
+ *    ↓
+ * destroy
+ *    ↓
+ * new login fails
+ *    ↓
+ * no session
+ *
+ * Instead:
+ *
+ * old session
+ *    ↓
+ * new client login
+ *    ↓
+ * success
+ *    ↓
+ * replace old session
+ *    ↓
+ * destroy old client
  */
 export async function startTokenSession(
   userId: string,
   guildId: string,
   token: string,
-  label: string
+  label: string,
 ): Promise<boolean> {
-  const sessionKey = `${userId}:${guildId}`;
-
-  // Stop any existing session
-  if (sessions.has(sessionKey)) {
-    stopTokenSession(userId, guildId);
-  }
-
-  // Create client with proper type
-  const client = new Client() as Client;
-  
-  // Set up error handler to prevent uncaught exceptions
-  client.on('error', (err) => {
-    logger.error('Token session client error', {
+  if (isShuttingDown) {
+    logger.warn('Ignoring session start during shutdown', {
+      component: 'TokenManager',
       userId,
       guildId,
-      error: err instanceof Error ? err.message : String(err),
+    });
+
+    return false;
+  }
+
+  const sessionKey = `${userId}:${guildId}`;
+  const existingSession = sessions.get(sessionKey);
+
+  /*
+   * Create the replacement client first.
+   */
+  const client = new Client() as Client;
+
+  /*
+   * Always have an error listener on managed clients.
+   */
+  client.on('error', (error) => {
+    logger.error('Token session client error', {
+      component: 'TokenManager',
+      userId,
+      guildId,
+      error: error instanceof Error ? error.message : String(error),
     });
   });
 
   try {
-    await client.login(token);
-    
-    // Wait a moment for the client to be ready
-    await new Promise<void>((resolve) => {
-      if (client.isReady()) {
-        resolve();
-      } else {
-        const timeout = setTimeout(() => resolve(), 5000);
-        // Use a type-safe approach with the client
-        try {
-          // @ts-ignore - Discord.js selfbot client has this method but types are incomplete
-          client.once('ready', () => {
-            clearTimeout(timeout);
-            resolve();
-          });
-        } catch {
-          // Fallback: just resolve after a delay
-          setTimeout(() => {
-            clearTimeout(timeout);
-            resolve();
-          }, 3000);
-        }
-      }
+    logger.debug('Starting token session login', {
+      component: 'TokenManager',
+      userId,
+      guildId,
+      label,
+      replacingExisting: Boolean(existingSession),
     });
 
-    // Register the session
-    sessions.set(sessionKey, {
+    /*
+     * LOGIN FIRST.
+     *
+     * We intentionally do NOT stop the existing session before this.
+     */
+    await client.login(token);
+
+    /*
+     * Give the client a short opportunity to emit ready.
+     *
+     * A timeout here does not automatically destroy the client.
+     */
+    await waitForReady(client, 5000);
+
+    /*
+     * If login succeeded, the client is now safe to register.
+     */
+    const newSession: TokenSession = {
       client,
       userId,
       guildId,
@@ -177,85 +337,155 @@ export async function startTokenSession(
       startedAt: Date.now(),
       lastActivityAt: Date.now(),
       isActive: true,
+    };
+
+    /*
+     * Atomically replace the map entry.
+     */
+    sessions.set(sessionKey, newSession);
+
+    /*
+     * ONLY NOW destroy the previous client.
+     */
+    if (existingSession && existingSession.client !== client) {
+      logger.debug('Replacing existing token session', {
+        component: 'TokenManager',
+        userId,
+        guildId,
+      });
+
+      await destroyClient(existingSession.client);
+    }
+
+    logger.info('Token session started', {
+      component: 'TokenManager',
+      userId,
+      guildId,
+      label,
+      sessionCount: sessions.size,
+      ready: client.isReady(),
     });
 
-    logger.info('Token session started', { 
-      userId, 
-      guildId, 
-      label,
-      sessionCount: sessions.size 
-    });
-    
-    // Start cleanup interval if not already running
     startSessionCleanup();
-    
+
     return true;
   } catch (error) {
     logger.error('Failed to start token session', {
+      component: 'TokenManager',
       userId,
       guildId,
-      error: String(error),
+      error: error instanceof Error ? error.message : String(error),
     });
-    try {
-      await client.destroy();
-    } catch {
-      // Ignore
-    }
+
+    /*
+     * IMPORTANT:
+     * Destroy only the NEW failed client.
+     *
+     * The existing session, if there was one, remains untouched.
+     */
+    await destroyClient(client);
+
     return false;
   }
 }
 
-export function stopTokenSession(userId: string, guildId: string): void {
+// ============================================================================
+// Stop Session
+// ============================================================================
+
+/**
+ * Explicitly stops a token session.
+ *
+ * This is the ONLY normal TokenManager operation that intentionally
+ * destroys a managed session.
+ */
+export function stopTokenSession(
+  userId: string,
+  guildId: string,
+): void {
   const sessionKey = `${userId}:${guildId}`;
   const session = sessions.get(sessionKey);
 
-  if (session) {
-    try {
-      // Remove all listeners to prevent memory leaks
-      session.client.removeAllListeners();
-      session.client.destroy();
-    } catch {
-      // Ignore
-    }
-    sessions.delete(sessionKey);
-    logger.info('Token session stopped', { 
-      userId, 
-      guildId,
-      remainingSessions: sessions.size 
-    });
+  if (!session) {
+    return;
   }
+
+  /*
+   * Remove the map reference FIRST.
+   *
+   * This makes the session unreachable from TokenManager immediately,
+   * allowing garbage collection after client cleanup finishes.
+   */
+  sessions.delete(sessionKey);
+
+  session.isActive = false;
+
+  void destroyClient(session.client);
+
+  logger.info('Token session stopped', {
+    component: 'TokenManager',
+    userId,
+    guildId,
+    remainingSessions: sessions.size,
+  });
 }
 
-export function updateSessionActivity(userId: string, guildId: string): void {
+// ============================================================================
+// Session Activity
+// ============================================================================
+
+export function updateSessionActivity(
+  userId: string,
+  guildId: string,
+): void {
   const sessionKey = `${userId}:${guildId}`;
   const session = sessions.get(sessionKey);
-  if (session) {
-    session.lastActivityAt = Date.now();
-    session.isActive = true;
+
+  if (!session) {
+    return;
   }
+
+  session.lastActivityAt = Date.now();
+  session.isActive = true;
 }
 
-export function getTokenSession(userId: string, guildId: string): TokenSession | null {
+// ============================================================================
+// Session Getters
+// ============================================================================
+
+export function getTokenSession(
+  userId: string,
+  guildId: string,
+): TokenSession | null {
   const sessionKey = `${userId}:${guildId}`;
   const session = sessions.get(sessionKey);
-  
-  if (session && session.isActive) {
-    updateSessionActivity(userId, guildId);
-    return session;
+
+  if (!session || !session.isActive) {
+    return null;
   }
-  
-  return null;
+
+  updateSessionActivity(userId, guildId);
+
+  return session;
 }
 
-export function getTokenSessionRaw(userId: string, guildId: string): TokenSession | null {
+export function getTokenSessionRaw(
+  userId: string,
+  guildId: string,
+): TokenSession | null {
   const sessionKey = `${userId}:${guildId}`;
-  return sessions.get(sessionKey) || null;
+
+  return sessions.get(sessionKey) ?? null;
 }
 
-export function isSessionActive(userId: string, guildId: string): boolean {
+export function isSessionActive(
+  userId: string,
+  guildId: string,
+): boolean {
   const sessionKey = `${userId}:${guildId}`;
   const session = sessions.get(sessionKey);
-  return session ? session.isActive : false;
+
+  return session?.isActive ?? false;
 }
 
 export function getAllSessions(): TokenSession[] {
@@ -264,9 +494,13 @@ export function getAllSessions(): TokenSession[] {
 
 export function getActiveSessionsCount(): number {
   let count = 0;
+
   for (const session of sessions.values()) {
-    if (session.isActive) count++;
+    if (session.isActive) {
+      count++;
+    }
   }
+
   return count;
 }
 
@@ -278,121 +512,157 @@ export function getTotalSessionsCount(): number {
 // Session Cleanup
 // ============================================================================
 
+/**
+ * Starts the lightweight session cleanup timer.
+ *
+ * This timer intentionally DOES NOT disconnect sessions because:
+ *
+ * - they are older than 24h
+ * - they have been idle
+ * - client.isReady() is temporarily false
+ *
+ * Those checks caused healthy/temporarily reconnecting sessions to be
+ * destroyed unnecessarily.
+ */
 function startSessionCleanup(): void {
-  if (sessionCleanupInterval) return;
-  
+  if (sessionCleanupInterval) {
+    return;
+  }
+
   sessionCleanupInterval = setInterval(() => {
     performSessionCleanup();
   }, SESSION_CLEANUP_INTERVAL_MS);
-  
-  if (sessionCleanupInterval.unref) {
+
+  /*
+   * The cleanup timer must never keep Node alive by itself.
+   */
+  if (typeof sessionCleanupInterval.unref === 'function') {
     sessionCleanupInterval.unref();
   }
-  
-  logger.debug('Session cleanup interval started', { 
+
+  logger.debug('Session cleanup interval started', {
     component: 'TokenManager',
-    interval: `${SESSION_CLEANUP_INTERVAL_MS / 60000} minutes`
+    interval: `${SESSION_CLEANUP_INTERVAL_MS / 60000} minutes`,
   });
 }
 
+/**
+ * Lightweight cleanup.
+ *
+ * At the moment this mainly removes invalid map entries rather than
+ * deciding that a Discord connection should be killed.
+ *
+ * Reconnection decisions belong to the session/AutoJoin manager.
+ */
 function performSessionCleanup(): void {
-  const now = Date.now();
   let cleaned = 0;
-  let idleCleaned = 0;
-  let expiredCleaned = 0;
-  
+
   for (const [key, session] of sessions) {
-    let shouldRemove = false;
-    let reason = '';
-    
-    // Check if session is too old (24 hours)
-    if (now - session.startedAt > SESSION_MAX_AGE_MS) {
-      shouldRemove = true;
-      reason = 'expired (max age)';
-      expiredCleaned++;
-    }
-    // Check if session is idle (12 hours)
-    else if (now - session.lastActivityAt > SESSION_IDLE_TIMEOUT_MS) {
-      shouldRemove = true;
-      reason = 'idle timeout';
-      idleCleaned++;
-    }
-    // Check if client is still connected
-    else if (session.isActive && !session.client.isReady()) {
-      shouldRemove = true;
-      reason = 'client disconnected';
-    }
-    
-    if (shouldRemove) {
-      try {
-        session.client.removeAllListeners();
-        session.client.destroy();
-      } catch {
-        // Ignore
-      }
+    /*
+     * Defensive check.
+     *
+     * We only remove entries that are explicitly inactive and somehow
+     * remained in the map.
+     */
+    if (!session.isActive) {
       sessions.delete(key);
+
+      void destroyClient(session.client);
+
       cleaned++;
-      logger.debug('Session cleaned up', {
+
+      logger.debug('Inactive session cleaned up', {
+        component: 'TokenManager',
         userId: session.userId,
         guildId: session.guildId,
-        reason,
-        sessionAge: Math.round((now - session.startedAt) / 60000) + 'm',
-        idleTime: Math.round((now - session.lastActivityAt) / 60000) + 'm'
       });
     }
   }
-  
+
   if (cleaned > 0) {
-    logger.info(`Session cleanup: removed ${cleaned} sessions`, {
+    logger.info('Session cleanup completed', {
       component: 'TokenManager',
-      expired: expiredCleaned,
-      idle: idleCleaned,
-      remaining: sessions.size
+      cleaned,
+      remaining: sessions.size,
     });
   }
 }
 
 // ============================================================================
-// Restore Sessions from Database
+// Restore Sessions From Database
 // ============================================================================
 
 export async function restoreTokenSessionsFromDatabase(): Promise<number> {
-  // Prevent concurrent restores
-  if (isRestoring) {
-    logger.debug('Session restore already in progress, skipping', {
-      component: 'TokenManager'
+  if (isShuttingDown) {
+    logger.debug('Skipping session restore during shutdown', {
+      component: 'TokenManager',
     });
+
     return 0;
   }
-  
+
+  /*
+   * Prevent two restore operations from running simultaneously.
+   */
+  if (isRestoring) {
+    logger.debug('Session restore already in progress, skipping', {
+      component: 'TokenManager',
+    });
+
+    return 0;
+  }
+
   isRestoring = true;
-  
+
   try {
-    // Dynamic import to avoid circular dependency
-    const { getAllPremiumUsersAllGuilds } = await import('../database.js');
-    
+    /*
+     * Dynamic import prevents circular dependency problems.
+     */
+    const {
+      getAllPremiumUsersAllGuilds,
+      setTokenActive,
+    } = await import('../database.js');
+
     const users = await getAllPremiumUsersAllGuilds();
+
     let restored = 0;
     let skipped = 0;
     let failed = 0;
 
-    logger.info(`Starting session restore for ${users.length} premium users`, {
-      component: 'TokenManager'
-    });
+    logger.info(
+      `Starting session restore for ${users.length} premium users`,
+      {
+        component: 'TokenManager',
+      },
+    );
 
     for (const user of users) {
-      // Skip if no token or inactive
+      if (isShuttingDown) {
+        logger.warn('Stopping session restore because shutdown started', {
+          component: 'TokenManager',
+        });
+
+        break;
+      }
+
+      /*
+       * Skip users without usable tokens.
+       */
       if (!user.token) {
         skipped++;
         continue;
       }
-      
+
       if (user.tokenActive === false) {
         skipped++;
         continue;
       }
 
       const sessionKey = `${user.userId}:${user.guildId}`;
+
+      /*
+       * Never create a duplicate session.
+       */
       if (sessions.has(sessionKey)) {
         skipped++;
         continue;
@@ -400,50 +670,98 @@ export async function restoreTokenSessionsFromDatabase(): Promise<number> {
 
       try {
         const decryptedToken = decryptToken(user.token);
+
         const success = await startTokenSession(
           user.userId,
           user.guildId,
           decryptedToken,
-          user.tokenLabel || 'main'
+          user.tokenLabel || 'main',
         );
-        
+
         if (success) {
           restored++;
         } else {
           failed++;
-          // Mark token as inactive if it failed to restore
-          const { setTokenActive } = await import('../database.js');
-          await setTokenActive(user.userId, user.guildId, false);
+
+          /*
+           * Only mark inactive when restoration actually failed.
+           */
+          try {
+            await setTokenActive(
+              user.userId,
+              user.guildId,
+              false,
+            );
+          } catch (dbError) {
+            logger.error('Failed to mark token inactive', {
+              component: 'TokenManager',
+              userId: user.userId,
+              guildId: user.guildId,
+              error:
+                dbError instanceof Error
+                  ? dbError.message
+                  : String(dbError),
+            });
+          }
         }
       } catch (error) {
         failed++;
+
         logger.error('Failed to restore token session', {
+          component: 'TokenManager',
           userId: user.userId,
-          error: String(error),
+          guildId: user.guildId,
+          error:
+            error instanceof Error
+              ? error.message
+              : String(error),
         });
-        const { setTokenActive } = await import('../database.js');
-        await setTokenActive(user.userId, user.guildId, false);
+
+        /*
+         * Database failures shouldn't cause the entire restore loop
+         * to die.
+         */
+        try {
+          await setTokenActive(
+            user.userId,
+            user.guildId,
+            false,
+          );
+        } catch (dbError) {
+          logger.error('Failed to mark token inactive', {
+            component: 'TokenManager',
+            userId: user.userId,
+            guildId: user.guildId,
+            error:
+              dbError instanceof Error
+                ? dbError.message
+                : String(dbError),
+          });
+        }
       }
     }
 
-    logger.info(`Session restore complete`, {
+    logger.info('Session restore complete', {
       component: 'TokenManager',
       restored,
       skipped,
       failed,
       totalUsers: users.length,
-      activeSessions: sessions.size
+      activeSessions: sessions.size,
     });
 
-    // Start cleanup interval after restoration
     startSessionCleanup();
 
     return restored;
   } catch (error) {
     logger.error('Failed to restore token sessions', {
       component: 'TokenManager',
-      error: String(error),
+      error:
+        error instanceof Error
+          ? error.message
+          : String(error),
     });
+
     return 0;
   } finally {
     isRestoring = false;
@@ -455,32 +773,48 @@ export async function restoreTokenSessionsFromDatabase(): Promise<number> {
 // ============================================================================
 
 export function shutdownTokenManager(): void {
-  logger.info('Shutting down token manager...', { 
+  if (isShuttingDown) {
+    return;
+  }
+
+  isShuttingDown = true;
+
+  logger.info('Shutting down token manager...', {
     component: 'TokenManager',
-    activeSessions: sessions.size 
+    activeSessions: sessions.size,
   });
-  
+
+  /*
+   * Stop cleanup timer first.
+   */
   if (sessionCleanupInterval) {
     clearInterval(sessionCleanupInterval);
     sessionCleanupInterval = null;
   }
-  
-  // Stop all sessions
-  let stopped = 0;
-  for (const [key, session] of sessions) {
-    try {
-      session.client.removeAllListeners();
-      session.client.destroy();
-      stopped++;
-    } catch {
-      // Ignore
-    }
-  }
+
+  /*
+   * Take all sessions out of the map immediately.
+   */
+  const currentSessions = Array.from(sessions.values());
   sessions.clear();
-  
+
+  let stopped = 0;
+
+  /*
+   * Destroy clients asynchronously without allowing one failure
+   * to prevent the others from being cleaned up.
+   */
+  for (const session of currentSessions) {
+    session.isActive = false;
+
+    void destroyClient(session.client);
+
+    stopped++;
+  }
+
   logger.info('Token manager shutdown complete', {
     component: 'TokenManager',
-    stopped
+    stopped,
   });
 }
 
@@ -496,48 +830,58 @@ export function getSessionStats(): {
   averageSessionAge: number | null;
 } {
   const now = Date.now();
+
   let active = 0;
   let idle = 0;
   let totalAge = 0;
   let oldestAge = 0;
-  
+
   for (const session of sessions.values()) {
     if (session.isActive) {
       active++;
     } else {
       idle++;
     }
-    
+
     const age = now - session.startedAt;
+
     totalAge += age;
-    if (age > oldestAge) oldestAge = age;
+
+    if (age > oldestAge) {
+      oldestAge = age;
+    }
   }
-  
+
   return {
     totalSessions: sessions.size,
     activeSessions: active,
     idleSessions: idle,
-    oldestSessionAge: sessions.size > 0 ? oldestAge : null,
-    averageSessionAge: sessions.size > 0 ? Math.round(totalAge / sessions.size) : null,
+    oldestSessionAge:
+      sessions.size > 0 ? oldestAge : null,
+    averageSessionAge:
+      sessions.size > 0
+        ? Math.round(totalAge / sessions.size)
+        : null,
   };
 }
 
 // ============================================================================
-// Cleanup on Process Exit
+// Process Shutdown
 // ============================================================================
 
-// Handle process signals for cleanup
 process.on('SIGTERM', () => {
-  logger.info('SIGTERM received, cleaning up token sessions...', { 
-    component: 'TokenManager' 
+  logger.info('SIGTERM received, cleaning up token sessions...', {
+    component: 'TokenManager',
   });
+
   shutdownTokenManager();
 });
 
 process.on('SIGINT', () => {
-  logger.info('SIGINT received, cleaning up token sessions...', { 
-    component: 'TokenManager' 
+  logger.info('SIGINT received, cleaning up token sessions...', {
+    component: 'TokenManager',
   });
+
   shutdownTokenManager();
 });
 
