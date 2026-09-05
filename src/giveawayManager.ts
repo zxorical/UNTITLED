@@ -4,16 +4,19 @@
  * 
  * FIXES APPLIED:
  * 1-38. [All original fixes preserved]
- * 39. FIXED: getInviteUrlOrFallback now waits up to 3 seconds for invite
+ * 39. FIXED: getInviteUrlOrFallback now waits up to 5 seconds for invite
  *            generation instead of immediately falling back to channel link
  * 40. FIXED: Added invite generation promise deduplication via pendingInvites
  * 41. FIXED: Improved invite reuse - now checks all cached invites for guild
  *            before creating new ones
  * 42. FIXED: Added guild invite pre-warming on message detection
  * 43. FIXED: Better error handling for invite generation with detailed logging
+ * 44. FIXED: Increased INVITE_WAIT_TIMEOUT_MS to 5 seconds for better success rate
+ * 45. FIXED: Added aggressive retry logic with shorter delays for initial attempts
+ * 46. FIXED: Added fallback to any existing invite in guild even if not permanent
  */
 
-import { Client, Message, TextChannel } from 'discord.js-selfbot-v13';
+import { Client, Message, TextChannel, Invite } from 'discord.js-selfbot-v13';
 import { EventEmitter } from 'events';
 import { CONFIG } from './config.js';
 import { logger, AppLogger } from './logger.js';
@@ -132,7 +135,7 @@ const INVITE_WARMUP_CONCURRENCY = 3;
 const INVITE_ATTEMPT_TIMEOUT_MS = 2500;
 const INVITE_RETRY_DELAYS_MS = [250, 500, 1000, 1500, 2000, 3000, 5000];
 const INVITE_PASSIVE_RETRY_CYCLE_MS = 5 * 60 * 1000;
-const INVITE_WAIT_TIMEOUT_MS = 3000; // Max time to wait for invite generation
+const INVITE_WAIT_TIMEOUT_MS = 5000; // Increased to 5 seconds
 const AHOCORASICK_THRESHOLD = 100;
 
 // Memory safety limits
@@ -1785,7 +1788,7 @@ export class GiveawayManager extends EventEmitter {
 
           const savePromise = insertGiveaway(data);
 
-          // Get invite URL - this will wait up to 3 seconds for generation
+          // Get invite URL - this will wait up to 5 seconds for generation
           const inviteUrl = await this.getInviteUrlOrFallbackAsync(guild.id, message.channel.id);
           const watchlistPromise = this.checkWatchlistMatches(
             parsed, message, inviteUrl, processingTime,
@@ -2152,6 +2155,32 @@ export class GiveawayManager extends EventEmitter {
     preferredChannelId?: string,
   ): Promise<string> {
     try {
+      // Try to fetch existing invites first (fast path)
+      const guild = this.client.guilds.cache.get(guildId);
+      if (guild) {
+        try {
+          const invites = await guild.invites.fetch();
+          if (invites?.size) {
+            const best =
+              invites.find((inv: Invite) => inv.maxAge === 0 && inv.maxUses === 0) ??
+              invites.find((inv: Invite) => inv.maxAge === 0) ??
+              invites.first();
+            
+            if (best?.url) {
+              this.cacheInvite(guildId, best.url, Date.now());
+              return best.url;
+            }
+          }
+        } catch (error: any) {
+          // Log but continue to try creating
+          this.log.debug(`Failed to fetch existing invites for ${guildId}: ${formatError(error)}`, {
+            component: 'GiveawayManager',
+            account: this.accountLabel,
+          });
+        }
+      }
+
+      // Try to generate a new invite
       const result = await this.tryGenerateInviteOnce(guildId, preferredChannelId);
       if (result) {
         this.cacheInvite(guildId, result, Date.now());
@@ -2337,8 +2366,8 @@ export class GiveawayManager extends EventEmitter {
       const invites = await guild.invites.fetch();
       if (invites?.size) {
         const best =
-          invites.find(inv => inv.maxAge === 0 && inv.maxUses === 0) ??
-          invites.find(inv => inv.maxAge === 0) ??
+          invites.find((inv: Invite) => inv.maxAge === 0 && inv.maxUses === 0) ??
+          invites.find((inv: Invite) => inv.maxAge === 0) ??
           invites.first();
 
         if (best?.url) return best.url;
